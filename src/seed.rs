@@ -1,5 +1,9 @@
 /// What a shuffle orders. Each purpose has its own tag in the key, so two
 /// shuffles never share a random stream even when their numbers match.
+///
+/// A lane is one of the global batch's sequence slots. Lanes are fixed by the
+/// batch size, never by the GPU count, which is why the same lane gets the
+/// same order however many GPUs there are.
 #[derive(Clone, Copy, Debug)]
 pub enum Purpose {
     RowGroups,
@@ -41,21 +45,32 @@ pub fn key(seed: u64, epoch: u64, purpose: Purpose) -> Key {
 mod tests {
     use super::*;
 
-    // Every field holds a different nonzero value, so any overlap between
-    // slots changes these bytes.
+    // Every byte of every field is nonzero and distinct, so a slot that
+    // moves, overlaps or narrows changes these bytes.
     #[test]
     fn golden() {
-        let lane = Purpose::Lane { window: 3, lane: 5 };
+        let lane = Purpose::Lane {
+            window: 0x2122_2324_2526_2728,
+            lane: 0x3132_3334,
+        };
         assert_eq!(
-            key(42, 1, lane).bytes(),
+            key(0x0102_0304_0506_0708, 0x1112_1314_1516_1718, lane).bytes(),
             [
-                42, 0, 0, 0, 0, 0, 0, 0, // seed
-                1, 0, 0, 0, 0, 0, 0, 0, // epoch
-                1, 0, 0, 0, // tag
-                5, 0, 0, 0, // lane
-                3, 0, 0, 0, 0, 0, 0, 0, // window
+                0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, // seed
+                0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11, // epoch
+                0x01, 0x00, 0x00, 0x00, // tag
+                0x34, 0x33, 0x32, 0x31, // lane
+                0x28, 0x27, 0x26, 0x25, 0x24, 0x23, 0x22, 0x21, // window
             ]
         );
-        assert_eq!(key(42, 1, Purpose::RowGroups).bytes()[16..], [0; 16]);
+    }
+
+    #[test]
+    fn purposes_never_collide() {
+        let lane0 = Purpose::Lane { window: 0, lane: 0 };
+        assert_ne!(
+            key(42, 1, Purpose::RowGroups).bytes(),
+            key(42, 1, lane0).bytes()
+        );
     }
 }
