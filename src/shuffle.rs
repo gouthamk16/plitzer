@@ -1,8 +1,9 @@
 use rand_chacha::ChaCha8Rng;
 use rand_chacha::rand_core::{Rng, SeedableRng};
 
-/// Fisher-Yates shuffle. The output depends only on `seed`, so it is
-/// identical on every platform and across dependency upgrades.
+/// Fisher-Yates shuffle. The output depends only on `seed` and is identical
+/// on every platform. `rand_chacha` only promises a stable stream within a
+/// minor version, so the `golden` test is what catches a breaking upgrade.
 ///
 /// Takes a seed rather than a generator so every call starts fresh: a shared
 /// generator would make one window's order depend on all the windows before it.
@@ -48,6 +49,11 @@ mod tests {
                 18, 17, 15, 10, 12, 1, 9, 16, 8, 0, 11, 5, 2, 7, 6, 3, 13, 14, 4, 19
             ]
         );
+        // Long enough to cross many ChaCha block refills.
+        assert_eq!(
+            shuffled(1_000, 7)[..8],
+            [451, 156, 902, 396, 621, 935, 822, 610]
+        );
     }
 
     #[test]
@@ -59,6 +65,16 @@ mod tests {
                 assert_eq!(v, (0..n).collect::<Vec<_>>(), "seed {seed}, n {n}");
             }
         }
+    }
+
+    // With n = 3 * 2^62, plain `x % n` lands below 2^62 half the time instead
+    // of a third, so this fails if the rejection step is broken or removed.
+    #[test]
+    fn below_is_unbiased() {
+        let n: u64 = 3 << 62;
+        let mut rng = ChaCha8Rng::from_seed([0; 32]);
+        let low = (0..30_000).filter(|_| below(&mut rng, n) < 1 << 62).count();
+        assert!((9_500..10_500).contains(&low), "low: {low}");
     }
 
     // Catches the classic off-by-one (`below(i)` instead of `below(i + 1)`),

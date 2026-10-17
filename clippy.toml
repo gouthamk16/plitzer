@@ -1,0 +1,3 @@
+disallowed-methods = [
+    { path = "rand_core::SeedableRng::seed_from_u64", reason = "its u64-to-seed expansion may change between rand_core versions; use from_seed" },
+]
