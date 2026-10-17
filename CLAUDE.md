@@ -38,7 +38,7 @@ Pipeline: **index → order → read → batch → Python**
 
 ### Invariants that must not break
 
-- Use `rand_chacha` for every shuffle, never `StdRng`. `StdRng`'s algorithm can change between `rand` versions, which would silently break reproducibility. For the same reason, don't use `rand`'s range sampling (`gen_range`, `SliceRandom`) or `seed_from_u64`. Use `shuffle::shuffle`, which takes a 32-byte seed so every shuffle starts from fresh generator state.
+- Use `rand_chacha` for every shuffle, never `StdRng`. `StdRng`'s algorithm can change between `rand` versions, which would silently break reproducibility. For the same reason, don't use `rand`'s range sampling (`random_range`, formerly `gen_range`, and `SliceRandom`) or `seed_from_u64`. Use `shuffle::shuffle`, which takes a 32-byte seed so every shuffle starts from fresh generator state.
 - Each epoch yields every sample exactly once.
 - Resuming at step k reproduces the tail of an uninterrupted run exactly, including when the GPU count changes.
 - A saved reference output of the order must match on every OS.

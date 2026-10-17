@@ -18,6 +18,7 @@ pub fn shuffle<T>(items: &mut [T], seed: [u8; 32]) {
 /// Uniform integer in `[0, n)`. Hand-rolled because `rand`'s range sampling
 /// may change between versions, which would silently change every order.
 fn below(rng: &mut ChaCha8Rng, n: u64) -> u64 {
+    debug_assert!(n > 0, "below(0) has no valid result");
     // 2^64 isn't a multiple of n, so plain `x % n` favours small results.
     // Rejecting the lowest `2^64 mod n` values leaves whole copies of [0, n).
     let skip = n.wrapping_neg() % n;
@@ -49,10 +50,24 @@ mod tests {
                 18, 17, 15, 10, 12, 1, 9, 16, 8, 0, 11, 5, 2, 7, 6, 3, 13, 14, 4, 19
             ]
         );
-        // Long enough to cross many ChaCha block refills.
+        // Long enough to cross many ChaCha block refills. A positional hash
+        // covers every element, so a change anywhere in the stream shows up.
+        let hash = shuffled(1_000, 7).iter().fold(0u64, |h, &x| {
+            h.wrapping_mul(1_000_003).wrapping_add(x as u64)
+        });
+        assert_eq!(hash, 2_786_988_667_572_105_488);
+
+        // Large n so the rejection branch runs: draws 3 and 4 each reject twice.
+        let mut rng = ChaCha8Rng::from_seed([0; 32]);
+        let draws: Vec<u64> = (0..4).map(|_| below(&mut rng, 3 << 62)).collect();
         assert_eq!(
-            shuffled(1_000, 7)[..8],
-            [451, 156, 902, 396, 621, 935, 822, 610]
+            draws,
+            [
+                1_603_386_510_163_247_166,
+                11_647_726_043_916_688_255,
+                4_715_024_415_260_232_856,
+                4_827_309_107_960_445_752
+            ]
         );
     }
 
