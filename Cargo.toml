@@ -8,3 +8,4 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/gouthamk16/plitzer"
 
 [dependencies]
+rand_chacha = "0.10.0"
