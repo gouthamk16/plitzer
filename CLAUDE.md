@@ -26,28 +26,37 @@ CI (`.github/workflows/ci.yml`) runs fmt, clippy with `-D warnings`, and tests o
 
 ## Planned design
 
-The pitch is MosaicML Streaming's guarantees, read directly from existing Parquet with no conversion step and no Python in the hot path. Initial scope is text and tabular data, mainly pre-tokenized LLM data. Images, WebDataset, format conversion and dataset mixing are out of scope for v1.
+The pitch is MosaicML Streaming's guarantees, read directly from existing Parquet with no conversion step and no Python in the hot path. Initial scope is LLM text: it loads documents and packs them into fixed-length sequences. Images, WebDataset, format conversion and dataset mixing are out of scope for v1.
 
-Pipeline: **index → order → read → batch → Python**
+Pipeline: **index → order → read → pack → Python**
 
-- **Index:** read only Parquet footers to build a list of `(file, row_group, num_rows)`. The result is cacheable.
-- **Order:** a pure function of `(seed, epoch, position)`. Shuffle the row groups, group them into windows of W row groups, then shuffle rows within each window, seeded by `(seed, epoch, window)`. Nothing about the order is stored. A checkpoint is just those integers.
-- **Splitting across GPUs:** the global batch size B is fixed. Step `s` covers positions `[sB, (s+1)B)`, and each GPU takes a contiguous `B/world` slice. That's why global batches stay the same when the GPU count changes. B must be divisible by `world`.
-- **I/O:** `object_store` plus the `parquet` crate's async reader, on tokio. Prefetching is capped by bytes, not by number of batches.
+- **Index:** read only Parquet footers to build a list of `(file, row_group, num_rows)`, and cache it as a compact sidecar file. Footers are large: about 3.1 MiB per FineWeb-Edu file, about 9.4 GB across the dataset. Rereading them on every start isn't an option.
+- **Order:** a pure function of `(seed, epoch, step)`. Nothing about the order is stored.
+  - Each epoch, shuffle the row groups (`Purpose::RowGroups`) and group them into windows of W row groups.
+  - Within a window, row groups are in storage order. The global batch has B **lanes** (sequence slots), and each lane owns one contiguous slice of the window. Each lane shuffles its slice with `Purpose::Lane { window, lane }`.
+- **Pack:** a lane is a permanent packer. Each step it takes D documents from its slice, appends them to its leftover tokens, and emits exactly one sequence of L tokens. Leftover is capped, and anything past the cap is dropped. A lane that runs short is padded. A lane's state is the `(doc, offset)` where its leftover starts.
+- **Checkpoint:** `seed`, `epoch`, `step`, plus every lane's state.
+- **Splitting across GPUs:** each GPU owns a contiguous block of `B/world` lanes. Lanes depend only on B, never on `world`. That's why resuming on a different GPU count gives identical sequences: each GPU rebuilds its lanes from the checkpoint. B must be divisible by `world`.
+- **I/O:** `object_store` plus the `parquet` crate's async reader, on tokio. Implement `AsyncFileReader` directly, since `ParquetObjectReader` is deprecated as of parquet 59.2. Prefetching is capped by bytes, not by number of batches.
 - **Python:** PyO3 and maturin. Batches are exported through the Arrow PyCapsule interface. A PyTorch `IterableDataset` provides `state_dict()` and `load_state_dict()`. Users set `num_workers=0`, since parallelism lives in Rust and forking a process with a running tokio runtime is unsafe.
+
+Still open:
+- The day-one input format: raw text with in-loader tokenization, or pre-tokenized.
+- Not yet measured on real FineWeb-Edu lengths: packing waste (padding plus dropped leftover), how well documents mix within a sequence on sorted datasets, per-GPU batch statistics, and the window-size/memory trade-off.
 
 ### Invariants that must not break
 
 - Use `rand_chacha` for every shuffle, never `StdRng`. `StdRng`'s algorithm can change between `rand` versions, which would silently break reproducibility. For the same reason, don't use `rand`'s range sampling (`random_range`, formerly `gen_range`, and `SliceRandom`) or `seed_from_u64`. Use `shuffle::shuffle`. It takes a `seed::Key`, which only `seed::key` can build, so every shuffle starts from fresh generator state and distinct `(seed, epoch, purpose)` inputs never share a stream.
-- Each epoch yields every sample exactly once.
+- Each epoch yields every sample exactly once, apart from leftover tokens dropped at the lane cap.
+- Lanes and their slices depend only on `(seed, epoch, B, W)`, never on `world`.
 - Resuming at step k reproduces the tail of an uninterrupted run exactly, including when the GPU count changes.
 - A saved reference output of the order must match on every OS.
 
-These are enforced with property tests. Any change to the ordering code must keep them passing.
+These are enforced with tests: golden outputs pinned in CI on all 3 OSes now, and property tests as the ordering core lands. Any change to the ordering code must keep them passing.
 
 ### Known hard problem
 
-Read amplification: every GPU's slice draws from the same window of row groups, so naively each GPU downloads every row group in the window. The planned v1 fix is a cache on each machine shared by its GPUs. Treat any change here as a trade-off between shuffle quality and I/O.
+Read amplification. If a shuffled batch is split across GPUs naively, every GPU downloads almost every row group in the window, about `world`× the data. Lane slices fix this. A GPU's lanes cover one contiguous stretch of storage, so it reads that stretch and roughly one shared row group at each edge. Simulation puts the cost at about 1 + world/W, or 1.01–1.25× at FineWeb-Edu-like sizes. A per-node cache is only a fallback if benchmarks show it's needed. Treat any change to slicing as a trade-off between shuffle quality and I/O.
 
 ## Code standards
 
