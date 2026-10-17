@@ -1,14 +1,16 @@
 use rand_chacha::ChaCha8Rng;
 use rand_chacha::rand_core::{Rng, SeedableRng};
 
-/// Fisher-Yates shuffle. The output depends only on `seed` and is identical
+use crate::seed::Key;
+
+/// Fisher-Yates shuffle. The output depends only on `key` and is identical
 /// on every platform. `rand_chacha` only promises a stable stream within a
 /// minor version, so the `golden` test is what catches a breaking upgrade.
 ///
-/// Takes a seed rather than a generator so every call starts fresh: a shared
+/// Takes a key rather than a generator so every call starts fresh: a shared
 /// generator would make one window's order depend on all the windows before it.
-pub fn shuffle<T>(items: &mut [T], seed: [u8; 32]) {
-    let mut rng = ChaCha8Rng::from_seed(seed);
+pub fn shuffle<T>(items: &mut [T], key: Key) {
+    let mut rng = ChaCha8Rng::from_seed(key.bytes());
     for i in (1..items.len()).rev() {
         let j = below(&mut rng, i as u64 + 1) as usize;
         items.swap(i, j);
@@ -33,12 +35,11 @@ fn below(rng: &mut ChaCha8Rng, n: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::seed::{Purpose, key};
 
     fn shuffled(n: u32, seed: u64) -> Vec<u32> {
-        let mut key = [0; 32];
-        key[..8].copy_from_slice(&seed.to_le_bytes());
         let mut v: Vec<u32> = (0..n).collect();
-        shuffle(&mut v, key);
+        shuffle(&mut v, key(seed, 0, Purpose::RowGroups));
         v
     }
 

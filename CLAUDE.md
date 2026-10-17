@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Status
 
-Plitzer is a Rust-core ML dataloader. It feeds Parquet data from local disk or S3 to PyTorch with an order that is deterministic and resumable. So far it is a library crate with one module, `src/shuffle.rs`: a deterministic Fisher-Yates shuffle. The rest of the design below is the plan, not existing code. Update this file as pieces land.
+Plitzer is a Rust-core ML dataloader. It feeds Parquet data from local disk or S3 to PyTorch with an order that is deterministic and resumable. So far it is a library crate with two modules: `src/shuffle.rs`, a deterministic Fisher-Yates shuffle, and `src/seed.rs`, which derives each shuffle's 32-byte key. The rest of the design below is the plan, not existing code. Update this file as pieces land.
 
 ## Commands
 
@@ -38,7 +38,7 @@ Pipeline: **index → order → read → batch → Python**
 
 ### Invariants that must not break
 
-- Use `rand_chacha` for every shuffle, never `StdRng`. `StdRng`'s algorithm can change between `rand` versions, which would silently break reproducibility. For the same reason, don't use `rand`'s range sampling (`random_range`, formerly `gen_range`, and `SliceRandom`) or `seed_from_u64`. Use `shuffle::shuffle`, which takes a 32-byte seed so every shuffle starts from fresh generator state.
+- Use `rand_chacha` for every shuffle, never `StdRng`. `StdRng`'s algorithm can change between `rand` versions, which would silently break reproducibility. For the same reason, don't use `rand`'s range sampling (`random_range`, formerly `gen_range`, and `SliceRandom`) or `seed_from_u64`. Use `shuffle::shuffle`. It takes a `seed::Key`, which only `seed::key` can build, so every shuffle starts from fresh generator state and no two share a stream.
 - Each epoch yields every sample exactly once.
 - Resuming at step k reproduces the tail of an uninterrupted run exactly, including when the GPU count changes.
 - A saved reference output of the order must match on every OS.
