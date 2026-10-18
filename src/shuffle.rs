@@ -9,6 +9,10 @@ use crate::seed::Key;
 ///
 /// Takes a key rather than a generator so every call starts fresh: a shared
 /// generator would make one window's order depend on all the windows before it.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the one place a Key becomes a generator"
+)]
 pub fn shuffle<T>(items: &mut [T], key: Key) {
     let mut rng = ChaCha8Rng::from_seed(key.bytes());
     for i in (1..items.len()).rev() {
@@ -33,6 +37,10 @@ fn below(rng: &mut ChaCha8Rng, n: u64) -> u64 {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "tests drive `below` from a raw seed"
+)]
 mod tests {
     use super::*;
     use crate::seed::{Purpose, key};
