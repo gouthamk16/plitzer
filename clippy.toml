@@ -1,3 +1,4 @@
 disallowed-methods = [
     { path = "rand_core::SeedableRng::seed_from_u64", reason = "its u64-to-seed expansion may change between rand_core versions; use from_seed" },
+    { path = "rand_core::SeedableRng::from_seed", reason = "raw seeds can collide with another shuffle's stream; build a seed::Key and call shuffle::shuffle" },
 ]
