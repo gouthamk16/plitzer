@@ -9,3 +9,6 @@ repository = "https://github.com/gouthamk16/plitzer"
 
 [dependencies]
 rand_chacha = "0.10.0"
+
+[dev-dependencies]
+proptest = "1.11.0"

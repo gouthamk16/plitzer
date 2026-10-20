@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Status
 
-Plitzer is a Rust-core ML dataloader. It feeds Parquet data from local disk or S3 to PyTorch with an order that is deterministic and resumable. So far it is a library crate with two modules: `src/shuffle.rs`, a deterministic Fisher-Yates shuffle, and `src/seed.rs`, which derives each shuffle's 32-byte key. The rest of the design below is the plan, not existing code. Update this file as pieces land.
+Plitzer is a Rust-core ML dataloader. It feeds Parquet data from local disk or S3 to PyTorch with an order that is deterministic and resumable. So far it is a library crate with three modules: `src/shuffle.rs`, a deterministic Fisher-Yates shuffle; `src/seed.rs`, which derives each shuffle's 32-byte key; and `src/order.rs`, the ordering core (row-group windows, lane slices, GPU lane blocks). The rest of the design below is the plan, not existing code. Update this file as pieces land.
 
 ## Commands
 
@@ -52,7 +52,7 @@ Still open:
 - Resuming at step k reproduces the tail of an uninterrupted run exactly, including when the GPU count changes.
 - A saved reference output of the order must match on every OS.
 
-These are enforced with tests: golden outputs pinned in CI on all 3 OSes now, and property tests as the ordering core lands. Any change to the ordering code must keep them passing.
+These are enforced with tests: golden outputs pinned in CI on all 3 OSes, and `proptest` property tests in `src/order.rs`. Any change to the ordering code must keep them passing.
 
 ### Known hard problem
 
