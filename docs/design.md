@@ -68,7 +68,7 @@ Each term has only one definition in this document.
 | Leftover | The tokens that a lane took but did not put into a sequence yet. |
 | C | The cap: the maximum number of leftover tokens that a lane keeps after a step. |
 | Cursor | The number of documents that a lane took in the epoch before a step. |
-| Lane state | The position where the leftover of a lane starts, as `(doc, offset)`. |
+| Lane state | The checkpoint of one lane: the next step and the position where its leftover starts, as `(step, doc, offset)`. |
 | Pad token | The token that fills the end of a sequence that has too few tokens. |
 | Key | The 32-byte seed of one shuffle. Only `seed::key` makes a key. |
 | Read amplification | The bytes that one GPU reads, divided by the bytes of its own data. |
@@ -202,7 +202,7 @@ pub struct Order<'a> {
     pub rows: &'a [u32], // row count of each row group
 }
 
-pub struct Window { /* private: index, groups */ }
+pub struct Window { /* private: index, groups, docs */ }
 
 impl Order<'_> {
     pub fn windows(&self) -> Vec<Window>;
@@ -251,6 +251,7 @@ A document shows as `row_group/row`. Step 6 then shuffles each lane. Lane 0 read
 
 - `Order::windows` panics if `window` is 0. `Order::lane` panics if `lane` is not less than B. `gpu_lanes` panics if world does not divide B, or if `rank` is not less than world (D-11).
 - A lane is empty if N is less than B.
+- A `Window` keeps its document count. Use it only with the `Order` that made it.
 - Row group ids and row numbers are `u32`. FineWeb-Edu has approximately 10⁵ row groups.
 - The documents of a window mix only inside each lane. The mix quality on sorted datasets is not measured yet (section 7).
 
@@ -285,7 +286,7 @@ pub struct Packing {
     pub pad: u32,     // pad token
 }
 
-pub struct LaneState { pub doc: u64, pub offset: u32 }
+pub struct LaneState { pub step: u64, pub doc: u64, pub offset: u32 }
 
 pub struct Epoch<'a> { /* private: order, packing, windows, steps */ }
 pub struct Lane<'e> { /* private */ }
@@ -293,7 +294,7 @@ pub struct Lane<'e> { /* private */ }
 impl<'a> Epoch<'a> {
     pub fn new(order: Order<'a>, packing: Packing) -> Self;
     pub fn steps(&self) -> u64;
-    pub fn lane(&self, lane: u32, step: u64, state: LaneState, tokens: &impl Tokens) -> Lane<'_>;
+    pub fn lane(&self, lane: u32, state: LaneState, tokens: &impl Tokens) -> Lane<'_>;
 }
 impl Lane<'_> {
     pub fn fill(&mut self, tokens: &impl Tokens, out: &mut [u32]) -> u32;
@@ -308,9 +309,9 @@ impl Lane<'_> {
 3. If the leftover has more than C tokens, remove the oldest tokens until C tokens remain.
 4. Return the number of real tokens in `out`.
 
-The cursor before step s is `min(s·D, lane_docs)`. It is a function of the step, so a checkpoint does not store it. The leftover is always the tokens from the lane state to the cursor. Thus `(step, LaneState)` is sufficient to make the lane again.
+The cursor before step s is `min(s·D, lane_docs)`. It is a function of the step, so a checkpoint does not store it (D-14). The leftover is always the tokens from `(doc, offset)` to the cursor. Thus the lane state is sufficient to make the lane again.
 
-`Epoch::lane` makes each lane, also at the start of an epoch (step 0 and the default state). It reads the documents from the lane state to the cursor again, and removes the first `offset` tokens.
+`Epoch::lane` makes each lane, also at the start of an epoch (the default state, at step 0). It reads the documents from the lane state to the cursor again, and removes the first `offset` tokens.
 
 The epoch has `ceil(max lane_docs / D) + ceil(C / L)` steps, or 0 steps if it has no documents. The last `ceil(C / L)` steps empty all leftovers. A lane with no tokens supplies a sequence of pad tokens.
 
@@ -323,10 +324,10 @@ tokens     19 20    21 ... 27   13 ... 18   3 ... 7    (none)
 
 | Step | Sequence | Dropped | Lane state after |
 |---|---|---|---|
-| 0 | 19 20 21 22 | 23 24 | (1, 4) |
-| 1 | 25 26 27 13 | 14 ... 18, 3, 4 | (3, 2) |
-| 2 | 5 6 7 pad | — | (5, 0) |
-| 3 | pad pad pad pad | — | (5, 0) |
+| 0 | 19 20 21 22 | 23 24 | (1, 1, 4) |
+| 1 | 25 26 27 13 | 14 ... 18, 3, 4 | (2, 3, 2) |
+| 2 | 5 6 7 pad | — | (3, 5, 0) |
+| 3 | pad pad pad pad | — | (4, 5, 0) |
 
 At step 0, the leftover has 9 tokens. The lane copies 4 tokens. Then it removes 23 and 24, so that C = 3 tokens remain.
 
@@ -334,7 +335,8 @@ At step 0, the leftover has 9 tokens. The lane copies 4 tokens. Then it removes 
 
 - The cap removes the oldest tokens. Thus the leftover is one continuous run of tokens that ends at the cursor, and `(doc, offset)` can describe it (D-12).
 - The last `ceil(C / L)` steps empty the leftovers. Thus the cap is the only cause of dropped tokens, and the epoch length does not depend on token counts (D-13).
-- The pack module reads tokens through the `Tokens` trait. The Read stage does not exist yet, and the tests use a corpus in memory (D-14).
+- The pack module reads tokens through the `Tokens` trait. The Read stage does not exist yet, and the tests use a corpus in memory (D-16).
+- The lane state holds its step. Thus a caller cannot give the state of one step with a different step (D-17).
 - `fill` writes into a buffer from the caller. The Python stage can then give one buffer of B/world × L tokens to each GPU, with no copy (D-15).
 - Each `Lane` reads the windows of its `Epoch`. Thus the row group shuffle occurs one time for each epoch, not one time for each lane.
 
@@ -363,7 +365,7 @@ The property tests use small inputs. Thus empty documents, empty lanes, C = 0, C
 
 These components are not in the code yet. Their sections will have the full set of parts when they are implemented.
 
-- **Checkpoint:** A checkpoint holds `seed`, `epoch`, `step` and the lane state of each lane. It also holds B, W, L, D and C. A resume with different values must stop with an error.
+- **Checkpoint:** A checkpoint holds `seed`, `epoch` and the lane state of each lane. It also holds B, W, L, D, C and a fingerprint of the index. A resume with different values must stop with an error.
 - **Index:** The index reads only the Parquet footers and makes the list of `(file, row_group, num_rows)`. Plitzer keeps the index in a small sidecar file. The footers of FineWeb-Edu are approximately 9.4 GB in total, so Plitzer must not read them again at each start.
 - **Read:** The read stage uses `object_store` and the async reader of the `parquet` crate, on tokio. It implements `AsyncFileReader` directly, because `ParquetObjectReader` is deprecated as of parquet 59.2. A byte limit controls the prefetch, not a batch count. It supplies tokens to the pack module through the `Tokens` trait.
 - **Python:** The bindings use PyO3 and maturin. Batches go to Python through the Arrow PyCapsule interface. A PyTorch `IterableDataset` gives `state_dict()` and `load_state_dict()`. Users must set `num_workers=0`. The parallel work is in Rust, and a fork of a process with a tokio runtime is not safe.
@@ -408,6 +410,8 @@ These components are not in the code yet. Their sections will have the full set 
 | D-13 | Each epoch ends with `ceil(C / L)` steps that empty the leftovers. | Only the cap drops tokens, and the epoch length is known before the read. | Drop the leftover at the end of the epoch. | #8 |
 | D-14 | Each step takes a fixed D documents. | The cursor is a function of the step, so a checkpoint does not store it. | Take documents until the sequence is full: the cursor then depends on token counts and must be in the checkpoint. | #8 |
 | D-15 | `fill` writes into a buffer from the caller. | One buffer for each GPU batch, with no copy. | Return a new `Vec` for each sequence. | #8 |
+| D-16 | The pack module reads tokens through the `Tokens` trait. | The Read stage does not exist yet. Tests use a corpus in memory, and the Read stage can implement the trait later. | A fixed token source, such as a `Vec` of all tokens. | #8 |
+| D-17 | `LaneState` holds the step. | A state cannot go with a different step, which gives wrong sequences with no error. | A separate step input to `Epoch::lane`. | #8 |
 
 ## 9. Change log
 

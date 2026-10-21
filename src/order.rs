@@ -25,6 +25,7 @@ pub struct Order<'a> {
 
 /// One window of an epoch. Only `Order::windows` builds one, so a window's
 /// number always matches its row groups and no two windows share a lane key.
+/// It caches its document count, so use it only with the `Order` that built it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Window {
     index: u64,

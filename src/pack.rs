@@ -21,11 +21,12 @@ pub struct Packing {
     pub pad: u32,
 }
 
-/// Where a lane's leftover starts: token `offset` of the lane's `doc`-th
-/// document of the epoch. The leftover always runs from here to the lane's
-/// cursor, so this and the step are all a resume needs.
+/// A lane's checkpoint before step `step`: its leftover starts at token
+/// `offset` of the lane's `doc`-th document of the epoch and runs to the
+/// cursor, so nothing else is needed to resume. The default starts the epoch.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LaneState {
+    pub step: u64,
     pub doc: u64,
     pub offset: u32,
 }
@@ -68,49 +69,28 @@ impl<'a> Epoch<'a> {
         self.steps
     }
 
-    /// Lane `lane` before step `step`, with `state` from `Lane::state` at that
-    /// step. Step 0 with the default state starts the epoch.
-    pub fn lane(&self, lane: u32, step: u64, state: LaneState, tokens: &impl Tokens) -> Lane<'_> {
+    /// Lane `lane`, resumed from `state`.
+    pub fn lane(&self, lane: u32, state: LaneState, tokens: &impl Tokens) -> Lane<'_> {
         assert!(
-            step <= self.steps,
-            "step {step} is past the epoch's {} steps",
+            state.step <= self.steps,
+            "state {state:?} is past the epoch's {} steps",
             self.steps
         );
-        let cursor = self.cursor(lane, step);
+        let cursor = self.cursor(lane, state.step);
         assert!(
             state.doc <= cursor,
             "state {state:?} is past the cursor {cursor}"
         );
-        let mut lane = Lane {
+        let mut l = Lane {
             epoch: self,
             lane,
-            step,
+            step: state.step,
             stream: Stream::seek(self, lane, state.doc),
             leftover: Leftover::new(state.doc),
         };
-        for _ in state.doc..cursor {
-            let doc = lane
-                .stream
-                .next(self, lane.lane)
-                .expect("cursor within the lane");
-            lane.leftover.push(tokens.tokens(doc));
-        }
-        let first = lane.leftover.lens.front().copied().unwrap_or(0);
-        assert!(
-            state.offset < first || (state.doc == cursor && state.offset == 0),
-            "state {state:?} offset is past its document"
-        );
-        lane.leftover.advance(state.offset as usize);
-        assert_eq!(
-            lane.state(),
-            state,
-            "state does not start on a document with tokens left"
-        );
-        assert!(
-            lane.leftover.tokens.len() <= self.packing.cap as usize,
-            "state {state:?} leaves more than the cap"
-        );
-        lane
+        l.take(tokens, cursor - state.doc);
+        l.start_at(state);
+        l
     }
 
     /// The documents lane `lane` takes in the whole epoch.
@@ -153,12 +133,7 @@ impl Lane<'_> {
             "out must hold seq_len tokens"
         );
         assert!(self.step < self.epoch.steps, "the epoch has ended");
-        for _ in 0..p.docs {
-            let Some(doc) = self.stream.next(self.epoch, self.lane) else {
-                break;
-            };
-            self.leftover.push(tokens.tokens(doc));
-        }
+        self.take(tokens, p.docs.into());
         let real = self.leftover.tokens.len().min(out.len());
         for (o, &t) in out.iter_mut().zip(&self.leftover.tokens) {
             *o = t;
@@ -174,7 +149,41 @@ impl Lane<'_> {
     }
 
     pub fn state(&self) -> LaneState {
-        self.leftover.start
+        LaneState {
+            step: self.step,
+            doc: self.leftover.doc,
+            offset: self.leftover.offset,
+        }
+    }
+
+    /// Skips the replayed leftover's first `state.offset` tokens and checks
+    /// that the lane now stands exactly at `state`.
+    fn start_at(&mut self, state: LaneState) {
+        let first = self.leftover.lens.front().copied().unwrap_or(0);
+        assert!(
+            state.offset == 0 || state.offset < first,
+            "state {state:?} offset is past its document"
+        );
+        self.leftover.advance(state.offset as usize);
+        assert_eq!(
+            self.state(),
+            state,
+            "state does not start on a document with tokens left"
+        );
+        assert!(
+            self.leftover.tokens.len() <= self.epoch.packing.cap as usize,
+            "state {state:?} leaves more than the cap"
+        );
+    }
+
+    /// Adds the next `n` documents, or as many as are left, to the leftover.
+    fn take(&mut self, tokens: &impl Tokens, n: u64) {
+        for _ in 0..n {
+            let Some(doc) = self.stream.next(self.epoch, self.lane) else {
+                break;
+            };
+            self.leftover.push(tokens.tokens(doc));
+        }
     }
 }
 
@@ -226,9 +235,11 @@ impl Stream {
 /// The tokens a lane has taken but not yet emitted or dropped.
 struct Leftover {
     tokens: VecDeque<u32>,
-    /// Remaining tokens of each document from `start.doc` to the cursor.
+    /// Remaining tokens of each document from `doc` to the cursor.
     lens: VecDeque<u32>,
-    start: LaneState,
+    /// Where the leftover starts.
+    doc: u64,
+    offset: u32,
 }
 
 impl Leftover {
@@ -236,7 +247,8 @@ impl Leftover {
         Leftover {
             tokens: VecDeque::new(),
             lens: VecDeque::new(),
-            start: LaneState { doc, offset: 0 },
+            doc,
+            offset: 0,
         }
     }
 
@@ -254,21 +266,19 @@ impl Leftover {
             let front = &mut self.lens[0];
             let k = n.min(*front as usize);
             *front -= k as u32;
-            self.start.offset += k as u32;
+            self.offset += k as u32;
             n -= k;
             self.skip_empty();
         }
     }
 
-    /// Keeps `start` on a document with tokens left, or on the cursor when
+    /// Keeps the start on a document with tokens left, or on the cursor when
     /// the leftover is empty.
     fn skip_empty(&mut self) {
         while self.lens.front() == Some(&0) {
             self.lens.pop_front();
-            self.start = LaneState {
-                doc: self.start.doc + 1,
-                offset: 0,
-            };
+            self.doc += 1;
+            self.offset = 0;
         }
     }
 }

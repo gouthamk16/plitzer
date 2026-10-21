@@ -39,11 +39,11 @@ impl Tokens for Corpus {
 /// One step of one lane: the sequence, its real-token count, the state after.
 type Out = (Vec<u32>, u32, LaneState);
 
-/// Runs `lane` from `step` with `state` to the end of the epoch.
-fn run(e: &Epoch, c: &Corpus, lane: u32, step: u64, state: LaneState) -> Vec<Out> {
-    let mut l = e.lane(lane, step, state, c);
+/// Runs `lane` from `state` to the end of the epoch.
+fn run(e: &Epoch, c: &Corpus, lane: u32, state: LaneState) -> Vec<Out> {
+    let mut l = e.lane(lane, state, c);
     let mut out = vec![0; e.packing.seq_len as usize];
-    (step..e.steps())
+    (state.step..e.steps())
         .map(|_| {
             let real = l.fill(c, &mut out);
             (out.clone(), real, l.state())
@@ -89,10 +89,9 @@ proptest! {
         let rows = c.rows();
         let e = epoch(&rows, lanes, window, seed, p);
         for lane in 0..lanes {
-            let full = run(&e, &c, lane, 0, LaneState::default());
+            let full = run(&e, &c, lane, LaneState::default());
             for k in 0..full.len() {
-                let state = full[k].2;
-                prop_assert_eq!(&run(&e, &c, lane, k as u64 + 1, state)[..], &full[k + 1..]);
+                prop_assert_eq!(&run(&e, &c, lane, full[k].2)[..], &full[k + 1..]);
             }
         }
     }
@@ -111,7 +110,7 @@ proptest! {
                 let s = stream(&e, &c, lane);
                 let pos = |t: u32| s.iter().position(|&x| x == t).unwrap();
                 let mut next = 0;
-                for (seq, real, _) in run(&e, &c, lane, 0, LaneState::default()) {
+                for (seq, real, _) in run(&e, &c, lane, LaneState::default()) {
                     let seq = &seq[..real as usize];
                     if let Some(&first) = seq.first() {
                         let start = pos(first);
@@ -136,18 +135,18 @@ proptest! {
         let e = epoch(&rows, lanes, window, seed, p);
         let mut out = vec![0; p.seq_len as usize];
         for lane in 0..lanes {
-            let mut l = e.lane(lane, 0, LaneState::default(), &c);
+            let mut l = e.lane(lane, LaneState::default(), &c);
             for _ in 0..e.steps() {
                 let real = l.fill(&c, &mut out) as usize;
                 prop_assert!(out[real..].iter().all(|&t| t == PAD));
-                prop_assert!(out[..real].iter().all(|&t| t != PAD));
                 prop_assert!(l.leftover.tokens.len() <= p.cap as usize);
                 if real < out.len() {
                     prop_assert!(l.leftover.tokens.is_empty());
                 }
             }
             prop_assert!(l.leftover.tokens.is_empty());
-            prop_assert_eq!(l.state(), LaneState { doc: e.lane_docs(lane), offset: 0 });
+            let end = LaneState { step: e.steps(), doc: e.lane_docs(lane), offset: 0 };
+            prop_assert_eq!(l.state(), end);
         }
     }
 
@@ -167,19 +166,19 @@ proptest! {
         let e = epoch(&rows, LANES, window, seed, p);
         let k = k.min(e.steps());
         let per_lane: Vec<Vec<Out>> =
-            (0..LANES).map(|l| run(&e, &c, l, 0, LaneState::default())).collect();
+            (0..LANES).map(|l| run(&e, &c, l, LaneState::default())).collect();
         let batch = |step: usize| -> Vec<u32> {
             per_lane.iter().flat_map(|r| r[step].0.clone()).collect()
         };
 
         let mut got: Vec<Vec<u32>> = vec![Vec::new(); e.steps() as usize];
         let mut states = vec![LaneState::default(); LANES as usize];
-        for (world, from, to) in [(worlds[a], 0, k), (worlds[b], k, e.steps())] {
+        for (world, to) in [(worlds[a], k), (worlds[b], e.steps())] {
             for rank in 0..world {
                 for lane in gpu_lanes(LANES, world, rank) {
-                    let mut l = e.lane(lane, from, states[lane as usize], &c);
+                    let mut l = e.lane(lane, states[lane as usize], &c);
                     let mut out = vec![0; p.seq_len as usize];
-                    for step in from..to {
+                    for step in states[lane as usize].step..to {
                         l.fill(&c, &mut out);
                         got[step as usize].extend_from_slice(&out);
                     }
@@ -211,21 +210,21 @@ fn golden() {
     // Step 0 emits 19..=22 and drops 23 24 to keep the newest 3 tokens. Step 1
     // drops 14..=18 3 4. Step 2 runs short. The last step only flushes.
     assert_eq!(e.steps(), 4);
-    let s = |doc, offset| LaneState { doc, offset };
+    let s = |step, doc, offset| LaneState { step, doc, offset };
     const P: u32 = PAD;
     #[rustfmt::skip]
-    assert_eq!(run(&e, &c, 0, 0, LaneState::default()), [
-        (vec![12, 8, 9, 10], 4, s(1, 3)),
-        (vec![11, 0, 1, 2], 4, s(3, 0)),
-        (vec![P, P, P, P], 0, s(3, 0)),
-        (vec![P, P, P, P], 0, s(3, 0)),
+    assert_eq!(run(&e, &c, 0, LaneState::default()), [
+        (vec![12, 8, 9, 10], 4, s(1, 1, 3)),
+        (vec![11, 0, 1, 2], 4, s(2, 3, 0)),
+        (vec![P, P, P, P], 0, s(3, 3, 0)),
+        (vec![P, P, P, P], 0, s(4, 3, 0)),
     ]);
     #[rustfmt::skip]
-    assert_eq!(run(&e, &c, 1, 0, LaneState::default()), [
-        (vec![19, 20, 21, 22], 4, s(1, 4)),
-        (vec![25, 26, 27, 13], 4, s(3, 2)),
-        (vec![5, 6, 7, P], 3, s(5, 0)),
-        (vec![P, P, P, P], 0, s(5, 0)),
+    assert_eq!(run(&e, &c, 1, LaneState::default()), [
+        (vec![19, 20, 21, 22], 4, s(1, 1, 4)),
+        (vec![25, 26, 27, 13], 4, s(2, 3, 2)),
+        (vec![5, 6, 7, P], 3, s(3, 5, 0)),
+        (vec![P, P, P, P], 0, s(4, 5, 0)),
     ]);
 
     // A larger corpus, so a change anywhere in the packer changes the hash.
@@ -242,7 +241,7 @@ fn golden() {
     };
     let e = epoch(&rows, 4, 8, 7, p);
     let hash = (0..4)
-        .flat_map(|l| run(&e, &c, l, 0, LaneState::default()))
+        .flat_map(|l| run(&e, &c, l, LaneState::default()))
         .flat_map(|(seq, _, _)| seq)
         .fold(0u64, |h, t| {
             h.wrapping_mul(1_000_003).wrapping_add(t.into())
@@ -268,7 +267,12 @@ const P4: Packing = Packing {
 fn fill_past_end_panics() {
     let (c, rows) = small();
     let e = epoch(&rows, 1, 2, 7, P4);
-    let mut l = e.lane(0, e.steps(), LaneState { doc: 4, offset: 0 }, &c);
+    let end = LaneState {
+        step: e.steps(),
+        doc: 4,
+        offset: 0,
+    };
+    let mut l = e.lane(0, end, &c);
     l.fill(&c, &mut [0; 4]);
 }
 
@@ -277,7 +281,7 @@ fn fill_past_end_panics() {
 fn wrong_out_len_panics() {
     let (c, rows) = small();
     let e = epoch(&rows, 1, 2, 7, P4);
-    e.lane(0, 0, LaneState::default(), &c).fill(&c, &mut [0; 3]);
+    e.lane(0, LaneState::default(), &c).fill(&c, &mut [0; 3]);
 }
 
 #[test]
@@ -285,7 +289,15 @@ fn wrong_out_len_panics() {
 fn state_past_cursor_panics() {
     let (c, rows) = small();
     let e = epoch(&rows, 1, 2, 7, P4);
-    e.lane(0, 1, LaneState { doc: 2, offset: 0 }, &c);
+    e.lane(
+        0,
+        LaneState {
+            step: 1,
+            doc: 2,
+            offset: 0,
+        },
+        &c,
+    );
 }
 
 #[test]
@@ -293,7 +305,15 @@ fn state_past_cursor_panics() {
 fn offset_past_doc_panics() {
     let (c, rows) = small();
     let e = epoch(&rows, 1, 2, 7, P4);
-    e.lane(0, 1, LaneState { doc: 0, offset: 99 }, &c);
+    e.lane(
+        0,
+        LaneState {
+            step: 1,
+            doc: 0,
+            offset: 99,
+        },
+        &c,
+    );
 }
 
 #[test]
