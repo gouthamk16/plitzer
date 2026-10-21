@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Status
 
-Plitzer is a Rust-core ML dataloader. It feeds Parquet data from local disk or S3 to PyTorch with an order that is deterministic and resumable. So far it is a library crate with three modules: `src/shuffle.rs`, a deterministic Fisher-Yates shuffle; `src/seed.rs`, which derives each shuffle's 32-byte key; and `src/order.rs`, the ordering core (row-group windows, lane slices, GPU lane blocks). The rest of the design below is the plan, not existing code. Update this file as pieces land.
+Plitzer is a Rust-core ML dataloader. It feeds Parquet data from local disk or S3 to PyTorch with an order that is deterministic and resumable. So far it is a library crate with four modules: `src/shuffle.rs`, a deterministic Fisher-Yates shuffle; `src/seed.rs`, which derives each shuffle's 32-byte key; `src/order.rs`, the ordering core (row-group windows, lane slices, GPU lane blocks); and `src/pack.rs`, the per-lane packer with resumable lane state. The rest of the design below is the plan, not existing code. Update this file as pieces land.
 
 ## Commands
 
@@ -35,7 +35,7 @@ Pipeline: **index → order → read → pack → Python**
 - **Order:** a pure function of `(seed, epoch, step)`. Nothing about the order is stored.
   - Each epoch, shuffle the row groups (`Purpose::RowGroups`) and group them into windows of W row groups.
   - Within a window, row groups are in storage order. The global batch has B **lanes** (sequence slots), and each lane owns one contiguous slice of the window. Each lane shuffles its slice with `Purpose::Lane { window, lane }`.
-- **Pack:** a lane is a permanent packer. Each step it takes D documents from its slice, appends them to its leftover tokens, and emits exactly one sequence of L tokens. Leftover is capped, and anything past the cap is dropped. A lane that runs short is padded. A lane's state is the `(doc, offset)` where its leftover starts.
+- **Pack:** a lane is a permanent packer. Each step it takes D documents from its slice, appends them to its leftover tokens, and emits exactly one sequence of L tokens. Leftover is capped at C tokens; past the cap the *oldest* tokens are dropped, so the leftover is always one run ending at the cursor (`min(step·D, lane_docs)`). A lane that runs short is padded. A lane's state is the `(doc, offset)` where its leftover starts. Each epoch ends with `ceil(C/L)` flush steps, so nothing is dropped at epoch end. Tokens come in through the `Tokens` trait; the packer adds no EOS.
 - **Checkpoint:** `seed`, `epoch`, `step`, plus every lane's state.
 - **Splitting across GPUs:** each GPU owns a contiguous block of `B/world` lanes. Lanes depend only on B, never on `world`. That's why resuming on a different GPU count gives identical sequences: each GPU rebuilds its lanes from the checkpoint. B must be divisible by `world`.
 - **I/O:** `object_store` plus the `parquet` crate's async reader, on tokio. Implement `AsyncFileReader` directly, since `ParquetObjectReader` is deprecated as of parquet 59.2. Prefetching is capped by bytes, not by number of batches.
@@ -53,7 +53,7 @@ Still open:
 - Resuming at step k reproduces the tail of an uninterrupted run exactly, including when the GPU count changes.
 - A saved reference output of the order must match on every OS.
 
-These are enforced with tests: golden outputs pinned in CI on all 3 OSes, and `proptest` property tests in `src/order.rs`. Any change to the ordering code must keep them passing.
+These are enforced with tests: golden outputs pinned in CI on all 3 OSes, and `proptest` property tests in `src/order.rs` and `src/pack/tests.rs`. Any change to the ordering code must keep them passing.
 
 ### Known hard problem
 

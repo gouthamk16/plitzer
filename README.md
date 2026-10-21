@@ -15,9 +15,9 @@ The design, its rationale and the decision log are in [docs/design.md](docs/desi
   - [x] each epoch yields every sample exactly once
   - [x] each lane's slice is one contiguous stretch of storage
   - [x] a saved reference output matches on every OS
-- [ ] **Lanes:** pack each lane's documents into fixed-length sequences, carry leftover tokens, and checkpoint each lane's state. Property tests:
-  - [ ] resuming at step k matches the tail of an uninterrupted run
-  - [ ] global batches are identical across GPU counts
+- [x] **Lanes:** pack each lane's documents into fixed-length sequences, carry leftover tokens, and checkpoint each lane's state. Property tests:
+  - [x] resuming at step k matches the tail of an uninterrupted run
+  - [x] global batches are identical across GPU counts
 - [ ] **Index:** build a row-group index from Parquet footers, with caching
 - [ ] **I/O:** async reads with `object_store` (local disk and S3, tested against MinIO), plus a prefetch queue capped by bytes
 - [ ] **Python:** PyO3 and maturin bindings, a PyTorch `IterableDataset` with `state_dict()`, and Arrow PyCapsule export
