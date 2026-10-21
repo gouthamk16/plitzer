@@ -23,6 +23,7 @@ CI (`.github/workflows/ci.yml`) runs fmt, clippy with `-D warnings`, and tests o
 - One branch per feature, branched from `main` (`feat/<name>`, `fix/<name>`). Don't use git worktrees.
 - Each change lands on `main` through a PR with green CI. Never commit directly to `main`.
 - Keep the TODO list in `README.md` current: tick items off in the PR that completes them.
+- Keep `docs/design.md` current: every PR that adds or changes a feature, design or interface updates it in the same PR (status table, component section, requirements, decision log, change log). Write it in ASD-STE100; section 10 of the doc lists the steps and rules.
 
 ## Planned design
 

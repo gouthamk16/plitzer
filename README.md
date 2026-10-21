@@ -6,6 +6,8 @@ Batch order is a pure function of `(seed, epoch, step)`. Documents are packed in
 
 > **Status:** pre-alpha. Nothing usable yet.
 
+The design, its rationale and the decision log are in [docs/design.md](docs/design.md).
+
 ## TODO
 
 - [ ] **Benchmark baseline:** measure MosaicML Streaming and HF `datasets` on a FineWeb-Edu Parquet sample (conversion time, samples/s, CPU cores used, resume time)
