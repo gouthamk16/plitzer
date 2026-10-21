@@ -1,5 +1,7 @@
 # Plitzer engineering design
 
+<!-- ste-allow: engineering, training, streaming, sampling -->
+
 | Field | Value |
 |---|---|
 | Status | Active. It changes with each feature PR. The code is pre-alpha. |
@@ -237,7 +239,7 @@ A document shows as `row_group/row`. Step 6 then shuffles each lane. Lane 0 read
 
 **Limits:**
 
-- `Order` panics if `window` is 0. `lane` panics if `lane` is not less than B. `gpu_lanes` panics if world does not divide B (D-11).
+- `Order::windows` panics if `window` is 0. `Order::lane` panics if `lane` is not less than B. `gpu_lanes` panics if world does not divide B, or if `rank` is not less than world (D-11).
 - A lane is empty if N is less than B.
 - Row group ids and row numbers are `u32`. FineWeb-Edu has approximately 10⁵ row groups.
 - The documents of a window mix only inside each lane. The mix quality on sorted datasets is not measured yet (section 7).
