@@ -25,10 +25,12 @@ pub struct Order<'a> {
 
 /// One window of an epoch. Only `Order::windows` builds one, so a window's
 /// number always matches its row groups and no two windows share a lane key.
+/// It caches its document count, so use it only with the `Order` that built it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Window {
     index: u64,
     groups: Vec<u32>,
+    docs: u64,
 }
 
 impl Window {
@@ -53,9 +55,14 @@ impl Order<'_> {
         let window = |(i, chunk): (usize, &[u32])| {
             let mut groups = chunk.to_vec();
             groups.sort_unstable();
+            let docs = groups
+                .iter()
+                .map(|&g| u64::from(self.rows[g as usize]))
+                .sum();
             Window {
                 index: i as u64,
                 groups,
+                docs,
             }
         };
         ids.chunks(self.window as usize)
@@ -69,25 +76,31 @@ impl Order<'_> {
     /// Lane `l` owns rows `[l·N/B, (l+1)·N/B)` of the window, so lane sizes
     /// differ by at most one and lanes are empty when N < B.
     pub fn lane(&self, window: &Window, lane: u32) -> Vec<Doc> {
-        assert!(
-            lane < self.lanes,
-            "lane {lane} out of range for {} lanes",
-            self.lanes
-        );
-        let total: u64 = window
-            .groups
-            .iter()
-            .map(|&g| u64::from(self.rows[g as usize]))
-            .sum();
-        // `l · N` can exceed u64; the quotient never does.
-        let bound = |l: u32| (u128::from(l) * u128::from(total) / u128::from(self.lanes)) as u64;
-        let mut docs = slice(&window.groups, self.rows, bound(lane)..bound(lane + 1));
+        let mut docs = slice(&window.groups, self.rows, self.bounds(window, lane));
         let purpose = Purpose::Lane {
             window: window.index,
             lane,
         };
         shuffle(&mut docs, key(self.seed, self.epoch, purpose));
         docs
+    }
+
+    /// The number of documents `lane` gets from `window`, without the shuffle.
+    pub fn lane_len(&self, window: &Window, lane: u32) -> u64 {
+        let r = self.bounds(window, lane);
+        r.end - r.start
+    }
+
+    fn bounds(&self, window: &Window, lane: u32) -> Range<u64> {
+        assert!(
+            lane < self.lanes,
+            "lane {lane} out of range for {} lanes",
+            self.lanes
+        );
+        // `l · N` can exceed u64; the quotient never does.
+        let bound =
+            |l: u32| (u128::from(l) * u128::from(window.docs) / u128::from(self.lanes)) as u64;
+        bound(lane)..bound(lane + 1)
     }
 }
 
@@ -188,6 +201,16 @@ mod tests {
                     joined.extend(lane);
                 }
                 prop_assert_eq!(joined, storage(&rows, w.groups().iter().copied()));
+            }
+        }
+
+        #[test]
+        fn lane_len_matches((rows, lanes, window, seed) in inputs()) {
+            let o = Order { seed, epoch: 3, lanes, window, rows: &rows };
+            for w in o.windows() {
+                for l in 0..lanes {
+                    prop_assert_eq!(o.lane_len(&w, l), o.lane(&w, l).len() as u64);
+                }
             }
         }
 
