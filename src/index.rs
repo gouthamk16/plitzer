@@ -1,5 +1,8 @@
 use std::fmt;
 use std::future::ready;
+use std::ops::Range;
+
+use bytes::Bytes;
 
 use futures::{StreamExt, TryStreamExt, stream};
 use object_store::path::Path;
@@ -10,9 +13,13 @@ use parquet::file::metadata::{PageIndexPolicy, ParquetMetaData, ParquetMetaDataP
 
 mod sidecar;
 
-/// Footers read at once. Each footer is one or two range requests, so this
-/// bounds the requests in flight against S3.
+/// Footers read at once. This bounds the requests in flight against S3.
 const CONCURRENT_FOOTERS: usize = 16;
+
+/// Bytes read from the end of each file in the first request. FineWeb-Edu
+/// footers are about 3.1 MiB, so this fits one in a single request; a larger
+/// footer needs a second.
+const TAIL: u64 = 4 << 20;
 
 /// One Parquet file of the dataset.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -34,6 +41,8 @@ pub enum Error {
     Footer { path: String, source: ParquetError },
     /// A row count or the number of row groups does not fit in `u32`.
     TooLarge { path: String },
+    /// No `.parquet` file is below the prefix.
+    NoFiles { prefix: String },
     /// The sidecar could not be written.
     Cache(std::io::Error),
 }
@@ -48,6 +57,7 @@ impl fmt::Display for Error {
             Error::TooLarge { path } => {
                 write!(f, "{path} has more rows or row groups than fit in u32")
             }
+            Error::NoFiles { prefix } => write!(f, "no .parquet files below {prefix:?}"),
             Error::Cache(e) => write!(f, "writing the index cache failed: {e}"),
         }
     }
@@ -58,7 +68,7 @@ impl std::error::Error for Error {
         match self {
             Error::Store(e) => Some(e),
             Error::Footer { source, .. } => Some(source),
-            Error::TooLarge { .. } => None,
+            Error::TooLarge { .. } | Error::NoFiles { .. } => None,
             Error::Cache(e) => Some(e),
         }
     }
@@ -162,7 +172,8 @@ impl Index {
     }
 }
 
-/// The `.parquet` files below `prefix`, sorted by path. Local listings come
+/// The `.parquet` files below `prefix`, sorted by path. None is an error,
+/// since a wrong prefix would otherwise give an empty index. Local listings come
 /// back in directory order, which differs between machines.
 async fn list(store: &dyn ObjectStore, prefix: &Path) -> Result<Vec<ObjectMeta>, Error> {
     let mut metas: Vec<ObjectMeta> = store
@@ -170,6 +181,11 @@ async fn list(store: &dyn ObjectStore, prefix: &Path) -> Result<Vec<ObjectMeta>,
         .try_filter(|m| ready(m.location.extension() == Some("parquet")))
         .try_collect()
         .await?;
+    if metas.is_empty() {
+        return Err(Error::NoFiles {
+            prefix: prefix.to_string(),
+        });
+    }
     metas.sort_by(|a, b| a.location.cmp(&b.location));
     Ok(metas)
 }
@@ -225,6 +241,8 @@ async fn footer(
 ) -> Result<ParquetMetaData, ParquetError> {
     let mut decoder = ParquetMetaDataPushDecoder::try_new(meta.size)?
         .with_page_index_policy(PageIndexPolicy::Skip);
+    let (range, tail) = tail(store, meta).await?;
+    decoder.push_range(range, tail)?;
     loop {
         match decoder.try_decode()? {
             DecodeResult::Data(metadata) => return Ok(metadata),
@@ -232,7 +250,7 @@ async fn footer(
                 let data = store
                     .get_ranges(&meta.location, &ranges)
                     .await
-                    .map_err(|e| ParquetError::External(Box::new(e)))?;
+                    .map_err(external)?;
                 decoder.push_ranges(ranges, data)?;
             }
             DecodeResult::Finished => {
@@ -240,6 +258,35 @@ async fn footer(
             }
         }
     }
+}
+
+/// The last `TAIL` bytes of the file, which usually hold the whole footer,
+/// so most files need one request. Also checks the footer length against
+/// the file size: parquet 60 panics on a length larger than the file.
+async fn tail(
+    store: &dyn ObjectStore,
+    meta: &ObjectMeta,
+) -> Result<(Range<u64>, Bytes), ParquetError> {
+    let range = meta.size.saturating_sub(TAIL)..meta.size;
+    let mut data = store
+        .get_ranges(&meta.location, std::slice::from_ref(&range))
+        .await
+        .map_err(external)?;
+    let tail = data.pop().unwrap_or_default();
+    let len = tail
+        .len()
+        .checked_sub(8)
+        .map(|end| u32::from_le_bytes(tail[end..end + 4].try_into().unwrap()));
+    match len {
+        Some(len) if u64::from(len) + 8 <= meta.size => Ok((range, tail)),
+        _ => Err(ParquetError::General(
+            "footer length is larger than the file".into(),
+        )),
+    }
+}
+
+fn external(e: object_store::Error) -> ParquetError {
+    ParquetError::External(Box::new(e))
 }
 
 #[cfg(test)]

@@ -382,7 +382,7 @@ pub struct File {
 
 pub struct Index { /* private: files, starts */ }
 
-pub enum Error { Store(..), Footer { path, source }, TooLarge { path }, Cache(..) }
+pub enum Error { Store(..), Footer { path, source }, TooLarge { path }, NoFiles { prefix }, Cache(..) }
 
 impl Index {
     pub async fn build(store: &dyn ObjectStore, prefix: &Path) -> Result<Index, Error>;
@@ -396,10 +396,13 @@ impl Index {
 
 **Design:** `Index::build` does these steps:
 
-1. List the files below the prefix through `object_store`. Keep only the `.parquet` files.
+1. List the files below the prefix through `object_store`. Keep only the `.parquet` files. If there are none, return `Error::NoFiles`.
 2. Sort the files by path.
-3. Read the footer of each file with `ParquetMetaDataPushDecoder`. Read 16 footers at the same time. Do not read the page indexes.
-4. Keep the row count of each row group.
+3. Read the last 4 MiB of each file in one request. Make sure that the footer length is not larger than the file.
+4. Decode the footer with `ParquetMetaDataPushDecoder`. Do not read the page indexes. A footer larger than 4 MiB needs a second request.
+5. Keep the row count of each row group.
+
+The module reads 16 files at the same time.
 
 The id of a row group is its position in the index: files in path order, then row groups in file order. `locate` finds the file of an id with a binary search over the first id of each file.
 
@@ -429,7 +432,10 @@ The fingerprint is the 64-bit FNV-1a hash of the same layout, with no ETags.
 - The fingerprint does not include the ETag. A local ETag holds the inode and the modification time, which are different on each copy (D-21).
 - The sidecar uses its own small format. It needs no `serde` dependency, and a golden test pins the bytes (D-22).
 - If the sidecar does not exist or is corrupt, `open` builds the index again. This is not an error. The sidecar is only a cache (D-23).
-- The module writes the sidecar to a temporary file and then renames it. Thus a crash does not leave a partial sidecar.
+- The module writes the sidecar to a temporary file with a unique name and then renames it. Thus the processes of all GPUs on one node can write at the same time, and no process reads a half-written sidecar.
+- The first request reads 4 MiB, because a FineWeb-Edu footer is approximately 3.1 MiB. Thus most files need one request, not two.
+- The module checks the footer length itself, because `parquet` 60 panics on a footer length that is larger than the file.
+- A prefix with no `.parquet` files gives an error. An empty index for a wrong prefix gives no data and no error.
 
 **Limits:**
 
@@ -437,6 +443,9 @@ The fingerprint is the 64-bit FNV-1a hash of the same layout, with no ETags.
 - A row count or the number of row groups above `u32::MAX` gives `Error::TooLarge`.
 - `locate` panics if the id is not in the index.
 - The sidecar is valid only for the same prefix. Use one sidecar for each dataset.
+- If the store gives no ETag, the cache check uses only the path and the size. S3 and local disk give ETags.
+- A file name below the prefix that is not UTF-8 stops the build with `Error::Store`.
+- The module does not flush the sidecar to the disk before the rename. After a power loss, a damaged sidecar only causes a new build.
 - No test shows that `open` skips the page indexes. Code review checks it.
 
 **Verification:**
@@ -447,8 +456,10 @@ The fingerprint is the 64-bit FNV-1a hash of the same layout, with no ETags.
 | `open_writes_and_reuses_cache` | Unit | `open` writes the sidecar, and a second `open` gives the same index. |
 | `open_uses_cache_without_footers` | Unit | A sidecar with false row counts that matches the list of files is used, so no footer is read. A stale ETag causes a new build. |
 | `open_rebuilds_on_change` | Unit | A changed file, a new file and a corrupt sidecar each cause a new build. |
-| `bad_footer_names_file` | Unit | A file with a bad footer gives `Error::Footer` with its path. |
-| `fingerprint_golden` | Unit | The fingerprint is the same on each OS and does not change with the ETag. It changes with a row count. |
+| `bad_footer_names_file` | Unit | A bad magic number, a file that is too short and a footer length larger than the file each give `Error::Footer` with the path. |
+| `no_files_is_an_error` | Unit | A prefix with no `.parquet` files gives `Error::NoFiles`. |
+| `concurrent_open_shares_cache` | Unit | Eight processes that open a cold cache at the same time all succeed, in ten rounds. |
+| `fingerprint_golden` | Unit | The fingerprint and the hash of the sidecar bytes are the same on each OS. The fingerprint does not change with the ETag, but it changes with a row count. |
 | `sidecar_roundtrip` | Property | Each index is the same after encode and decode. |
 | `decode_never_panics` | Property | A truncated sidecar and random bytes give `None`, not a panic. |
 | `locate_past_end_panics` | Unit | `locate` panics for an id after the last row group. |

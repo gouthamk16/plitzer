@@ -6,7 +6,7 @@
 //!   row-group count u32 | rows u32 × count
 //! ```
 
-use std::io;
+use std::io::{self, Write};
 
 use super::File;
 
@@ -68,13 +68,15 @@ pub(super) fn decode(bytes: &[u8]) -> Option<Vec<File>> {
     r.0.is_empty().then_some(files)
 }
 
-/// Writes `bytes` to a temporary file next to `path`, then renames it, so a
-/// crash never leaves a partial sidecar.
+/// Writes `bytes` to a temporary file with a unique name next to `path`,
+/// then renames it. Processes that start together (one per GPU) can then
+/// write at once, and no reader sees a half-written sidecar.
 pub(super) fn write(path: &std::path::Path, bytes: &[u8]) -> io::Result<()> {
-    let mut tmp = path.as_os_str().to_owned();
-    tmp.push(".tmp");
-    std::fs::write(&tmp, bytes)?;
-    std::fs::rename(&tmp, path)
+    let dir = path.parent().filter(|d| !d.as_os_str().is_empty());
+    let mut tmp = tempfile::NamedTempFile::new_in(dir.unwrap_or(".".as_ref()))?;
+    tmp.write_all(bytes)?;
+    tmp.persist(path)?;
+    Ok(())
 }
 
 /// 64-bit FNV-1a. Its output is fixed by definition, unlike `std`'s hashers.

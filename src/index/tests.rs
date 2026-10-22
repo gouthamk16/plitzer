@@ -158,18 +158,67 @@ async fn open_rebuilds_on_change() {
 
 #[tokio::test]
 async fn bad_footer_names_file() {
-    let (dir, store, prefix) = dataset();
-    std::fs::write(dir.path().join("data/bad.parquet"), b"PAR1 not a footer").unwrap();
-    match Index::build(&store, &prefix).await {
-        Err(Error::Footer { path, .. }) => assert_eq!(path, "bad.parquet"),
-        other => panic!("expected a footer error, got {other:?}"),
+    // A bad magic number, a file shorter than a footer, and a footer length
+    // larger than the file (which panics inside parquet 60 unchecked).
+    let mut huge = b"xxxx".to_vec();
+    huge.extend(u32::MAX.to_le_bytes());
+    huge.extend(b"PAR1");
+    for bytes in [&b"PAR1 not a footer"[..], b"PAR1", &huge] {
+        let (dir, store, prefix) = dataset();
+        std::fs::write(dir.path().join("data/bad.parquet"), bytes).unwrap();
+        match Index::build(&store, &prefix).await {
+            Err(Error::Footer { path, .. }) => assert_eq!(path, "bad.parquet"),
+            other => panic!("expected a footer error, got {other:?}"),
+        }
     }
+}
+
+#[tokio::test]
+async fn no_files_is_an_error() {
+    let (_dir, store, _) = dataset();
+    let result = Index::build(&store, &Path::from("typo")).await;
+    assert!(matches!(result, Err(Error::NoFiles { .. })), "{result:?}");
+}
+
+// Processes on one node (one per GPU) open the same cold cache at once.
+#[test]
+fn concurrent_open_shares_cache() {
+    let (dir, store, prefix) = dataset();
+    let cache = dir.path().join("index.bin");
+    // Rounds on a cold cache, since a race shows up only some of the time.
+    for _ in 0..10 {
+        let _ = std::fs::remove_file(&cache);
+        open_at_once(&store, &prefix, &cache);
+    }
+    let files = sidecar::decode(&std::fs::read(&cache).unwrap()).unwrap();
+    assert_eq!(files.len(), EXPECTED.len());
+}
+
+fn open_at_once(store: &LocalFileSystem, prefix: &Path, cache: &std::path::Path) {
+    std::thread::scope(|s| {
+        let opens: Vec<_> = (0..8)
+            .map(|_| {
+                s.spawn(|| {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .build()
+                        .unwrap();
+                    rt.block_on(Index::open(store, prefix, cache)).unwrap()
+                })
+            })
+            .collect();
+        for open in opens {
+            assert_eq!(summary(&open.join().unwrap()), EXPECTED);
+        }
+    });
 }
 
 #[test]
 fn fingerprint_golden() {
     let index = Index::new(vec![file("a/x.parquet", &[2]), file("b.parquet", &[3, 1])]).unwrap();
     assert_eq!(index.fingerprint(), 2_109_774_877_995_249_362);
+    // The cache bytes, with ETags, are pinned too.
+    let cache = sidecar::fnv1a(&sidecar::encode(&index.files, true));
+    assert_eq!(cache, 10_182_121_034_693_317_030);
 
     let mut files = index.files.clone();
     files[0].e_tag = None;
