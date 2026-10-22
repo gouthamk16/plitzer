@@ -75,8 +75,23 @@ pub(super) fn write(path: &std::path::Path, bytes: &[u8]) -> io::Result<()> {
     let dir = path.parent().filter(|d| !d.as_os_str().is_empty());
     let mut tmp = tempfile::NamedTempFile::new_in(dir.unwrap_or(".".as_ref()))?;
     tmp.write_all(bytes)?;
-    tmp.persist(path)?;
-    Ok(())
+    for attempt in 0.. {
+        let Err(e) = tmp.persist(path) else {
+            return Ok(());
+        };
+        // Windows refuses to replace a file while another process has it
+        // open or is replacing it. If that process wrote the same index, the
+        // sidecar is already right; else retry briefly before giving up.
+        if std::fs::read(path).is_ok_and(|b| b == bytes) {
+            return Ok(());
+        }
+        if attempt == 5 || e.error.kind() != io::ErrorKind::PermissionDenied {
+            return Err(e.error);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10 << attempt));
+        tmp = e.file;
+    }
+    unreachable!()
 }
 
 /// 64-bit FNV-1a. Its output is fixed by definition, unlike `std`'s hashers.

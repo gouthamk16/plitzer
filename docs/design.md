@@ -433,6 +433,7 @@ The fingerprint is the 64-bit FNV-1a hash of the same layout, with no ETags.
 - The sidecar uses its own small format. It needs no `serde` dependency, and a golden test pins the bytes (D-22).
 - If the sidecar does not exist or is corrupt, `open` builds the index again. This is not an error. The sidecar is only a cache (D-23).
 - The module writes the sidecar to a temporary file with a unique name and then renames it. Thus the processes of all GPUs on one node can write at the same time, and no process reads a half-written sidecar.
+- Windows does not replace a file while a different process has it open or replaces it. If the rename fails and the sidecar already has the same bytes, a different process wrote the same index, and the write is complete. If not, the module tries again up to five times.
 - The first request reads 4 MiB, because a FineWeb-Edu footer is approximately 3.1 MiB. Thus most files need one request, not two.
 - The module checks the footer length itself, because `parquet` 60 panics on a footer length that is larger than the file.
 - A prefix with no `.parquet` files gives an error. An empty index for a wrong prefix gives no data and no error.
