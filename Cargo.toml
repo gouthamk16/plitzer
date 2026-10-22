@@ -2,13 +2,19 @@
 name = "plitzer"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 description = "Deterministic, resumable dataloader for Parquet on local disk and S3"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/gouthamk16/plitzer"
 
 [dependencies]
+bytes = "1.11.1"
+futures = "0.3.32"
+object_store = { version = "0.14.2", default-features = false, features = ["fs"] }
+parquet = { version = "60.0.0", default-features = false }
 rand_chacha = "0.10.0"
 
 [dev-dependencies]
 proptest = "1.11.0"
+tempfile = "3.27.0"
+tokio = { version = "1.52.1", features = ["rt", "macros"] }

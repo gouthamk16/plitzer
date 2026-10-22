@@ -123,7 +123,7 @@ fn slice(window: &[u32], rows: &[u32], range: Range<u64>) -> Vec<Doc> {
 /// `world` changes which GPU runs a lane, never what the lane reads.
 pub fn gpu_lanes(lanes: u32, world: u32, rank: u32) -> Range<u32> {
     assert!(
-        world > 0 && lanes % world == 0,
+        world > 0 && lanes.is_multiple_of(world),
         "world {world} must divide {lanes} lanes"
     );
     assert!(rank < world, "rank {rank} out of range for world {world}");

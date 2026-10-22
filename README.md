@@ -18,7 +18,7 @@ The design, its rationale and the decision log are in [docs/design.md](docs/desi
 - [x] **Lanes:** pack each lane's documents into fixed-length sequences, carry leftover tokens, and checkpoint each lane's state. Property tests:
   - [x] resuming at step k matches the tail of an uninterrupted run
   - [x] global batches are identical across GPU counts
-- [ ] **Index:** build a row-group index from Parquet footers, with caching
+- [x] **Index:** build a row-group index from Parquet footers, with caching
 - [ ] **I/O:** async reads with `object_store` (local disk and S3, tested against MinIO), plus a prefetch queue capped by bytes
 - [ ] **Python:** PyO3 and maturin bindings, a PyTorch `IterableDataset` with `state_dict()`, and Arrow PyCapsule export
 - [ ] **End-to-end test:** kill training at a random step, resume on a different GPU count, and check the sample-stream hash matches

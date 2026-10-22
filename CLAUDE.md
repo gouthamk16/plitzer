@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Status
 
-Plitzer is a Rust-core ML dataloader. It feeds Parquet data from local disk or S3 to PyTorch with an order that is deterministic and resumable. So far it is a library crate with four modules: `src/shuffle.rs`, a deterministic Fisher-Yates shuffle; `src/seed.rs`, which derives each shuffle's 32-byte key; `src/order.rs`, the ordering core (row-group windows, lane slices, GPU lane blocks); and `src/pack.rs`, the per-lane packer with resumable lane state. The rest of the design below is the plan, not existing code. Update this file as pieces land.
+Plitzer is a Rust-core ML dataloader. It feeds Parquet data from local disk or S3 to PyTorch with an order that is deterministic and resumable. So far it is a library crate with five modules: `src/shuffle.rs`, a deterministic Fisher-Yates shuffle; `src/seed.rs`, which derives each shuffle's 32-byte key; `src/order.rs`, the ordering core (row-group windows, lane slices, GPU lane blocks); `src/pack.rs`, the per-lane packer with resumable lane state; and `src/index.rs`, the row-group index built from Parquet footers through `object_store`, cached in a sidecar. The rest of the design below is the plan, not existing code. Update this file as pieces land.
 
 ## Commands
 
@@ -15,6 +15,8 @@ cargo test <name>          # single test, substring match
 cargo clippy --all-targets
 cargo fmt
 ```
+
+MSRV is Rust 1.88 (required by `parquet` 60).
 
 CI (`.github/workflows/ci.yml`) runs fmt, clippy with `-D warnings`, and tests on Linux, macOS and Windows. The cross-OS matrix is required because ordering output must match on every platform.
 
@@ -31,7 +33,7 @@ The pitch is MosaicML Streaming's guarantees, read directly from existing Parque
 
 Pipeline: **index → order → read → pack → Python**
 
-- **Index:** read only Parquet footers to build a list of `(file, row_group, num_rows)`, and cache it as a compact sidecar file. Footers are large: about 3.1 MiB per FineWeb-Edu file, about 9.4 GB across the dataset. Rereading them on every start isn't an option.
+- **Index:** read only Parquet footers (parquet's `ParquetMetaDataPushDecoder` over `object_store`, no arrow) to build a list of `(file, row_group, num_rows)`, sorted by path, and cache it as a compact sidecar file. The cache is reused while every file's path, size and ETag match the listing. Footers are large: about 3.1 MiB per FineWeb-Edu file, about 9.4 GB across the dataset. Rereading them on every start isn't an option.
 - **Order:** a pure function of `(seed, epoch, step)`. Nothing about the order is stored.
   - Each epoch, shuffle the row groups (`Purpose::RowGroups`) and group them into windows of W row groups.
   - Within a window, row groups are in storage order. The global batch has B **lanes** (sequence slots), and each lane owns one contiguous slice of the window. Each lane shuffles its slice with `Purpose::Lane { window, lane }`.

@@ -5,7 +5,7 @@
 | Field | Value |
 |---|---|
 | Status | Active. It changes with each feature PR. The code is pre-alpha. |
-| Last change | 2026-10-21, PR #8 |
+| Last change | 2026-10-22, PR #10 |
 | Language standard | ASD-STE100 (Simplified Technical English) |
 | Code | `src/` at the commit of this file |
 
@@ -72,6 +72,10 @@ Each term has only one definition in this document.
 | Pad token | The token that fills the end of a sequence that has too few tokens. |
 | Key | The 32-byte seed of one shuffle. Only `seed::key` makes a key. |
 | Read amplification | The bytes that one GPU reads, divided by the bytes of its own data. |
+| Prefix | The folder or key prefix in the store below which the dataset files are. |
+| Sidecar | The file that keeps the index between starts. |
+| ETag | A version tag that the store gives to each file. It changes when the file changes. |
+| Fingerprint | A 64-bit hash of the index without the ETags. |
 
 ## 3. Requirements
 
@@ -84,6 +88,7 @@ Each term has only one definition in this document.
 | REQ-5 | The output is the same on Linux, macOS and Windows. | CI runs the golden tests on the three systems. | Met |
 | REQ-6 | Read amplification is approximately 1 + world/W or less. | Planned: measurement on FineWeb-Edu. | Planned |
 | REQ-7 | A dependency upgrade does not change the order without a test failure. | Golden tests pin the shuffle output and the key bytes. | Met |
+| REQ-8 | A start with an unchanged dataset reads no Parquet footers. | `index::open_uses_cache_without_footers`. | Met |
 
 ## 4. System overview
 
@@ -96,7 +101,7 @@ flowchart LR
     read --> pack["Pack<br/>L-token sequences"]
     pack --> python["Python<br/>IterableDataset"]
     classDef done fill:#d4edda,stroke:#2e7d32,color:#1b5e20
-    class order,pack done
+    class index,order,pack done
 ```
 
 | Component | Module | Status | Section |
@@ -105,10 +110,10 @@ flowchart LR
 | Seed key | `src/seed.rs` | Implemented | [5.2](#52-seed-key) |
 | Order | `src/order.rs` | Implemented | [5.3](#53-order) |
 | Pack | `src/pack.rs` | Implemented | [5.4](#54-pack) |
-| Checkpoint | — | Planned | [5.5](#55-planned-components) |
-| Index | — | Planned | [5.5](#55-planned-components) |
-| Read (I/O) | — | Planned | [5.5](#55-planned-components) |
-| Python bindings | — | Planned | [5.5](#55-planned-components) |
+| Index | `src/index.rs` | Implemented | [5.5](#55-index) |
+| Checkpoint | — | Planned | [5.6](#56-planned-components) |
+| Read (I/O) | — | Planned | [5.6](#56-planned-components) |
+| Python bindings | — | Planned | [5.6](#56-planned-components) |
 
 ## 5. Component design
 
@@ -361,13 +366,99 @@ At step 0, the leftover has 9 tokens. The lane copies 4 tokens. Then it removes 
 
 The property tests use small inputs. Thus empty documents, empty lanes, C = 0, C < L and L = 1 occur frequently.
 
-### 5.5 Planned components
+### 5.5 Index
+
+**Function:** The index module makes the list of all row groups of a dataset and their row counts. It reads only the Parquet footers. It keeps the list in a sidecar, so that a start with an unchanged dataset reads no footers.
+
+**Interface:**
+
+```rust
+pub struct File {
+    pub path: String,          // below the prefix, with "/" separators
+    pub size: u64,
+    pub e_tag: Option<String>,
+    pub rows: Vec<u32>,        // row count of each row group
+}
+
+pub struct Index { /* private: files, starts */ }
+
+pub enum Error { Store(..), Footer { path, source }, TooLarge { path }, Cache(..) }
+
+impl Index {
+    pub async fn build(store: &dyn ObjectStore, prefix: &Path) -> Result<Index, Error>;
+    pub async fn open(store: &dyn ObjectStore, prefix: &Path, cache: &std::path::Path) -> Result<Index, Error>;
+    pub fn files(&self) -> &[File];
+    pub fn rows(&self) -> Vec<u32>;                           // the input of Order::rows
+    pub fn locate(&self, row_group: u32) -> (usize, usize);   // (file, row group in the file)
+    pub fn fingerprint(&self) -> u64;
+}
+```
+
+**Design:** `Index::build` does these steps:
+
+1. List the files below the prefix through `object_store`. Keep only the `.parquet` files.
+2. Sort the files by path.
+3. Read the footer of each file with `ParquetMetaDataPushDecoder`. Read 16 footers at the same time. Do not read the page indexes.
+4. Keep the row count of each row group.
+
+The id of a row group is its position in the index: files in path order, then row groups in file order. `locate` finds the file of an id with a binary search over the first id of each file.
+
+`Index::open` lists the files and reads the sidecar. If the path, size and ETag of each file are equal to the new list of files, `open` uses the sidecar and reads no footers. If not, it builds the index again and writes a new sidecar.
+
+The sidecar has this layout. All integers are little-endian.
+
+| Field | Type |
+|---|---|
+| Magic | 8 bytes, `PLTZIDX\0` |
+| Version | `u32`, 1 |
+| File count | `u32` |
+| For each file: path | `u32` length, then UTF-8 bytes |
+| For each file: size | `u64` |
+| For each file: ETag | `u8` flag (0 or 1), then a length and UTF-8 bytes if the flag is 1 |
+| For each file: rows | `u32` count, then one `u32` for each row group |
+
+The fingerprint is the 64-bit FNV-1a hash of the same layout, with no ETags.
+
+**Rationale:**
+
+- The push decoder needs no `arrow` and no `async` features of `parquet`. The async reader of `parquet` needs all of `arrow` (D-18).
+- The index uses `object_store` from the start. Thus local disk and S3 use the same code, and the footers of S3 are the expensive case (D-19).
+- The list of files from local disk comes in directory order, which is different on each machine. The sort makes the ids the same on each machine.
+- The paths are below the prefix and use `/`. Thus a copy of the dataset on S3 and on local disk gives the same index.
+- The cache check compares the ETag, because a file can change and keep its size (D-20).
+- The fingerprint does not include the ETag. A local ETag holds the inode and the modification time, which are different on each copy (D-21).
+- The sidecar uses its own small format. It needs no `serde` dependency, and a golden test pins the bytes (D-22).
+- If the sidecar does not exist or is corrupt, `open` builds the index again. This is not an error. The sidecar is only a cache (D-23).
+- The module writes the sidecar to a temporary file and then renames it. Thus a crash does not leave a partial sidecar.
+
+**Limits:**
+
+- `open` reads and writes the sidecar with synchronous file calls. The sidecar is small, and `open` runs one time at the start.
+- A row count or the number of row groups above `u32::MAX` gives `Error::TooLarge`.
+- `locate` panics if the id is not in the index.
+- The sidecar is valid only for the same prefix. Use one sidecar for each dataset.
+- No test shows that `open` skips the page indexes. Code review checks it.
+
+**Verification:**
+
+| Test | Type | What it shows |
+|---|---|---|
+| `build_reads_row_groups` | Unit | The row groups of Parquet files in nested folders, in path order. Other files are not in the index. `locate` is correct at each file edge. |
+| `open_writes_and_reuses_cache` | Unit | `open` writes the sidecar, and a second `open` gives the same index. |
+| `open_uses_cache_without_footers` | Unit | A sidecar with false row counts that matches the list of files is used, so no footer is read. A stale ETag causes a new build. |
+| `open_rebuilds_on_change` | Unit | A changed file, a new file and a corrupt sidecar each cause a new build. |
+| `bad_footer_names_file` | Unit | A file with a bad footer gives `Error::Footer` with its path. |
+| `fingerprint_golden` | Unit | The fingerprint is the same on each OS and does not change with the ETag. It changes with a row count. |
+| `sidecar_roundtrip` | Property | Each index is the same after encode and decode. |
+| `decode_never_panics` | Property | A truncated sidecar and random bytes give `None`, not a panic. |
+| `locate_past_end_panics` | Unit | `locate` panics for an id after the last row group. |
+
+### 5.6 Planned components
 
 These components are not in the code yet. Their sections will have the full set of parts when they are implemented.
 
-- **Checkpoint:** A checkpoint holds `seed`, `epoch` and the lane state of each lane. It also holds B, W, L, D, C and a fingerprint of the index. A resume with different values must stop with an error.
-- **Index:** The index reads only the Parquet footers and makes the list of `(file, row_group, num_rows)`. Plitzer keeps the index in a small sidecar file. The footers of FineWeb-Edu are approximately 9.4 GB in total, so Plitzer must not read them again at each start.
-- **Read:** The read stage uses `object_store` and the async reader of the `parquet` crate, on tokio. It implements `AsyncFileReader` directly, because `ParquetObjectReader` is deprecated as of parquet 59.2. A byte limit controls the prefetch, not a batch count. It supplies tokens to the pack module through the `Tokens` trait.
+- **Checkpoint:** A checkpoint holds `seed`, `epoch` and the lane state of each lane. It also holds B, W, L, D, C and `Index::fingerprint`. A resume with different values must stop with an error.
+- **Read:** The read stage uses `object_store` and the async reader of the `parquet` crate, on tokio. It implements `AsyncFileReader` directly, because `ParquetObjectReader` is deprecated as of parquet 59.2. A byte limit controls the prefetch, not a batch count. It finds the file of each row group with `Index::locate`, and supplies tokens to the pack module through the `Tokens` trait.
 - **Python:** The bindings use PyO3 and maturin. Batches go to Python through the Arrow PyCapsule interface. A PyTorch `IterableDataset` gives `state_dict()` and `load_state_dict()`. Users must set `num_workers=0`. The parallel work is in Rust, and a fork of a process with a tokio runtime is not safe.
 
 ## 6. Read amplification
@@ -412,6 +503,12 @@ These components are not in the code yet. Their sections will have the full set 
 | D-15 | `fill` writes into a buffer from the caller. | One buffer for each GPU batch, with no copy. | Return a new `Vec` for each sequence. | #8 |
 | D-16 | The pack module reads tokens through the `Tokens` trait. | The Read stage does not exist yet. Tests use a corpus in memory, and the Read stage can implement the trait later. | A fixed token source, such as a `Vec` of all tokens. | #8 |
 | D-17 | `LaneState` holds the step. | A state cannot go with a different step, which gives wrong sequences with no error. | A separate step input to `Epoch::lane`. | #8 |
+| D-18 | Read footers with `ParquetMetaDataPushDecoder`. | It needs no `arrow`, and it does no I/O of its own. | `ParquetMetaDataReader`: its async API needs all of `arrow`. `ParquetObjectReader`: deprecated. | #10 |
+| D-19 | Build the index over `object_store` from the start. | Local disk and S3 use the same code, and S3 is the expensive case. | Local files only, with S3 in the Read PR. | #10 |
+| D-20 | The cache is valid if the path, size and ETag of each file are the same. | A file can change and keep its size. | Path and size only. | #10 |
+| D-21 | The fingerprint does not include the ETag. | A local ETag holds the inode and modification time, so it is different on each copy. | A hash of the full sidecar. | #10 |
+| D-22 | The sidecar uses its own binary format and FNV-1a. | No new dependency, and the bytes are fixed by our code. | `serde` with `bincode`, or JSON. | #10 |
+| D-23 | A sidecar that does not exist or is corrupt causes a new build. | The sidecar is only a cache. | An error that the user must correct. | #10 |
 
 ## 9. Change log
 
@@ -421,6 +518,7 @@ These components are not in the code yet. Their sections will have the full set 
 | 2026-10-19 | #4 | Add the seed key (`src/seed.rs`) and the `from_seed` ban. Change the planned design to lanes. |
 | 2026-10-21 | #6 | Add the order (`src/order.rs`) and `proptest`. Add this document. |
 | 2026-10-21 | #8 | Add the packer (`src/pack.rs`) and `Order::lane_len`. |
+| 2026-10-22 | #10 | Add the index (`src/index.rs`), `object_store` and `parquet`. Increase the minimum Rust version to 1.88. |
 
 ## 10. Maintenance
 
