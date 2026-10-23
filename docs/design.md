@@ -5,7 +5,7 @@
 | Field | Value |
 |---|---|
 | Status | Active. It changes with each feature PR. The code is pre-alpha. |
-| Last change | 2026-10-23, PR #14 |
+| Last change | 2026-10-23, PR #16 |
 | Language standard | ASD-STE100 (Simplified Technical English) |
 | Code | `src/` at the commit of this file |
 
@@ -79,6 +79,8 @@ Each term has only one definition in this document.
 | Budget | The most bytes of decoded tokens that the loader of one GPU keeps in memory. |
 | Need plan | The list of row groups that one GPU needs, each with the first and last step that needs it. |
 | Token column | The Parquet column that holds the tokens of each document as a list of integers. |
+| Checkpoint part | The checkpoint of the lanes of one GPU. |
+| Global checkpoint | A checkpoint that holds all B lanes. It resumes on each GPU count. |
 | Column chunk | The bytes of one column in one row group. |
 | Codec | The compression method of a column chunk, such as Snappy or Zstd. |
 
@@ -89,12 +91,13 @@ Each term has only one definition in this document.
 | REQ-1 | The order is a pure function of `(seed, epoch, step)` and the index. | Golden tests in `shuffle`, `seed`, `order` and `pack`. | Met for the order and the packer |
 | REQ-2 | Each epoch supplies each document exactly once. The only exception is leftover tokens that a lane drops at its cap. | `order::exactly_once` and `pack::exactly_once_tokens` (property tests). | Met for the order and the packer |
 | REQ-3 | Lanes and their slices depend only on `(seed, epoch, B, W)`. They do not depend on world. | `Order` has no world input. `order::gpu_lanes_partition` (property test). | Met |
-| REQ-4 | A resume at step k gives the same tail as a run without a stop. This is also true when world changes. | `pack::resume_matches_tail` and `pack::world_invariant` (property tests). Planned: end-to-end test. | Met in the packer |
+| REQ-4 | A resume at step k gives the same tail as a run without a stop. This is also true when world changes. | `pack::resume_matches_tail` and `pack::world_invariant` (property tests). `session::resume_on_another_world_matches_one_run` reads Parquet files through checkpoint bytes. | Met |
 | REQ-5 | The output is the same on Linux, macOS and Windows. | CI runs the golden tests on the three systems. | Met |
 | REQ-6 | Read amplification is approximately 1 + world/W or less. | The reader reads no footer (`read::reads_without_footer`). Each GPU reads only its own slices (`load::reads_only_own_row_groups`). Planned: measurement on FineWeb-Edu. | Partly met |
 | REQ-7 | A dependency upgrade does not change the order without a test failure. | Golden tests pin the shuffle output and the key bytes. | Met |
 | REQ-8 | A start with an unchanged dataset reads no Parquet footers. | `index::open_uses_cache_without_footers`. | Met |
 | REQ-9 | The decoded tokens in memory stay at or below the budget, and a budget that the loader accepts never stops it. | `load::budget_is_checked_and_kept`. | Met |
+| REQ-10 | A resume with different settings or a different dataset stops with an error that names the field. | `checkpoint::check_names_the_field` and `session::resume_refuses_other_runs`. | Met |
 
 ## 4. System overview
 
@@ -117,10 +120,11 @@ flowchart LR
 | Order | `src/order.rs` | Implemented | [5.3](#53-order) |
 | Pack | `src/pack.rs` | Implemented | [5.4](#54-pack) |
 | Index | `src/index.rs` | Implemented | [5.5](#55-index) |
-| Checkpoint | — | Planned | [5.8](#58-planned-components) |
 | Read | `src/read.rs` | Implemented | [5.6](#56-read) |
 | Loader | `src/load.rs` | Implemented | [5.7](#57-loader) |
-| Python bindings | — | Planned | [5.8](#58-planned-components) |
+| Checkpoint | `src/checkpoint.rs` | Implemented | [5.8](#58-checkpoint) |
+| Session | `src/session.rs` | Implemented | [5.9](#59-session) |
+| Python bindings | — | Planned | [5.10](#510-planned-components) |
 
 ## 5. Component design
 
@@ -574,6 +578,7 @@ impl Loader {
     pub async fn new(epoch: Arc<Epoch>, reader: Arc<Reader>, index: Arc<Index>,
                      lanes: Range<u32>, states: &[LaneState], budget: u64) -> Result<Loader, Error>;
     pub async fn next(&mut self, out: &mut [u32]) -> Result<Option<Vec<u32>>, Error>;
+    pub fn ended(&self) -> bool;               // true after the last step of the epoch
     pub fn states(&self) -> Vec<LaneState>;   // the part of the checkpoint for this GPU
     pub fn resident_bytes(&self) -> usize;
 }
@@ -621,6 +626,7 @@ The decoded row group keeps its permits. The loader releases the permits when it
 - The loader stops all read tasks when it is dropped.
 - The loader has a maximum of 16 reads at the same time. Without this limit, a large budget starts thousands of requests at the start. The index has the same limit for footers.
 - If a read fails, `next` returns the error, and the next calls return `Error::Stopped`. The lanes did not change in the failed step, so `states()` is a correct point to resume from.
+- `next` is cancel safe. The loader keeps the read that it waits for, so a dropped `next` loses no row group (D-44).
 
 **Limits:**
 
@@ -645,12 +651,151 @@ The decoded row group keeps its permits. The loader releases the permits when it
 | `plan_matches_lane_streams` | Unit | Each document that a lane takes at step s, also at a resume, is in a row group that the plan needs at s. |
 | `lane_groups_match` | Property | `Order::lane_groups` gives the row groups that `Order::lane` uses. |
 
-### 5.8 Planned components
+### 5.8 Checkpoint
+
+**Function:** A checkpoint holds the settings, the fingerprint, the epoch and the lane states of some lanes. It changes to bytes and back. It refuses a resume with different settings or a different dataset.
+
+**Interface:**
+
+```rust
+pub struct Config { pub column: String, pub seed: u64, pub lanes: u32 /* B */,
+                    pub window: u32 /* W */, pub packing: Packing }
+
+pub struct Checkpoint {
+    pub config: Config,
+    pub fingerprint: u64,     // Index::fingerprint
+    pub epoch: u64,
+    pub first_lane: u32,      // lanes[i] is the state of lane first_lane + i
+    pub lanes: Vec<LaneState>,
+}
+
+impl Checkpoint {
+    pub fn to_bytes(&self) -> Vec<u8>;
+    pub fn from_bytes(bytes: &[u8]) -> Result<Checkpoint, Error>;
+    pub fn merge(parts: Vec<Checkpoint>) -> Result<Checkpoint, Error>;
+    pub fn is_global(&self) -> bool;
+    pub fn states(&self, lanes: Range<u32>) -> Result<Vec<LaneState>, Error>;
+    pub fn check(&self, config: &Config, fingerprint: u64) -> Result<(), Error>;
+}
+
+pub enum Error { Bytes(&'static str), Version(u32), Checksum,
+                 Mismatch { field, saved, now }, Parts(String) }
+```
+
+**Design:** The bytes have this layout. All integers are little-endian.
+
+| Field | Type |
+|---|---|
+| Magic | `PLTZCKPT` (8 bytes) |
+| Version | u32, now 1 |
+| Column | u32 length, then UTF-8 |
+| Seed | u64 |
+| B, W, L, D, C, pad token | 6 × u32 |
+| Fingerprint | u64 |
+| Epoch | u64 |
+| First lane | u32 |
+| Lane count | u32 |
+| Each lane | step u64, doc u64, offset u32 |
+| Checksum | u64, FNV-1a of all bytes before it |
+
+Each GPU gives a checkpoint part for its own lanes. `merge` puts the parts of all GPUs into one global checkpoint:
+
+1. Make sure that all parts have the same config, fingerprint, epoch and step.
+2. Sort the parts by first lane.
+3. Make sure that the parts hold lanes 0 to B − 1, each lane one time.
+
+`check` compares the settings and the fingerprint in a fixed order. It gives the name of the first field that is different.
+
+**Rationale:**
+
+- The checkpoint is bytes. `torch.load(weights_only=True)` accepts bytes, but not a custom class. Rust and Python use the same format (D-37).
+- A global checkpoint resumes on each GPU count. Some trainers save the state of rank 0 only, so each rank must be able to make the global checkpoint (D-38).
+- Different settings or a different dataset give different batches with no error. Thus a resume with them stops (D-39).
+- The format has a version and a checksum, so a damaged or old checkpoint gives a clear error. `from_bytes` checks the checksum first (D-45).
+- `from_bytes` does not reserve memory from the lane count in the bytes.
+
+**Limits:**
+
+- The checksum finds damage, not changes by an attacker.
+- `from_bytes` does not make sure that each lane state is correct for the epoch. A state that the checksum accepts but the epoch does not accept causes a panic in `Epoch::lane`.
+
+**Verification:**
+
+| Test | Type | What it shows |
+|---|---|---|
+| `golden_bytes` | Unit | The bytes of a fixed checkpoint are the same as bytes that Python's `struct` module made. |
+| `bytes_round_trip` | Property | `from_bytes(to_bytes(c))` gives `c`. |
+| `damaged_bytes_are_refused` | Unit | A changed bit, a changed version without a new checksum, a different version, no magic and too few bytes each give their error. |
+| `any_bytes_give_an_error_not_a_panic` | Property | Random bytes never cause a panic, also with a correct checksum. |
+| `truncation_is_refused` | Property | A checkpoint with bytes removed from its end gives an error. |
+| `merge_tiles_the_lanes` | Unit | Parts in any order give one global checkpoint. |
+| `merge_refuses_bad_parts` | Unit | No parts, a missing lane, a gap, an overlap and different steps, configs or epochs each give `Error::Parts`. |
+| `states_of_a_part` | Unit | `states` gives lanes that the part holds, and refuses other lanes and lanes at different steps. |
+| `check_names_the_field` | Unit | `check` gives the name of the field that is different. |
+
+### 5.9 Session
+
+**Function:** A session runs the lanes of one GPU from one epoch to the next. It opens the dataset, makes the loader of each epoch, and gives the checkpoint part of the GPU.
+
+**Interface:**
+
+```rust
+impl Session {
+    pub async fn open(store: Arc<dyn ObjectStore>, prefix: Path, cache: &std::path::Path,
+                      config: Config, rank: u32, world: u32, budget: u64) -> Result<Session, Error>;
+    pub fn set_epoch(&mut self, epoch: u64);
+    pub fn resume(&mut self, checkpoint: &Checkpoint) -> Result<(), Error>;
+    pub async fn next(&mut self, out: &mut [u32]) -> Result<Option<Vec<u32>>, Error>;
+    pub fn checkpoint(&self) -> Checkpoint;    // the part of this GPU
+    pub fn epoch(&self) -> u64;
+    pub fn lanes(&self) -> Range<u32>;
+}
+
+pub enum Error { Config(String), Index(index::Error), Read(read::Error),
+                 Load(load::Error), Checkpoint(checkpoint::Error) }
+```
+
+**Design:**
+
+- `open` checks the config, opens the index with `Index::open`, and makes the reader. The lanes are `gpu_lanes(B, world, rank)`.
+- The session keeps the lane states to start from. `set_epoch` sets them to the start of a later epoch. It does nothing for the current epoch or an earlier one. `resume` takes them from a checkpoint after `check`.
+- `next` makes the loader of the epoch at the first step. At the end of the epoch, `next` returns `None`, and the session goes to step 0 of the next epoch.
+- If `next` fails, the session keeps the lane states of the loader and drops the loader. The next call makes a new loader and tries the same step again.
+- `checkpoint` gives the lane states of the loader. Before the first step of an epoch, it gives the start states. After the last step of an epoch, it gives `(epoch + 1, step 0)`, also before the call of `next` that returns `None`.
+
+**Rationale:**
+
+- After the last step of an epoch, a checkpoint holds `(epoch + 1, step 0)`. A resume from it starts the next epoch, not an empty end of the old epoch. The parts of all GPUs agree, also if only some GPUs received `None` (D-40).
+- Trainers call `set_epoch` at the start of each epoch, also the epoch that they resumed into. A checkpoint after the last step of an epoch is at the next epoch. Thus `set_epoch` only goes forward, and a resume never repeats data (D-43).
+- The Python bindings give the config to `open`. Thus `open` returns `Error::Config` for a config that would cause a panic (D-41).
+- A failed read leaves the lane states before the failed step. Thus a retry can continue, and the caller does not have to make a new session (D-42).
+- The session calculates the fingerprint one time. The fingerprint encodes the full index.
+
+**Limits:**
+
+- `resume` does not read data. A budget that is too small for the resume step gives its error at the next call of `next`.
+- All GPUs must call `next` the same number of times, as in each data-parallel run.
+
+**Verification:**
+
+| Test | Type | What it shows |
+|---|---|---|
+| `resume_on_another_world_matches_one_run` | Unit | Runs on world a stop at step k, also at and after the end of an epoch. Their merged checkpoint resumes on world b. The batches are the same as one run on world 1 with no stop. |
+| `epochs_roll_over` | Unit | After the last step, the checkpoint holds epoch 1 and the start states, before and after `None`. Parts from a GPU that received `None` and a GPU that did not merge. The batches of epoch 1 are not the same as epoch 0. |
+| `set_epoch_starts_that_epoch` | Unit | `set_epoch(1)` after some steps gives the batches of epoch 1. |
+| `set_epoch_keeps_a_resume_in_that_epoch` | Unit | `set_epoch(0)` after a resume in epoch 0 keeps the resumed position. |
+| `set_epoch_never_goes_back` | Unit | `set_epoch(0)` after a resume from the end of epoch 0 gives the batches of epoch 1. |
+| `next_is_cancel_safe` | Unit | Calls of `next` that are dropped before they finish give the same batches as a run with no drops. |
+| `resume_refuses_other_runs` | Unit | A different L, a different seed and an added file each give `Mismatch` with the name of the field. |
+| `resume_needs_this_ranks_lanes` | Unit | A part resumes the rank that holds its lanes, and another rank refuses it. |
+| `open_refuses_bad_settings` | Unit | A world that does not divide B, a rank out of range, no GPUs, W = 0 and D = 0 each give `Error::Config`. |
+| `next_retries_after_a_failed_read` | Unit | After a failed read and a repair of the file, the next calls give the same batches as a run with no failure. |
+
+### 5.10 Planned components
 
 These components are not in the code yet. Their sections will have the full set of parts when they are implemented.
 
-- **Checkpoint:** A checkpoint holds `seed`, `epoch` and the lane state of each lane. It also holds B, W, L, D, C and `Index::fingerprint`. A resume with different values must stop with an error.
-- **Python:** The bindings use PyO3 and maturin. Batches go to Python through the Arrow PyCapsule interface. A PyTorch `IterableDataset` gives `state_dict()` and `load_state_dict()`. Users must set `num_workers=0`. The parallel work is in Rust, and a fork of a process with a tokio runtime is not safe.
+- **Python:** The bindings use PyO3 and maturin. Batches go to Python through DLPack and the Arrow PyCapsule interface. A PyTorch `IterableDataset` gives `state_dict()` and `load_state_dict()`. Users must set `num_workers=0`. The parallel work is in Rust, and a fork of a process with a tokio runtime is not safe.
 
 ## 6. Read amplification
 
@@ -686,7 +831,7 @@ These components are not in the code yet. Their sections will have the full set 
 | D-8 | `Window` holds its own index, and only `Order::windows` makes one. | A caller cannot mix the number of one window with the row groups of a different window. | Separate `index` and `&[u32]` inputs to `lane`. | #6 |
 | D-9 | Use `proptest` for the properties of the order. | The inputs (row counts, W, B, seed) have a real input space. | Fixed loops over a few cases. | #6 |
 | D-10 | Lane slices have equal document counts, not equal token counts. | Simple and exact. Token balance is a Pack problem. | Slices by token count. | #6 |
-| D-11 | Invalid configuration causes a panic. | It is a programmer error until the Python bindings exist. | `Result` errors now. | #6 |
+| D-11 | Invalid configuration causes a panic. | It is a programmer error until the Python bindings exist. D-41 changes this for `Session`. | `Result` errors now. | #6 |
 | D-12 | The cap removes the oldest leftover tokens. | The leftover is one run to the cursor, so `(doc, offset)` is the full lane state. | Remove the newest tokens: documents stay whole, but the leftover gets gaps and the state becomes a list of ranges. | #8 |
 | D-13 | Each epoch ends with `ceil(C / L)` steps that empty the leftovers. | Only the cap drops tokens, and the epoch length is known before the read. | Drop the leftover at the end of the epoch. | #8 |
 | D-14 | Each step takes a fixed D documents. | The cursor is a function of the step, so a checkpoint does not store it. | Take documents until the sequence is full: the cursor then depends on token counts and must be in the checkpoint. | #8 |
@@ -704,6 +849,15 @@ These components are not in the code yet. Their sections will have the full set 
 | D-34 | The budget cost is `values · 4 + (rows + 1) · 8` bytes. | It is the decoded size. | The uncompressed chunk size: approximately half of the decoded size with a dictionary. | #14 |
 | D-35 | `Lane` holds an `Arc<Epoch>`, and `Epoch` copies the row counts. | The loader owns the epoch and the lanes together. | A lifetime, which does not let one struct own both. | #14 |
 | D-36 | A checkpoint does not hold the prefetched row groups. | The lane state is sufficient, and a resume reads them again. | Save the buffers. | #14 |
+| D-37 | A checkpoint is versioned bytes with a checksum. | `torch.load(weights_only=True)` accepts bytes. Rust and Python use one format. | A dict of integers, or a custom Python class. | #16 |
+| D-38 | Each GPU gives a part, and `merge` makes a global checkpoint. | Some trainers save only rank 0. A global checkpoint resumes on each GPU count. | One file for each rank: a resume needs the same GPU count. | #16 |
+| D-39 | A resume with a different config or fingerprint stops, and gives the name of the field. | Other values give other batches with no error. | Accept the resume and show a warning. | #16 |
+| D-40 | After the last step of an epoch, the session goes to step 0 of the next epoch. | A checkpoint at the end of an epoch then starts the next epoch. | Stay at the end of the old epoch. | #16 |
+| D-41 | `Session::open` returns `Error::Config` for a config that would cause a panic. | Python gives the config. | A panic, which PyO3 shows as `PanicException`. | #16 |
+| D-42 | After a failed `next`, the session keeps the lane states and drops the loader. | The next call tries the same step again. | Stop the session, as the loader does. | #16 |
+| D-43 | `set_epoch` only goes to a later epoch. | Trainers call it after a resume, also with the epoch before a checkpoint at an epoch end. A reset would repeat steps with no error. | Always go to step 0, or do nothing only for the same epoch. | #16 |
+| D-44 | `Loader::next` is cancel safe. The read in progress stays in the loader. | Python drops the future at Ctrl-C, and a timeout drops it too. A lost read stops the loader with a panic. | Document that a dropped `next` breaks the loader. | #16 |
+| D-45 | `from_bytes` checks the checksum before the version. | A damaged version field gives `Checksum`, not a false `Version` error. | Check the version first. | #16 |
 | D-22 | The sidecar uses its own binary format and FNV-1a. | No new dependency, and the bytes are fixed by our code. | `serde` with `bincode`, or JSON. | #10 |
 | D-23 | A sidecar that does not exist or is corrupt causes a new build. | The sidecar is only a cache. | An error that the user must correct. | #10 |
 | D-24 | The index keeps the place of each token column chunk, and the reader reads no footer. | A window has row groups from approximately W files. A footer read for each row group costs approximately 1.5 times the data. | Read the footer of each file again, or keep footers in memory (9.4 GB for FineWeb-Edu). | #12 |
@@ -724,6 +878,7 @@ These components are not in the code yet. Their sections will have the full set 
 | 2026-10-22 | #10 | Add the index (`src/index.rs`), `object_store` and `parquet`. Increase the minimum Rust version to 1.88. |
 | 2026-10-23 | #12 | Add the reader (`src/read.rs`) and the `s3` feature. Change the index to version 2, with the token column chunk of each row group. |
 | 2026-10-23 | #14 | Add the loader (`src/load.rs`) and `Order::lane_groups`. Change the index to version 3, with the value count. `Lane` holds an `Arc<Epoch>`. |
+| 2026-10-23 | #16 | Add the checkpoint (`src/checkpoint.rs`) and the session (`src/session.rs`). Add `Loader::ended`. Move the binary helpers to `src/codec.rs`. |
 
 ## 10. Maintenance
 

@@ -162,7 +162,7 @@ impl Index {
     /// local disk, so copies of one dataset have the same fingerprint. See
     /// `sidecar::encode`.
     pub fn fingerprint(&self) -> u64 {
-        sidecar::fnv1a(&sidecar::encode(self, false))
+        crate::codec::fnv1a(&sidecar::encode(self, false))
     }
 
     fn new(column: String, schema: String, files: Vec<File>) -> Result<Self, Error> {

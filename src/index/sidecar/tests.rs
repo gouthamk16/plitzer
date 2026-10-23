@@ -1,6 +1,7 @@
 use proptest::prelude::*;
 
 use super::*;
+use crate::codec::fnv1a;
 use crate::index::{Codec, File, Index, RowGroup};
 
 const SCHEMA: &str = "message schema { required int32 tokens; }";
