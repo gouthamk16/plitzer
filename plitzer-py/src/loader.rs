@@ -2,7 +2,12 @@
 
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
+use std::mem::ManuallyDrop;
 use std::path::PathBuf;
+use std::sync::Arc;
+
+use object_store::ObjectStore;
+use object_store::path::Path;
 
 use plitzer::checkpoint::{Checkpoint, Config};
 use plitzer::pack::Packing;
@@ -18,8 +23,25 @@ use crate::runtime::block_on;
 /// it for the rest of the current epoch; the next iteration gives the next.
 #[pyclass(module = "plitzer._plitzer")]
 pub struct Loader {
-    session: Session,
+    session: ManuallyDrop<Session>,
     seq_len: usize,
+    /// Set when the epoch ended, so `__next__` keeps raising `StopIteration`
+    /// as Python iterators do, until `__iter__` starts the next epoch.
+    exhausted: bool,
+    /// The process that made the loader. See `Drop`.
+    pid: u32,
+}
+
+impl Drop for Loader {
+    fn drop(&mut self) {
+        // A forked child has none of the runtime's threads, and a lock they
+        // held at the fork stays held. Dropping the session aborts runtime
+        // tasks, which could wait on such a lock, so the child leaks it.
+        if self.pid == std::process::id() {
+            // SAFETY: the session is not used after this.
+            unsafe { ManuallyDrop::drop(&mut self.session) }
+        }
+    }
 }
 
 #[pymethods]
@@ -48,13 +70,7 @@ impl Loader {
         cache: Option<PathBuf>,
         storage_options: Option<HashMap<String, String>>,
     ) -> PyResult<Self> {
-        let mut options: Vec<_> = storage_options.unwrap_or_default().into_iter().collect();
-        options.sort();
-        let (store, prefix) = plitzer::store::open(location, &options).map_err(store_error)?;
-        // The resolved store, not the spelling: `data` from two folders, or
-        // `s3://b/p/` and `s3://b/p`, must not share or split an index.
-        let resolved = format!("{store}/{prefix}");
-        let cache = cache.unwrap_or_else(|| default_cache(&resolved, &column));
+        let (store, prefix, cache) = locate(location, storage_options, &column, cache)?;
         let packing = Packing {
             seq_len,
             docs,
@@ -71,23 +87,35 @@ impl Loader {
         let open = Session::open(store, prefix, &cache, config, rank, world, budget);
         let session = block_on(py, open)?.map_err(session_error)?;
         Ok(Loader {
-            session,
+            session: ManuallyDrop::new(session),
             seq_len: seq_len as usize,
+            exhausted: false,
+            pid: std::process::id(),
         })
     }
 
-    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+    /// The rest of the current epoch. A loader whose last step is taken, but
+    /// which has not raised `StopIteration` yet, goes to the next epoch.
+    fn __iter__(mut slf: PyRefMut<'_, Self>) -> PyRefMut<'_, Self> {
+        slf.exhausted = false;
+        let at = slf.session.checkpoint().epoch;
+        slf.session.set_epoch(at);
         slf
     }
 
     /// The next step, or `StopIteration` after the last step of the epoch.
     fn __next__(&mut self, py: Python<'_>) -> PyResult<Option<Batch>> {
+        if self.exhausted {
+            return Ok(None);
+        }
         let mut tokens = vec![0; self.session.lanes().len() * self.seq_len];
         let real = block_on(py, self.session.next(&mut tokens))?.map_err(session_error)?;
+        self.exhausted = real.is_none();
         Ok(real.map(|lengths| Batch::new(tokens, lengths, self.seq_len)))
     }
 
     fn set_epoch(&mut self, epoch: u64) {
+        self.exhausted = false;
         self.session.set_epoch(epoch);
     }
 
@@ -99,7 +127,9 @@ impl Loader {
 
     fn resume(&mut self, checkpoint: &[u8]) -> PyResult<()> {
         let checkpoint = Checkpoint::from_bytes(checkpoint).map_err(checkpoint_error)?;
-        self.session.resume(&checkpoint).map_err(session_error)
+        self.session.resume(&checkpoint).map_err(session_error)?;
+        self.exhausted = false;
+        Ok(())
     }
 
     #[getter]
@@ -114,11 +144,34 @@ impl Loader {
     }
 }
 
+/// The store and prefix of `location`, and the index cache: `cache`, else
+/// the default.
+fn locate(
+    location: &str,
+    storage_options: Option<HashMap<String, String>>,
+    column: &str,
+    cache: Option<PathBuf>,
+) -> PyResult<(Arc<dyn ObjectStore>, Path, PathBuf)> {
+    let mut options: Vec<_> = storage_options.unwrap_or_default().into_iter().collect();
+    options.sort();
+    let (store, prefix) = plitzer::store::open(location, &options).map_err(store_error)?;
+    // The resolved store, not the spelling: `data` from two folders, or
+    // `s3://b/p/` and `s3://b/p`, must not share or split an index. The S3
+    // store prints only its bucket, so the options name the endpoint.
+    let key = (format!("{store}/{prefix}"), &options, column);
+    let cache = cache.unwrap_or_else(|| default_cache(key));
+    Ok((store, prefix, cache))
+}
+
 /// `$PLITZER_CACHE_DIR`, else the user cache folder, then one file per
-/// resolved location and column. `DefaultHasher` can change with Rust; that only
-/// rebuilds the index once.
-fn default_cache(location: &str, column: &str) -> PathBuf {
-    let var = |name: &str| std::env::var_os(name).map(PathBuf::from);
+/// `key`. `DefaultHasher` can change with Rust; that only rebuilds the index
+/// once.
+fn default_cache(key: impl Hash) -> PathBuf {
+    // An empty variable counts as unset, as the XDG spec says.
+    let var = |name: &str| {
+        let value = std::env::var_os(name).filter(|v| !v.is_empty());
+        value.map(PathBuf::from)
+    };
     let dir = var("PLITZER_CACHE_DIR").unwrap_or_else(|| {
         let user = var("XDG_CACHE_HOME")
             .or_else(|| var("LOCALAPPDATA"))
@@ -127,6 +180,6 @@ fn default_cache(location: &str, column: &str) -> PathBuf {
         user.join("plitzer")
     });
     let mut hasher = DefaultHasher::new();
-    (location, column).hash(&mut hasher);
+    key.hash(&mut hasher);
     dir.join(format!("{:016x}.idx", hasher.finish()))
 }

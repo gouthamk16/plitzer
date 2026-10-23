@@ -100,12 +100,21 @@ fn file(r: &mut Reader) -> Option<File> {
 /// Writes `bytes` to a temporary file with a unique name next to `path`,
 /// then renames it. Processes that start together (one per GPU) can then
 /// write at once, and no reader sees a half-written sidecar.
-pub(super) fn write(path: &std::path::Path, bytes: &[u8]) -> io::Result<()> {
+/// A new file next to `path`, to `write` into. It is made before the build,
+/// so a cache folder that cannot be written fails before any footer is read.
+pub(super) fn temp_file(path: &std::path::Path) -> io::Result<tempfile::NamedTempFile> {
     let dir = path.parent().filter(|d| !d.as_os_str().is_empty());
     let dir = dir.unwrap_or(".".as_ref());
     // A default cache folder does not exist on a new machine.
     std::fs::create_dir_all(dir)?;
-    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+    tempfile::NamedTempFile::new_in(dir)
+}
+
+pub(super) fn write(
+    mut tmp: tempfile::NamedTempFile,
+    path: &std::path::Path,
+    bytes: &[u8],
+) -> io::Result<()> {
     tmp.write_all(bytes)?;
     for attempt in 0.. {
         let Err(e) = tmp.persist(path) else {

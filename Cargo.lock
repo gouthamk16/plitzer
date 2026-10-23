@@ -1326,6 +1326,7 @@ dependencies = [
  "arrow-array",
  "arrow-buffer",
  "arrow-schema",
+ "object_store",
  "plitzer",
  "pyo3",
  "tokio",

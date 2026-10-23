@@ -9,6 +9,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
+
+if sys.platform != "win32":
+    import resource
 import numpy.typing as npt
 import pyarrow as pa
 import pytest
@@ -52,6 +55,30 @@ def test_iteration_ends_each_epoch(make: MakeLoader) -> None:
     assert not same(first, second)
 
 
+def test_iterator_protocol(make: MakeLoader) -> None:
+    loader = make()
+    first = epoch([loader])
+    with pytest.raises(StopIteration):
+        next(loader)  # an ended iterator stays ended
+    assert loader.epoch == 1
+    second = epoch([loader])
+    assert not same(first, second)
+
+
+def test_non_strict_zip_keeps_ranks_together(make: MakeLoader) -> None:
+    one = make()
+    want = [epoch([one]), epoch([one])]
+    two = [make(rank=r, world=2) for r in range(2)]
+    for w in want:
+        # zip stops at the first StopIteration and never asks rank 1 for its
+        # end; `iter` moves rank 1 on to the next epoch too.
+        got = [
+            np.concatenate([np.from_dlpack(b.tokens) for b in pair])
+            for pair in zip(*two, strict=False)
+        ]
+        assert same(got, w)
+
+
 def test_batch_shapes_and_padding(make: MakeLoader) -> None:
     batch = next(make())
     assert batch.tokens.shape == (4, 8)
@@ -88,8 +115,6 @@ def test_dlpack_versioned_and_legacy(make: MakeLoader) -> None:
 
 
 def max_rss_kib() -> int:
-    import resource  # POSIX only, so imported where the test runs
-
     return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
 
 
@@ -208,6 +233,9 @@ def test_forked_child_is_refused(make: MakeLoader) -> None:
             code = 0
         except BaseException:
             code = 2
+        # Freeing the copied loader must not wait on the parent's runtime.
+        del loader
+        gc.collect()
         os._exit(code)
     # Without the guard the child would wait forever on threads it lacks.
     deadline = time.monotonic() + 20

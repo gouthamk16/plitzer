@@ -240,3 +240,21 @@ async fn old_sidecar_rebuilds() {
         expected()
     );
 }
+
+// A cache folder that cannot be written fails before any footer is read: the
+// corrupt file below would give `Error::Footer` if the build came first.
+#[tokio::test]
+async fn unwritable_cache_fails_before_the_build() {
+    let (dir, store, prefix) = dataset();
+    std::fs::write(dir.path().join("data/z.parquet"), b"not parquet").unwrap();
+    let blocker = dir.path().join("file");
+    std::fs::write(&blocker, b"").unwrap();
+    let cache = blocker.join("index.bin");
+    let got = open(&store, &prefix, &cache).await;
+    assert!(matches!(got, Err(Error::Cache(_))), "{got:?}");
+    // A missing cache folder is made.
+    std::fs::remove_file(dir.path().join("data/z.parquet")).unwrap();
+    let nested = dir.path().join("a/b/index.bin");
+    open(&store, &prefix, &nested).await.unwrap();
+    assert!(nested.exists());
+}

@@ -19,7 +19,11 @@ class DataError(PlitzerError):
     """The data cannot be listed, read or decoded."""
 
 class Array:
-    """A C-order int32 array, read through DLPack or Arrow without a copy."""
+    """A C-order int32 array, read through DLPack or Arrow without a copy.
+
+    Every export of one array shares its memory, as numpy views do: a write
+    through one is seen by the others. Use `copy=True` for separate memory.
+    """
 
     @property
     def shape(self) -> tuple[int, ...]: ...
@@ -71,8 +75,10 @@ class Loader:
         cache: str | None = None,
         storage_options: Mapping[str, str] | None = None,
     ) -> None: ...
-    def __iter__(self) -> Loader: ...
-    def __next__(self) -> Batch: ...
+    def __iter__(self) -> Loader:
+        """The rest of the current epoch, or the next epoch if it has ended."""
+    def __next__(self) -> Batch:
+        """The next step; `StopIteration` from the end of the epoch on."""
     def set_epoch(self, epoch: int) -> None:
         """Go to the start of `epoch` if it is later than the current one."""
     def checkpoint(self) -> bytes:
