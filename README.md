@@ -19,9 +19,9 @@ The design, its rationale and the decision log are in [docs/design.md](docs/desi
   - [x] resuming at step k matches the tail of an uninterrupted run
   - [x] global batches are identical across GPU counts
 - [x] **Index:** build a row-group index from Parquet footers, with caching
-- [ ] **I/O:** async reads with `object_store` (local disk and S3, tested against versitygw), plus a prefetch queue capped by bytes
+- [x] **I/O:** async reads with `object_store` (local disk and S3, tested against versitygw), plus a prefetch queue capped by bytes
   - [x] read one row group's token column without its footer (local disk and S3)
-  - [ ] prefetch each GPU's row groups for a window, capped by bytes
+  - [x] prefetch each GPU's row groups for a window, capped by bytes
 - [ ] **Python:** PyO3 and maturin bindings, a PyTorch `IterableDataset` with `state_dict()`, and Arrow PyCapsule export
 - [ ] **End-to-end test:** kill training at a random step, resume on a different GPU count, and check the sample-stream hash matches
 - [ ] **Read amplification check:** measure bytes read per GPU on real data. Lane slices simulate at 1.01–1.25×. Add a per-node cache only if it's needed

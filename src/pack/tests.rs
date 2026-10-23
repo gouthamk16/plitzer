@@ -40,7 +40,7 @@ impl Tokens for Corpus {
 type Out = (Vec<u32>, u32, LaneState);
 
 /// Runs `lane` from `state` to the end of the epoch.
-fn run(e: &Epoch, c: &Corpus, lane: u32, state: LaneState) -> Vec<Out> {
+fn run(e: &Arc<Epoch>, c: &Corpus, lane: u32, state: LaneState) -> Vec<Out> {
     let mut l = e.lane(lane, state, c);
     let mut out = vec![0; e.packing.seq_len as usize];
     (state.step..e.steps())
@@ -53,7 +53,7 @@ fn run(e: &Epoch, c: &Corpus, lane: u32, state: LaneState) -> Vec<Out> {
 
 /// Every token of lane `lane`'s documents, in the order the lane takes them.
 fn stream(e: &Epoch, c: &Corpus, lane: u32) -> Vec<u32> {
-    let docs = e.windows.iter().flat_map(|w| e.order.lane(w, lane));
+    let docs = e.windows.iter().flat_map(|w| e.order().lane(w, lane));
     docs.flat_map(|d| c.tokens(d).to_vec()).collect()
 }
 
@@ -71,7 +71,7 @@ fn inputs() -> impl Strategy<Value = (Vec<Vec<usize>>, u32, u32, u64, Packing)> 
     (lens, 1u32..6, 1u32..4, any::<u64>(), packing)
 }
 
-fn epoch<'a>(rows: &'a [u32], lanes: u32, window: u32, seed: u64, p: Packing) -> Epoch<'a> {
+fn epoch(rows: &[u32], lanes: u32, window: u32, seed: u64, p: Packing) -> Arc<Epoch> {
     let order = Order {
         seed,
         epoch: 1,
@@ -79,7 +79,7 @@ fn epoch<'a>(rows: &'a [u32], lanes: u32, window: u32, seed: u64, p: Packing) ->
         window,
         rows,
     };
-    Epoch::new(order, p)
+    Arc::new(Epoch::new(order, p))
 }
 
 proptest! {
