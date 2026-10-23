@@ -157,9 +157,10 @@ impl Index {
         in_file.unwrap_or_else(|| panic!("row group {row_group} is not in the index"))
     }
 
-    /// A hash of the whole index except the ETags, which hold inodes and
-    /// modification times on local disk, so copies of one dataset on
-    /// different machines have the same fingerprint.
+    /// A hash of the column name, the paths, the sizes and the chunks. It
+    /// leaves out the ETags, which hold inodes and modification times on
+    /// local disk, so copies of one dataset have the same fingerprint. See
+    /// `sidecar::encode`.
     pub fn fingerprint(&self) -> u64 {
         sidecar::fnv1a(&sidecar::encode(self, false))
     }

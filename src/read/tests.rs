@@ -1,6 +1,9 @@
 use std::sync::Arc;
 
-use arrow_array::builder::{GenericListBuilder, Int32Builder, Int64Builder, UInt32Builder};
+use arrow_array::builder::{
+    Date32Builder, GenericListBuilder, Int32Builder, Int64Builder, TimestampNanosecondBuilder,
+    UInt32Builder,
+};
 use arrow_array::{ArrayRef, Int64Array, RecordBatch};
 use object_store::local::LocalFileSystem;
 use parquet::arrow::ArrowWriter;
@@ -55,9 +58,13 @@ fn token_column(kind: Kind, rows: usize, nullable: bool) -> ArrayRef {
 
 /// Writes `rows` rows with an `id` column before `tokens`, in row groups of 9.
 fn write(path: &std::path::Path, tokens: ArrayRef, props: WriterProperties) {
+    write_named(path, "tokens", tokens, props);
+}
+
+fn write_named(path: &std::path::Path, name: &str, tokens: ArrayRef, props: WriterProperties) {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     let ids: ArrayRef = Arc::new(Int64Array::from_iter_values(0..tokens.len() as i64));
-    let batch = RecordBatch::try_from_iter([("id", ids), ("tokens", tokens)]).unwrap();
+    let batch = RecordBatch::try_from_iter([("id", ids), (name, tokens)]).unwrap();
     let file = std::fs::File::create(path).unwrap();
     let mut w = ArrowWriter::try_new(file, batch.schema(), Some(props)).unwrap();
     w.write(&batch).unwrap();
@@ -164,28 +171,50 @@ async fn reads_without_footer() {
     assert_eq!(d.read_all(&index).await, want);
 }
 
+// A nested list, text, dates (INT32 underneath), and an item name the
+// schema text cannot hold.
 #[tokio::test]
 async fn bad_columns_are_errors() {
     let nested = {
-        let mut b = GenericListBuilder::<i32, _>::new(GenericListBuilder::<i32, _>::new(
-            Int32Builder::new(),
-        ));
+        let inner = GenericListBuilder::<i32, _>::new(Int32Builder::new());
+        let mut b = GenericListBuilder::<i32, _>::new(inner);
         b.values().values().append_value(1);
         b.values().append(true);
         b.append(true);
         Arc::new(b.finish()) as ArrayRef
     };
+    let dates = {
+        let mut b = GenericListBuilder::<i32, _>::new(Date32Builder::new());
+        b.values().append_value(1);
+        b.append(true);
+        Arc::new(b.finish()) as ArrayRef
+    };
+    // The printer does not quote names, so this schema would not parse back.
+    let spaced = {
+        let item = arrow_schema::Field::new("my item", arrow_schema::DataType::Int32, true);
+        let mut b = GenericListBuilder::<i32, _>::new(Int32Builder::new()).with_field(item);
+        b.values().append_value(1);
+        b.append(true);
+        Arc::new(b.finish()) as ArrayRef
+    };
+    // Nanosecond timestamps have a logical type but no converted type.
+    let nanos = {
+        let mut b = GenericListBuilder::<i32, _>::new(TimestampNanosecondBuilder::new());
+        b.values().append_value(1);
+        b.append(true);
+        Arc::new(b.finish()) as ArrayRef
+    };
     let text: ArrayRef = Arc::new(arrow_array::StringArray::from(vec!["a"]));
-    for tokens in [nested, text] {
+    for tokens in [nested, text, dates, nanos, spaced] {
         let d = data();
-        write(
-            &d.path("x.parquet"),
-            tokens,
-            props(Compression::SNAPPY, false),
-        );
+        let p = props(Compression::SNAPPY, false);
+        write(&d.path("x.parquet"), tokens, p);
         assert!(matches!(d.index().await, Err(IndexError::Column { .. })));
     }
+}
 
+#[tokio::test]
+async fn missing_or_differing_columns_are_errors() {
     let d = data();
     let p = props(Compression::SNAPPY, false);
     write(
@@ -204,6 +233,48 @@ async fn bad_columns_are_errors() {
     }
     let missing = Index::build(&*d.store, &d.prefix, "input_ids").await;
     assert!(matches!(missing, Err(IndexError::Column { .. })));
+}
+
+// The schema printer does not quote names, so the index stores the column
+// under a fixed name. A name with a space must still read.
+#[tokio::test]
+async fn odd_column_name_reads() {
+    let d = data();
+    let tokens = token_column(Kind::ListI32, 20, false);
+    write_named(
+        &d.path("x.parquet"),
+        "input ids",
+        tokens,
+        props(Compression::SNAPPY, false),
+    );
+    let index = Index::build(&*d.store, &d.prefix, "input ids")
+        .await
+        .unwrap();
+    let want: Vec<_> = (0..20).map(|r| expected(r, false)).collect();
+    assert_eq!(d.read_all(&index).await, want);
+}
+
+// The schema text comes from parquet's printer and is stored in each
+// sidecar. A printer change after an upgrade must show up here.
+#[tokio::test]
+async fn schema_text_golden() {
+    let d = data();
+    let tokens = token_column(Kind::ListU32, 3, true);
+    write(
+        &d.path("x.parquet"),
+        tokens,
+        props(Compression::SNAPPY, false),
+    );
+    let index = d.index().await.unwrap();
+    let want = "message schema {
+  OPTIONAL group tokens (LIST) {
+    REPEATED group list {
+      OPTIONAL INT32 item (INTEGER(32,false));
+    }
+  }
+}
+";
+    assert_eq!(index.schema(), want);
 }
 
 // A negative token, and a null token inside a list, which would otherwise

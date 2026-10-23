@@ -5,9 +5,9 @@ use parquet::data_type::Int32Type;
 use parquet::file::properties::WriterProperties;
 use parquet::file::writer::SerializedFileWriter;
 use parquet::schema::parser::parse_message_type;
-use proptest::prelude::*;
 use tempfile::TempDir;
 
+use super::sidecar::tests::{file, index};
 use super::*;
 use crate::order::Order;
 
@@ -114,25 +114,6 @@ async fn build_reads_row_groups() {
 #[should_panic(expected = "not in the index")]
 fn locate_past_end_panics() {
     index(vec![file("a", &[1, 1]), file("b", &[])]).locate(2);
-}
-
-fn file(path: &str, rows: &[u32]) -> File {
-    let group = |(i, &rows)| RowGroup {
-        rows,
-        start: 4 + 100 * i as u64,
-        len: 100,
-        codec: Codec::Snappy,
-    };
-    File {
-        path: path.into(),
-        size: 1000,
-        e_tag: Some("t".into()),
-        row_groups: rows.iter().enumerate().map(group).collect(),
-    }
-}
-
-fn index(files: Vec<File>) -> Index {
-    Index::new("tokens".into(), "message schema {}".into(), files).unwrap()
 }
 
 #[tokio::test]
@@ -246,21 +227,6 @@ fn open_at_once(store: &LocalFileSystem, prefix: &Path, cache: &std::path::Path)
     });
 }
 
-#[test]
-fn fingerprint_golden() {
-    let golden = index(vec![file("a/x.parquet", &[2]), file("b.parquet", &[3, 1])]);
-    assert_eq!(golden.fingerprint(), 6_705_791_358_782_006_783);
-    // The cache bytes, with ETags, are pinned too.
-    let cache = sidecar::fnv1a(&sidecar::encode(&golden, true));
-    assert_eq!(cache, 13_735_421_162_347_142_627);
-
-    let mut other = golden.clone();
-    other.files[0].e_tag = None;
-    assert_eq!(other.fingerprint(), golden.fingerprint());
-    other.files[1].row_groups[1].rows = 2;
-    assert_ne!(other.fingerprint(), golden.fingerprint());
-}
-
 #[tokio::test]
 async fn old_sidecar_rebuilds() {
     let (dir, store, prefix) = dataset();
@@ -273,49 +239,4 @@ async fn old_sidecar_rebuilds() {
         summary(&open(&store, &prefix, &cache).await.unwrap()),
         expected()
     );
-}
-
-fn codec() -> impl Strategy<Value = Codec> {
-    (0u8..7).prop_map(|b| Codec::from_byte(b).unwrap())
-}
-
-fn files() -> impl Strategy<Value = Vec<File>> {
-    let group = (any::<u32>(), any::<u64>(), any::<u32>(), codec());
-    let group = group.prop_map(|(rows, start, len, codec)| RowGroup {
-        rows,
-        start,
-        len,
-        codec,
-    });
-    let f = (
-        ".{0,8}",
-        any::<u64>(),
-        proptest::option::of(".{0,8}"),
-        prop::collection::vec(group, 0..5),
-    );
-    prop::collection::vec(
-        f.prop_map(|(path, size, e_tag, row_groups)| File {
-            path,
-            size,
-            e_tag,
-            row_groups,
-        }),
-        0..5,
-    )
-}
-
-proptest! {
-    #[test]
-    fn sidecar_roundtrip(files in files(), column in ".{0,8}", schema in ".{0,16}") {
-        let index = Index::new(column, schema, files).unwrap();
-        prop_assert_eq!(sidecar::decode(&sidecar::encode(&index, true)), Some(index));
-    }
-
-    #[test]
-    fn decode_never_panics(files in files(), cut in any::<prop::sample::Index>(), junk in prop::collection::vec(any::<u8>(), 0..64)) {
-        let bytes = sidecar::encode(&index(files), true);
-        let cut = cut.index(bytes.len());
-        prop_assert_eq!(sidecar::decode(&bytes[..cut]), None);
-        sidecar::decode(&junk);
-    }
 }

@@ -12,7 +12,7 @@ Plitzer is a Rust-core ML dataloader. It feeds Parquet data from local disk or S
 cargo build
 cargo test
 cargo test <name>          # single test, substring match
-cargo clippy --all-targets
+cargo clippy --all-targets --all-features
 cargo fmt
 cargo test --features s3 --test s3   # needs PLITZER_S3_ENDPOINT, e.g. a local versitygw
 ```

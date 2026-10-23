@@ -409,9 +409,9 @@ impl Index {
 2. Sort the files by path.
 3. Read the last 4 MiB of each file in one request. Make sure that the footer length is not larger than the file.
 4. Decode the footer with `ParquetMetaDataPushDecoder`. Do not read the page indexes. A footer larger than 4 MiB needs a second request.
-5. Find the token column. It must be one list level of integers. Its schema must be the same in each file.
+5. Find the token column. It must be one list level of plain integers, with no date, time, timestamp or decimal type. Its schema must be the same in each file.
 6. For each row group, keep the row count and the token column chunk: its first byte, length and codec.
-7. Use the dictionary page as the first byte, if the chunk has one.
+7. Use the dictionary page as the first byte if its offset is from 4 to the data page offset. Some writers set the offset to 0 for no dictionary.
 
 The module reads 16 files at the same time.
 
@@ -435,7 +435,9 @@ The sidecar has this layout. All integers are little-endian.
 
 A sidecar of version 1 does not decode, so `open` builds the index again. A row group record has 17 bytes. The ~3 × 10⁶ row groups of FineWeb-Edu need approximately 51 MB, not the 9.4 GB of the footers.
 
-The fingerprint is the 64-bit FNV-1a hash of the same layout, with no ETags.
+The index keeps the schema text of the token column with the root name `tokens`. The schema printer does not quote names, so a real name with a space would not parse back. The index parses the text before it keeps it.
+
+The fingerprint is the 64-bit FNV-1a hash of the same layout, with no ETags and an empty schema.
 
 **Rationale:**
 
@@ -478,6 +480,8 @@ The fingerprint is the 64-bit FNV-1a hash of the same layout, with no ETags.
 | `no_files_is_an_error` | Unit | A prefix with no `.parquet` files gives `Error::NoFiles`. |
 | `concurrent_open_shares_cache` | Unit | Eight processes that open a cold cache at the same time all succeed, in ten rounds. |
 | `fingerprint_golden` | Unit | The fingerprint and the hash of the sidecar bytes are the same on each OS. The fingerprint does not change with the ETag, but it changes with a row count. |
+| `bad_schema_does_not_decode` | Unit | A sidecar with schema text that does not parse gives `None`. |
+| `dictionary_offset_only_when_real` | Unit | A dictionary offset of 0, or an offset not before the data page, is not used. |
 | `sidecar_roundtrip` | Property | Each index is the same after encode and decode. |
 | `decode_never_panics` | Property | A truncated sidecar and random bytes give `None`, not a panic. |
 | `locate_past_end_panics` | Unit | `locate` panics for an id after the last row group. |
@@ -533,7 +537,7 @@ The page reader of `parquet` uses only the codec and the byte range of the chunk
 
 - The reader reads one row group at a time. The prefetch of many row groups is in the second PR of the I/O item.
 - A list column has 32-bit offsets after the decode, also for a `large_list` column. One row group never has 2³¹ tokens.
-- A column of more than one list level, or a column that is not an integer list, gives an index error.
+- A column of more than one list level, or a column that is not a list of plain integers, gives an index error.
 
 **Verification:**
 
@@ -541,7 +545,10 @@ The page reader of `parquet` uses only the codec and the byte range of the chunk
 |---|---|---|
 | `reads_every_variant` | Unit | Each token is correct for 48 files. They have four list types, null rows or not, three codecs, and a dictionary or not. The file name has a space and a percent sign. |
 | `reads_without_footer` | Unit | The reader still gives each token after the footer length and magic of the file are set to zero. |
-| `bad_columns_are_errors` | Unit | A nested list, a text column, a column that is not there, and a column type that differs between files each give `Error::Column`. |
+| `bad_columns_are_errors` | Unit | A nested list, text, dates, nanosecond timestamps, and an item name with a space each give `Error::Column`. |
+| `missing_or_differing_columns_are_errors` | Unit | A column that is not there, and a column type that differs between files, each give `Error::Column`. |
+| `odd_column_name_reads` | Unit | A column named `input ids` reads correctly. |
+| `schema_text_golden` | Unit | The schema text of a `list<uint32>` column is pinned, so a change of the `parquet` printer shows. |
 | `bad_tokens_are_errors` | Unit | A negative token and a null token each give `Error::BadToken`. |
 | `fetch_splits_large_ranges`, `pieces_cover_range` | Unit | The pieces cover the range with no gap and no overlap, and each piece is 16 MiB or less. |
 | `index_and_read_over_s3` | Integration | The index, the sidecar and the reader work against versitygw in the `s3` CI job. |
@@ -599,6 +606,7 @@ These components are not in the code yet. Their sections will have the full set 
 | D-19 | Build the index over `object_store` from the start. | Local disk and S3 use the same code, and S3 is the expensive case. | Local files only, with S3 in the Read PR. | #10 |
 | D-20 | The cache is valid if the path, size and ETag of each file are the same. | A file can change and keep its size. | Path and size only. | #10 |
 | D-21 | The fingerprint does not include the ETag. | A local ETag holds the inode and modification time, so it is different on each copy. | A hash of the full sidecar. | #10 |
+| D-30 | The fingerprint does not include the schema text. | The `parquet` printer makes the text, and an upgrade could change it. A changed fingerprint would refuse all saved checkpoints. | A hash of the schema text. | #12 |
 | D-22 | The sidecar uses its own binary format and FNV-1a. | No new dependency, and the bytes are fixed by our code. | `serde` with `bincode`, or JSON. | #10 |
 | D-23 | A sidecar that does not exist or is corrupt causes a new build. | The sidecar is only a cache. | An error that the user must correct. | #10 |
 | D-24 | The index keeps the place of each token column chunk, and the reader reads no footer. | A window has row groups from approximately W files. A footer read for each row group costs approximately 1.5 times the data. | Read the footer of each file again, or keep footers in memory (9.4 GB for FineWeb-Edu). | #12 |

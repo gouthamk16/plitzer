@@ -16,18 +16,20 @@ const MAGIC: &[u8; 8] = b"PLTZIDX\0";
 /// decode, so `Index::open` rebuilds it.
 const VERSION: u32 = 2;
 
-/// The index in the cache format. Without `e_tags`, every ETag is written
-/// as absent, which makes the bytes the same on every copy of a dataset.
-pub(super) fn encode(index: &Index, e_tags: bool) -> Vec<u8> {
+/// The index in the cache format. Without `cache`, every ETag is written as
+/// absent and the schema as empty, for the fingerprint: ETags differ between
+/// copies of a dataset, and the schema text comes from `parquet`'s printer,
+/// which an upgrade could change.
+pub(super) fn encode(index: &Index, cache: bool) -> Vec<u8> {
     let mut out = MAGIC.to_vec();
     out.extend(VERSION.to_le_bytes());
     put_str(&mut out, &index.column);
-    put_str(&mut out, &index.schema);
+    put_str(&mut out, if cache { &index.schema } else { "" });
     out.extend(len(index.files.len()).to_le_bytes());
     for f in &index.files {
         put_str(&mut out, &f.path);
         out.extend(f.size.to_le_bytes());
-        match f.e_tag.as_deref().filter(|_| e_tags) {
+        match f.e_tag.as_deref().filter(|_| cache) {
             Some(tag) => {
                 out.push(1);
                 put_str(&mut out, tag);
@@ -54,6 +56,7 @@ pub(super) fn decode(bytes: &[u8]) -> Option<Index> {
     }
     let column = r.str()?;
     let schema = r.str()?;
+    super::parse_schema(&schema).ok()?;
     // Counts come from the file, so nothing is preallocated from them.
     let mut files = Vec::new();
     for _ in 0..r.u32()? {
@@ -154,3 +157,6 @@ impl<'a> Reader<'a> {
         String::from_utf8(self.take(n)?.to_vec()).ok()
     }
 }
+
+#[cfg(test)]
+pub(super) mod tests;

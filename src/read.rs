@@ -162,15 +162,30 @@ fn pieces(range: Range<u64>, piece: u64) -> Vec<Range<u64>> {
     starts.map(|s| s..(s + piece).min(range.end)).collect()
 }
 
-/// Decodes one chunk from the index record alone. The page reader takes the
-/// codec and the chunk range from the metadata, and all else from the page
-/// headers, so a one-column metadata built here is enough.
+/// Decodes one chunk from the index record alone.
 fn decode(
     schema: &SchemaDescPtr,
     rg: &RowGroup,
     range: Range<u64>,
     data: Bytes,
 ) -> Result<arrow_array::ArrayRef, ParquetError> {
+    let mut decoder = ParquetPushDecoderBuilder::new_with_metadata(metadata(schema, rg)?)
+        .with_batch_size(rg.rows as usize)
+        .build()?;
+    decoder.push_range(range, data)?;
+    match decoder.try_decode()? {
+        DecodeResult::Data(batch) => Ok(batch.column(0).clone()),
+        // The index records the whole chunk, so this means a bad record.
+        DecodeResult::NeedsData(_) | DecodeResult::Finished => Err(ParquetError::General(
+            "the chunk needs bytes outside its index record".into(),
+        )),
+    }
+}
+
+/// Metadata for a file with one row group of one column. The page reader
+/// takes the codec and the chunk range from it, and all else from the page
+/// headers, so the index record is enough.
+fn metadata(schema: &SchemaDescPtr, rg: &RowGroup) -> Result<ArrowReaderMetadata, ParquetError> {
     let rows = i64::from(rg.rows);
     let chunk = ColumnChunkMetaData::builder(schema.column(0))
         .set_compression(rg.codec.to_parquet())
@@ -183,18 +198,7 @@ fn decode(
         .build()?;
     let file = FileMetaData::new(2, rows, None, None, schema.clone(), None);
     let metadata = Arc::new(ParquetMetaData::new(file, vec![group]));
-    let metadata = ArrowReaderMetadata::try_new(metadata, ArrowReaderOptions::new())?;
-    let mut decoder = ParquetPushDecoderBuilder::new_with_metadata(metadata)
-        .with_batch_size(rg.rows as usize)
-        .build()?;
-    decoder.push_range(range, data)?;
-    match decoder.try_decode()? {
-        DecodeResult::Data(batch) => Ok(batch.column(0).clone()),
-        // The index records the whole chunk, so this means a bad record.
-        DecodeResult::NeedsData(_) | DecodeResult::Finished => Err(ParquetError::General(
-            "the chunk needs bytes outside its index record".into(),
-        )),
-    }
+    ArrowReaderMetadata::try_new(metadata, ArrowReaderOptions::new())
 }
 
 #[cfg(test)]
