@@ -4,7 +4,8 @@
 //! magic "PLTZIDX\0" | version u32 | column (len u32, UTF-8) | schema (len u32, UTF-8) |
 //! file count u32 | each file:
 //!   path (len u32, UTF-8) | size u64 | e_tag (flag u8, then len u32, UTF-8) |
-//!   row-group count u32 | each row group: rows u32 | start u64 | len u32 | codec u8
+//!   row-group count u32 | each row group: rows u32 | start u64 | len u32 | values u32 |
+//!   codec u8
 //! ```
 
 use std::io::{self, Write};
@@ -12,9 +13,9 @@ use std::io::{self, Write};
 use super::{Codec, File, Index, RowGroup};
 
 const MAGIC: &[u8; 8] = b"PLTZIDX\0";
-/// Version 1 held only row counts. A sidecar of another version does not
-/// decode, so `Index::open` rebuilds it.
-const VERSION: u32 = 2;
+/// Version 1 held only row counts, version 2 no value counts. A sidecar of
+/// another version does not decode, so `Index::open` rebuilds it.
+const VERSION: u32 = 3;
 
 /// The index in the cache format. Without `cache`, every ETag is written as
 /// absent and the schema as empty, for the fingerprint: ETags differ between
@@ -41,6 +42,7 @@ pub(super) fn encode(index: &Index, cache: bool) -> Vec<u8> {
             out.extend(g.rows.to_le_bytes());
             out.extend(g.start.to_le_bytes());
             out.extend(g.len.to_le_bytes());
+            out.extend(g.values.to_le_bytes());
             out.push(g.codec.byte());
         }
     }
@@ -82,6 +84,7 @@ fn file(r: &mut Reader) -> Option<File> {
             rows: r.u32()?,
             start: r.u64()?,
             len: r.u32()?,
+            values: r.u32()?,
             codec: Codec::from_byte(r.take(1)?[0])?,
         });
     }

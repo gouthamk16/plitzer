@@ -232,7 +232,7 @@ async fn old_sidecar_rebuilds() {
     let (dir, store, prefix) = dataset();
     let cache = dir.path().join("index.bin");
     let mut bytes = sidecar::encode(&build(&store, &prefix).await.unwrap(), true);
-    bytes[8..12].copy_from_slice(&1u32.to_le_bytes());
+    bytes[8..12].copy_from_slice(&2u32.to_le_bytes());
     assert_eq!(sidecar::decode(&bytes), None);
     std::fs::write(&cache, bytes).unwrap();
     assert_eq!(

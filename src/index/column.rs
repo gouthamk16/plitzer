@@ -17,7 +17,18 @@ pub struct RowGroup {
     /// The first byte of the chunk: its dictionary page, else its first data page.
     pub start: u64,
     pub len: u32,
+    /// The chunk's leaf value count: one per token, plus one per empty row.
+    pub values: u32,
     pub codec: Codec,
+}
+
+impl RowGroup {
+    /// The memory of the decoded tokens: `RowGroupTokens::bytes` for this row
+    /// group, or a little more when rows are empty. The chunk's uncompressed
+    /// size is no guide: with a dictionary it is about half of this.
+    pub fn decoded_bytes(&self) -> u64 {
+        u64::from(self.values) * 4 + (u64::from(self.rows) + 1) * 8
+    }
 }
 
 /// The compression codecs that `parquet` can decode. Our own enum, so the
@@ -149,12 +160,14 @@ fn chunk(rg: &RowGroupMetaData, leaf: usize) -> Result<RowGroup, String> {
     let start = u64::try_from(start).map_err(|_| "negative chunk offset".to_string())?;
     let len = u32::try_from(c.compressed_size()).map_err(|_| "chunk larger than 4 GiB")?;
     let rows = u32::try_from(rg.num_rows()).map_err(|_| "more rows than fit in u32")?;
+    let values = u32::try_from(c.num_values()).map_err(|_| "more values than fit in u32")?;
     let codec = Codec::from_parquet(c.compression())
         .ok_or_else(|| format!("unsupported codec {}", c.compression()))?;
     Ok(RowGroup {
         rows,
         start,
         len,
+        values,
         codec,
     })
 }

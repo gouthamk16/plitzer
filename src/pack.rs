@@ -1,6 +1,10 @@
-use std::collections::VecDeque;
+use std::sync::Arc;
 
 use crate::order::{Doc, Order, Window};
+
+mod leftover;
+
+use leftover::Leftover;
 
 /// Where a lane gets each document's tokens. The packer adds no separators,
 /// so a source that wants EOS between documents includes it in the tokens.
@@ -31,28 +35,38 @@ pub struct LaneState {
     pub offset: u32,
 }
 
-/// One epoch of packing. Lanes borrow its windows, so they are computed once.
-pub struct Epoch<'a> {
-    order: Order<'a>,
+/// One epoch of packing. It owns a copy of the order's inputs, and lanes
+/// share it through an `Arc`, so the windows are computed once and a loader
+/// can own an epoch together with its lanes.
+pub struct Epoch {
+    seed: u64,
+    number: u64,
+    lanes: u32,
+    window: u32,
+    rows: Vec<u32>,
     packing: Packing,
     windows: Vec<Window>,
     steps: u64,
 }
 
-impl<'a> Epoch<'a> {
-    pub fn new(order: Order<'a>, packing: Packing) -> Self {
+impl Epoch {
+    pub fn new(order: Order<'_>, packing: Packing) -> Self {
         assert!(
             packing.seq_len > 0 && packing.docs > 0,
             "seq_len and docs must be positive"
         );
         let windows = order.windows();
         let mut epoch = Epoch {
-            order,
+            seed: order.seed,
+            number: order.epoch,
+            lanes: order.lanes,
+            window: order.window,
+            rows: order.rows.to_vec(),
             packing,
             windows,
             steps: 0,
         };
-        let longest = (0..epoch.order.lanes).map(|l| epoch.lane_docs(l)).max();
+        let longest = (0..epoch.lanes).map(|l| epoch.lane_docs(l)).max();
         // After the longest lane takes its last documents, its leftover holds
         // at most C tokens, so ceil(C/L) more steps empty every lane.
         epoch.steps = match longest {
@@ -64,13 +78,32 @@ impl<'a> Epoch<'a> {
         epoch
     }
 
+    /// The order of this epoch, as a view of the copied inputs.
+    pub fn order(&self) -> Order<'_> {
+        Order {
+            seed: self.seed,
+            epoch: self.number,
+            lanes: self.lanes,
+            window: self.window,
+            rows: &self.rows,
+        }
+    }
+
+    pub fn windows(&self) -> &[Window] {
+        &self.windows
+    }
+
+    pub fn packing(&self) -> Packing {
+        self.packing
+    }
+
     /// Steps in the epoch. Every lane supplies one sequence per step.
     pub fn steps(&self) -> u64 {
         self.steps
     }
 
     /// Lane `lane`, resumed from `state`.
-    pub fn lane(&self, lane: u32, state: LaneState, tokens: &impl Tokens) -> Lane<'_> {
+    pub fn lane(self: &Arc<Self>, lane: u32, state: LaneState, tokens: &impl Tokens) -> Lane {
         assert!(
             state.step <= self.steps,
             "state {state:?} is past the epoch's {} steps",
@@ -82,7 +115,7 @@ impl<'a> Epoch<'a> {
             "state {state:?} is past the cursor {cursor}"
         );
         let mut l = Lane {
-            epoch: self,
+            epoch: self.clone(),
             lane,
             step: state.step,
             stream: Stream::seek(self, lane, state.doc),
@@ -94,19 +127,19 @@ impl<'a> Epoch<'a> {
     }
 
     /// The documents lane `lane` takes in the whole epoch.
-    fn lane_docs(&self, lane: u32) -> u64 {
+    pub fn lane_docs(&self, lane: u32) -> u64 {
         self.windows
             .iter()
-            .map(|w| self.order.lane_len(w, lane))
+            .map(|w| self.order().lane_len(w, lane))
             .sum()
     }
 
     /// The documents lane `lane` has taken before step `step`.
     fn cursor(&self, lane: u32, step: u64) -> u64 {
         assert!(
-            lane < self.order.lanes,
+            lane < self.lanes,
             "lane {lane} out of range for {} lanes",
-            self.order.lanes
+            self.lanes
         );
         step.saturating_mul(self.packing.docs.into())
             .min(self.lane_docs(lane))
@@ -114,15 +147,15 @@ impl<'a> Epoch<'a> {
 }
 
 /// One lane's packer for one epoch.
-pub struct Lane<'e> {
-    epoch: &'e Epoch<'e>,
+pub struct Lane {
+    epoch: Arc<Epoch>,
     lane: u32,
     step: u64,
     stream: Stream,
     leftover: Leftover,
 }
 
-impl Lane<'_> {
+impl Lane {
     /// Writes the next sequence into `out`, pads its end, and returns the
     /// number of real tokens.
     pub fn fill(&mut self, tokens: &impl Tokens, out: &mut [u32]) -> u32 {
@@ -179,7 +212,7 @@ impl Lane<'_> {
     /// Adds the next `n` documents, or as many as are left, to the leftover.
     fn take(&mut self, tokens: &impl Tokens, n: u64) {
         for _ in 0..n {
-            let Some(doc) = self.stream.next(self.epoch, self.lane) else {
+            let Some(doc) = self.stream.next(&self.epoch, self.lane) else {
                 break;
             };
             self.leftover.push(tokens.tokens(doc));
@@ -199,9 +232,9 @@ impl Stream {
     fn seek(epoch: &Epoch, lane: u32, mut pos: u64) -> Self {
         let mut window = 0;
         while let Some(w) = epoch.windows.get(window) {
-            let len = epoch.order.lane_len(w, lane);
+            let len = epoch.order().lane_len(w, lane);
             if pos < len {
-                let docs = epoch.order.lane(w, lane);
+                let docs = epoch.order().lane(w, lane);
                 return Stream {
                     window,
                     docs,
@@ -224,62 +257,11 @@ impl Stream {
                 return None;
             }
             self.window += 1;
-            self.docs = epoch.order.lane(&epoch.windows[self.window], lane);
+            self.docs = epoch.order().lane(&epoch.windows[self.window], lane);
             self.next = 0;
         }
         self.next += 1;
         Some(self.docs[self.next - 1])
-    }
-}
-
-/// The tokens a lane has taken but not yet emitted or dropped.
-struct Leftover {
-    tokens: VecDeque<u32>,
-    /// Remaining tokens of each document from `doc` to the cursor.
-    lens: VecDeque<u32>,
-    /// Where the leftover starts.
-    doc: u64,
-    offset: u32,
-}
-
-impl Leftover {
-    fn new(doc: u64) -> Self {
-        Leftover {
-            tokens: VecDeque::new(),
-            lens: VecDeque::new(),
-            doc,
-            offset: 0,
-        }
-    }
-
-    fn push(&mut self, doc: &[u32]) {
-        self.tokens.extend(doc);
-        self.lens
-            .push_back(u32::try_from(doc.len()).expect("document longer than u32::MAX tokens"));
-        self.skip_empty();
-    }
-
-    /// Removes the oldest `n` tokens.
-    fn advance(&mut self, mut n: usize) {
-        self.tokens.drain(..n);
-        while n > 0 {
-            let front = &mut self.lens[0];
-            let k = n.min(*front as usize);
-            *front -= k as u32;
-            self.offset += k as u32;
-            n -= k;
-            self.skip_empty();
-        }
-    }
-
-    /// Keeps the start on a document with tokens left, or on the cursor when
-    /// the leftover is empty.
-    fn skip_empty(&mut self) {
-        while self.lens.front() == Some(&0) {
-            self.lens.pop_front();
-            self.doc += 1;
-            self.offset = 0;
-        }
     }
 }
 

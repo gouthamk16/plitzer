@@ -5,7 +5,7 @@
 | Field | Value |
 |---|---|
 | Status | Active. It changes with each feature PR. The code is pre-alpha. |
-| Last change | 2026-10-23, PR #12 |
+| Last change | 2026-10-23, PR #14 |
 | Language standard | ASD-STE100 (Simplified Technical English) |
 | Code | `src/` at the commit of this file |
 
@@ -76,6 +76,8 @@ Each term has only one definition in this document.
 | Sidecar | The file that keeps the index between starts. |
 | ETag | A version tag that the store gives to each file. It changes when the file changes. |
 | Fingerprint | A 64-bit hash of the index without the ETags. |
+| Budget | The most bytes of decoded tokens that the loader of one GPU keeps in memory. |
+| Need plan | The list of row groups that one GPU needs, each with the first and last step that needs it. |
 | Token column | The Parquet column that holds the tokens of each document as a list of integers. |
 | Column chunk | The bytes of one column in one row group. |
 | Codec | The compression method of a column chunk, such as Snappy or Zstd. |
@@ -89,9 +91,10 @@ Each term has only one definition in this document.
 | REQ-3 | Lanes and their slices depend only on `(seed, epoch, B, W)`. They do not depend on world. | `Order` has no world input. `order::gpu_lanes_partition` (property test). | Met |
 | REQ-4 | A resume at step k gives the same tail as a run without a stop. This is also true when world changes. | `pack::resume_matches_tail` and `pack::world_invariant` (property tests). Planned: end-to-end test. | Met in the packer |
 | REQ-5 | The output is the same on Linux, macOS and Windows. | CI runs the golden tests on the three systems. | Met |
-| REQ-6 | Read amplification is approximately 1 + world/W or less. | The reader reads no footer (`read::reads_without_footer`). Planned: measurement on FineWeb-Edu. | Partly met |
+| REQ-6 | Read amplification is approximately 1 + world/W or less. | The reader reads no footer (`read::reads_without_footer`). Each GPU reads only its own slices (`load::reads_only_own_row_groups`). Planned: measurement on FineWeb-Edu. | Partly met |
 | REQ-7 | A dependency upgrade does not change the order without a test failure. | Golden tests pin the shuffle output and the key bytes. | Met |
 | REQ-8 | A start with an unchanged dataset reads no Parquet footers. | `index::open_uses_cache_without_footers`. | Met |
+| REQ-9 | The decoded tokens in memory stay at or below the budget, and a budget that the loader accepts never stops it. | `load::budget_is_checked_and_kept`. | Met |
 
 ## 4. System overview
 
@@ -114,10 +117,10 @@ flowchart LR
 | Order | `src/order.rs` | Implemented | [5.3](#53-order) |
 | Pack | `src/pack.rs` | Implemented | [5.4](#54-pack) |
 | Index | `src/index.rs` | Implemented | [5.5](#55-index) |
-| Checkpoint | — | Planned | [5.7](#57-planned-components) |
+| Checkpoint | — | Planned | [5.8](#58-planned-components) |
 | Read | `src/read.rs` | Implemented | [5.6](#56-read) |
-| Prefetch | — | Planned | [5.7](#57-planned-components) |
-| Python bindings | — | Planned | [5.7](#57-planned-components) |
+| Loader | `src/load.rs` | Implemented | [5.7](#57-loader) |
+| Python bindings | — | Planned | [5.8](#58-planned-components) |
 
 ## 5. Component design
 
@@ -217,6 +220,7 @@ impl Order<'_> {
     pub fn windows(&self) -> Vec<Window>;
     pub fn lane(&self, window: &Window, lane: u32) -> Vec<Doc>;
     pub fn lane_len(&self, window: &Window, lane: u32) -> u64;
+    pub fn lane_groups(&self, window: &Window, lanes: Range<u32>) -> Vec<Range<usize>>;
 }
 impl Window {
     pub fn groups(&self) -> &[u32];
@@ -297,15 +301,19 @@ pub struct Packing {
 
 pub struct LaneState { pub step: u64, pub doc: u64, pub offset: u32 }
 
-pub struct Epoch<'a> { /* private: order, packing, windows, steps */ }
-pub struct Lane<'e> { /* private */ }
+pub struct Epoch { /* private: a copy of the order inputs, packing, windows, steps */ }
+pub struct Lane { /* private: Arc<Epoch>, ... */ }
 
-impl<'a> Epoch<'a> {
-    pub fn new(order: Order<'a>, packing: Packing) -> Self;
+impl Epoch {
+    pub fn new(order: Order<'_>, packing: Packing) -> Self;
+    pub fn order(&self) -> Order<'_>;
+    pub fn windows(&self) -> &[Window];
+    pub fn packing(&self) -> Packing;
     pub fn steps(&self) -> u64;
-    pub fn lane(&self, lane: u32, state: LaneState, tokens: &impl Tokens) -> Lane<'_>;
+    pub fn lane_docs(&self, lane: u32) -> u64;
+    pub fn lane(self: &Arc<Self>, lane: u32, state: LaneState, tokens: &impl Tokens) -> Lane;
 }
-impl Lane<'_> {
+impl Lane {
     pub fn fill(&mut self, tokens: &impl Tokens, out: &mut [u32]) -> u32;
     pub fn state(&self) -> LaneState;
 }
@@ -384,7 +392,7 @@ pub struct File {
     pub row_groups: Vec<RowGroup>,
 }
 
-pub struct RowGroup { pub rows: u32, pub start: u64, pub len: u32, pub codec: Codec }
+pub struct RowGroup { pub rows: u32, pub start: u64, pub len: u32, pub values: u32, pub codec: Codec }
 
 pub struct Index { /* private: column, schema, files, starts */ }
 
@@ -424,16 +432,16 @@ The sidecar has this layout. All integers are little-endian.
 | Field | Type |
 |---|---|
 | Magic | 8 bytes, `PLTZIDX\0` |
-| Version | `u32`, 2 |
+| Version | `u32`, 3 |
 | Column | `u32` length, then UTF-8 bytes |
 | Schema | `u32` length, then UTF-8 bytes |
 | File count | `u32` |
 | For each file: path | `u32` length, then UTF-8 bytes |
 | For each file: size | `u64` |
 | For each file: ETag | `u8` flag (0 or 1), then a length and UTF-8 bytes if the flag is 1 |
-| For each file: row groups | `u32` count, then for each row group: rows `u32`, start `u64`, length `u32`, codec `u8` |
+| For each file: row groups | `u32` count, then for each row group: rows `u32`, start `u64`, length `u32`, values `u32`, codec `u8` |
 
-A sidecar of version 1 does not decode, so `open` builds the index again. A row group record has 17 bytes. The ~3 × 10⁶ row groups of FineWeb-Edu need approximately 51 MB, not the 9.4 GB of the footers.
+A sidecar of an earlier version does not decode, so `open` builds the index again. A row group record has 21 bytes. The ~3 × 10⁶ row groups of FineWeb-Edu need approximately 63 MB, not the 9.4 GB of the footers. The value count gives the decoded size for the loader budget (section 5.7).
 
 The index keeps the schema text of the token column with the root name `tokens`. The schema printer does not quote names, so a real name with a space would not parse back. The index parses the text before it keeps it.
 
@@ -485,7 +493,7 @@ The fingerprint is the 64-bit FNV-1a hash of the same layout, with no ETags and 
 | `sidecar_roundtrip` | Property | Each index is the same after encode and decode. |
 | `decode_never_panics` | Property | A truncated sidecar and random bytes give `None`, not a panic. |
 | `locate_past_end_panics` | Unit | `locate` panics for an id after the last row group. |
-| `old_sidecar_rebuilds` | Unit | A sidecar of version 1 does not decode, and `open` builds the index again. |
+| `old_sidecar_rebuilds` | Unit | A sidecar of version 2 does not decode, and `open` builds the index again. |
 
 ### 5.6 Read
 
@@ -553,12 +561,89 @@ The page reader of `parquet` uses only the codec and the byte range of the chunk
 | `fetch_splits_large_ranges`, `pieces_cover_range` | Unit | The pieces cover the range with no gap and no overlap, and each piece is 16 MiB or less. |
 | `index_and_read_over_s3` | Integration | The index, the sidecar and the reader work against versitygw in the `s3` CI job. |
 
-### 5.7 Planned components
+### 5.7 Loader
+
+**Function:** The loader runs the lanes of one GPU. It reads the row groups of these lanes before the lanes need them, and it keeps the decoded tokens in memory below a byte limit. For each step, it gives one sequence for each lane.
+
+**Interface:**
+
+```rust
+pub struct Loader { /* private: epoch, lanes, needs, buffer, arrivals, held, driver */ }
+
+impl Loader {
+    pub async fn new(epoch: Arc<Epoch>, reader: Arc<Reader>, index: Arc<Index>,
+                     lanes: Range<u32>, states: &[LaneState], budget: u64) -> Result<Loader, Error>;
+    pub async fn next(&mut self, out: &mut [u32]) -> Result<Option<Vec<u32>>, Error>;
+    pub fn states(&self) -> Vec<LaneState>;   // the part of the checkpoint for this GPU
+    pub fn resident_bytes(&self) -> usize;
+}
+
+pub enum Error { Budget { needed, budget }, Read(read::Error), Join(..) }
+```
+
+The caller gives `lanes = gpu_lanes(B, world, rank)`. Thus the loader does not know world.
+
+**Design:** `Loader::new` makes a need plan for its lanes:
+
+1. Find the row groups of each lane slice with `Order::lane_groups`.
+2. The slice of a lane holds the stream positions `[p, p + len)`. The lane takes them at the steps `p / D` to `(p + len − 1) / D`.
+3. Give each row group of the slice that step range. The lane shuffles its slice, so a document can come at each step of the range.
+4. Merge the ranges of all lanes of the GPU. Each row group gets a first step and a last step.
+5. Sort the row groups by first step.
+
+On a resume, the plan starts at the lane state of each lane. The lane reads its leftover again at the resume step, so these documents are necessary at that step.
+
+The cost of a row group is its decoded size: `values · 4 + (rows + 1) · 8` bytes. `peak` finds the largest cost of the row groups that are necessary at the same step. If the budget is less than this peak, `new` returns `Error::Budget`.
+
+A driver task does these steps for each row group of the plan, in order:
+
+1. Get the permits of its cost, in KiB, from a semaphore of the budget size.
+2. Start a task that reads the row group.
+3. Send the task to the loader.
+
+The decoded row group keeps its permits. The loader releases the permits when it removes the row group from memory.
+
+`Loader::next` does these steps:
+
+1. Receive each row group with a first step at or before the current step.
+2. Fill one sequence for each lane.
+3. Remove each row group with this step as its last step.
+
+**Rationale:**
+
+- The plan uses one entry for each lane slice, not for each document. FineWeb-Edu has approximately 10⁹ documents, but only some thousand windows (D-31).
+- The driver gets the permits of one row group at a time, in plan order. The semaphore of tokio is first in, first out, so a later row group cannot take the permits that an earlier row group needs (D-32).
+- At step s, the loader holds the row groups that are necessary at s, and some that are read early. The first set is not more than the peak. Thus a budget at or above the peak cannot stop the loader (D-33).
+- The cost comes from the value count of the chunk. The uncompressed size of a chunk with a dictionary is approximately half of the decoded size (D-34).
+- The loader owns its epoch and its lanes. Thus `Lane` holds an `Arc<Epoch>`, and `Epoch` keeps a copy of the row counts (D-35).
+- A checkpoint does not hold the row groups in memory. A resume reads them again. torchdata, MosaicML Streaming and LitData do the same (D-36).
+- The loader stops all read tasks when it is dropped.
+
+**Limits:**
+
+- The budget does not include the memory of a decode in progress. Research measured approximately 3.5 times the decoded size of the row group during its decode.
+- The loader must run in a multi-thread tokio runtime. Thus the reads continue while Python runs the GPU step.
+- All lane states must have the same step.
+- A plan for a resume can hold row groups that the lane read before the resume, if they are in the same slice.
+
+**Verification:**
+
+| Test | Type | What it shows |
+|---|---|---|
+| `loader_matches_direct` | Unit | For world 1, 2 and 4, the batches of all ranks are equal to a run over all row groups in memory. |
+| `resume_matches_tail` | Unit | A stop at step k on world a and a resume on world b give the same batches as a run with no stop. |
+| `budget_is_checked_and_kept` | Unit | A budget below the peak gives `Error::Budget`. A budget equal to the peak runs to the end, and the bytes in memory stay at or below the budget. |
+| `evicts_everything` | Unit | After the last step, no row group is in memory. |
+| `prefetches_ahead` | Unit | With a large budget, the loader reads all row groups before `next` needs them. |
+| `reads_only_own_row_groups` | Unit | The plans of all ranks cover all row groups. Ranks share only the row groups at the edges of their slices. |
+| `plan_matches_lane_streams` | Unit | Each document that a lane takes at step s, also at a resume, is in a row group that the plan needs at s. |
+| `lane_groups_match` | Property | `Order::lane_groups` gives the row groups that `Order::lane` uses. |
+
+### 5.8 Planned components
 
 These components are not in the code yet. Their sections will have the full set of parts when they are implemented.
 
 - **Checkpoint:** A checkpoint holds `seed`, `epoch` and the lane state of each lane. It also holds B, W, L, D, C and `Index::fingerprint`. A resume with different values must stop with an error.
-- **Prefetch:** For each window, each GPU reads the row groups of its lanes before it needs them. A byte limit controls the prefetch, not a batch count. The limit must hold at least the share of one window. The prefetched row groups supply tokens to the pack module through the `Tokens` trait.
 - **Python:** The bindings use PyO3 and maturin. Batches go to Python through the Arrow PyCapsule interface. A PyTorch `IterableDataset` gives `state_dict()` and `load_state_dict()`. Users must set `num_workers=0`. The parallel work is in Rust, and a fork of a process with a tokio runtime is not safe.
 
 ## 6. Read amplification
@@ -607,6 +692,12 @@ These components are not in the code yet. Their sections will have the full set 
 | D-20 | The cache is valid if the path, size and ETag of each file are the same. | A file can change and keep its size. | Path and size only. | #10 |
 | D-21 | The fingerprint does not include the ETag. | A local ETag holds the inode and modification time, so it is different on each copy. | A hash of the full sidecar. | #10 |
 | D-30 | The fingerprint does not include the schema text. | The `parquet` printer makes the text, and an upgrade could change it. A changed fingerprint would refuse all saved checkpoints. | A hash of the schema text. | #12 |
+| D-31 | The need plan uses the step range of each lane slice. | One entry for each slice, not for each document. | A list of the documents of each step. | #14 |
+| D-32 | One driver gets the permits of each row group in plan order. | The tokio semaphore is first in, first out, so no later row group takes the permits of an earlier one. | One task for each row group that gets its own permits. | #14 |
+| D-33 | The loader refuses a budget below the peak of the plan. | With such a budget the loader would wait for itself. | Wait and hope that memory becomes free. | #14 |
+| D-34 | The budget cost is `values · 4 + (rows + 1) · 8` bytes. | It is the decoded size. | The uncompressed chunk size: approximately half of the decoded size with a dictionary. | #14 |
+| D-35 | `Lane` holds an `Arc<Epoch>`, and `Epoch` copies the row counts. | The loader owns the epoch and the lanes together. | A lifetime, which does not let one struct own both. | #14 |
+| D-36 | A checkpoint does not hold the prefetched row groups. | The lane state is sufficient, and a resume reads them again. | Save the buffers. | #14 |
 | D-22 | The sidecar uses its own binary format and FNV-1a. | No new dependency, and the bytes are fixed by our code. | `serde` with `bincode`, or JSON. | #10 |
 | D-23 | A sidecar that does not exist or is corrupt causes a new build. | The sidecar is only a cache. | An error that the user must correct. | #10 |
 | D-24 | The index keeps the place of each token column chunk, and the reader reads no footer. | A window has row groups from approximately W files. A footer read for each row group costs approximately 1.5 times the data. | Read the footer of each file again, or keep footers in memory (9.4 GB for FineWeb-Edu). | #12 |
@@ -626,6 +717,7 @@ These components are not in the code yet. Their sections will have the full set 
 | 2026-10-21 | #8 | Add the packer (`src/pack.rs`) and `Order::lane_len`. |
 | 2026-10-22 | #10 | Add the index (`src/index.rs`), `object_store` and `parquet`. Increase the minimum Rust version to 1.88. |
 | 2026-10-23 | #12 | Add the reader (`src/read.rs`) and the `s3` feature. Change the index to version 2, with the token column chunk of each row group. |
+| 2026-10-23 | #14 | Add the loader (`src/load.rs`) and `Order::lane_groups`. Change the index to version 3, with the value count. `Lane` holds an `Arc<Epoch>`. |
 
 ## 10. Maintenance
 

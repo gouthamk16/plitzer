@@ -18,6 +18,7 @@ object_store = { version = "0.14.2", default-features = false, features = ["fs"]
 parquet = "60.0.0"
 rand_chacha = "0.10.0"
 tempfile = "3.27.0"
+tokio = { version = "1.52.1", features = ["rt-multi-thread", "sync"] }
 
 [features]
 # S3 through object_store. Off by default: it pulls in an HTTP and TLS stack.
@@ -25,4 +26,4 @@ s3 = ["object_store/aws"]
 
 [dev-dependencies]
 proptest = "1.11.0"
-tokio = { version = "1.52.1", features = ["rt", "macros"] }
+tokio = { version = "1.52.1", features = ["rt", "rt-multi-thread", "macros", "time"] }

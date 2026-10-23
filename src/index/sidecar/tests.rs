@@ -10,6 +10,7 @@ pub(crate) fn file(path: &str, rows: &[u32]) -> File {
         rows,
         start: 4 + 100 * i as u64,
         len: 100,
+        values: rows * 3,
         codec: Codec::Snappy,
     };
     File {
@@ -32,10 +33,10 @@ pub(crate) fn index(files: Vec<File>) -> Index {
 #[test]
 fn fingerprint_golden() {
     let golden = index(vec![file("a/x.parquet", &[2]), file("b.parquet", &[3, 1])]);
-    assert_eq!(golden.fingerprint(), 8_288_418_835_622_463_668);
+    assert_eq!(golden.fingerprint(), 1_182_724_291_465_975_489);
     // The cache bytes, with ETags, are pinned too.
     let cache = fnv1a(&encode(&golden, true));
-    assert_eq!(cache, 1_150_502_440_377_594_925);
+    assert_eq!(cache, 5_679_387_340_200_057_198);
 
     let mut other = golden.clone();
     other.files[0].e_tag = None;
@@ -56,11 +57,18 @@ fn codec() -> impl Strategy<Value = Codec> {
 }
 
 fn files() -> impl Strategy<Value = Vec<File>> {
-    let group = (any::<u32>(), any::<u64>(), any::<u32>(), codec());
-    let group = group.prop_map(|(rows, start, len, codec)| RowGroup {
+    let group = (
+        any::<u32>(),
+        any::<u64>(),
+        any::<u32>(),
+        any::<u32>(),
+        codec(),
+    );
+    let group = group.prop_map(|(rows, start, len, values, codec)| RowGroup {
         rows,
         start,
         len,
+        values,
         codec,
     });
     let f = (
