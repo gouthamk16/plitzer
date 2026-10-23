@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use object_store::local::LocalFileSystem;
-use parquet::data_type::Int64Type;
+use parquet::data_type::Int32Type;
 use parquet::file::properties::WriterProperties;
 use parquet::file::writer::SerializedFileWriter;
 use parquet::schema::parser::parse_message_type;
@@ -11,21 +11,29 @@ use tempfile::TempDir;
 use super::*;
 use crate::order::Order;
 
-/// Writes a Parquet file with one row group per entry of `groups`.
+const SCHEMA: &str = "message m {
+    required int32 id;
+    required group tokens (LIST) { repeated group list { required int32 element; } }
+}";
+
+/// Writes a Parquet file with one row group per entry of `groups`, each row
+/// with one token.
 fn write_parquet(path: &std::path::Path, groups: &[u32]) {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    let schema = Arc::new(parse_message_type("message m { required int64 x; }").unwrap());
+    let schema = Arc::new(parse_message_type(SCHEMA).unwrap());
     let props = Arc::new(WriterProperties::builder().build());
     let mut w =
         SerializedFileWriter::new(std::fs::File::create(path).unwrap(), schema, props).unwrap();
     for &n in groups {
         let mut rg = w.next_row_group().unwrap();
-        let mut col = rg.next_column().unwrap().unwrap();
-        let values: Vec<i64> = (0..i64::from(n)).collect();
-        col.typed::<Int64Type>()
-            .write_batch(&values, None, None)
-            .unwrap();
-        col.close().unwrap();
+        let values: Vec<i32> = (0..n as i32).collect();
+        let (def, rep) = (vec![1; n as usize], vec![0; n as usize]);
+        for levels in [None, Some((&def[..], &rep[..]))] {
+            let mut col = rg.next_column().unwrap().unwrap();
+            let (d, r) = levels.unzip();
+            col.typed::<Int32Type>().write_batch(&values, d, r).unwrap();
+            col.close().unwrap();
+        }
         rg.close().unwrap();
     }
     w.close().unwrap();
@@ -46,26 +54,41 @@ fn dataset() -> (TempDir, LocalFileSystem, Path) {
     (dir, store, Path::from("data"))
 }
 
-fn summary(index: &Index) -> Vec<(&str, &[u32])> {
+fn summary(index: &Index) -> Vec<(&str, Vec<u32>)> {
+    let rows = |f: &File| f.row_groups.iter().map(|g| g.rows).collect();
     index
         .files()
         .iter()
-        .map(|f| (f.path.as_str(), f.rows.as_slice()))
+        .map(|f| (f.path.as_str(), rows(f)))
         .collect()
 }
 
-const EXPECTED: [(&str, &[u32]); 4] = [
-    ("a/x.parquet", &[2]),
-    ("b.parquet", &[3, 1]),
-    ("c.parquet", &[]),
-    ("d.parquet", &[4, 0, 5]),
-];
+fn build(store: &LocalFileSystem, prefix: &Path) -> impl Future<Output = Result<Index, Error>> {
+    Index::build(store, prefix, "tokens")
+}
+
+fn open<'a>(
+    store: &'a LocalFileSystem,
+    prefix: &'a Path,
+    cache: &'a std::path::Path,
+) -> impl Future<Output = Result<Index, Error>> + 'a {
+    Index::open(store, prefix, "tokens", cache)
+}
+
+fn expected() -> Vec<(&'static str, Vec<u32>)> {
+    vec![
+        ("a/x.parquet", vec![2]),
+        ("b.parquet", vec![3, 1]),
+        ("c.parquet", vec![]),
+        ("d.parquet", vec![4, 0, 5]),
+    ]
+}
 
 #[tokio::test]
 async fn build_reads_row_groups() {
     let (_dir, store, prefix) = dataset();
-    let index = Index::build(&store, &prefix).await.unwrap();
-    assert_eq!(summary(&index), EXPECTED);
+    let index = build(&store, &prefix).await.unwrap();
+    assert_eq!(summary(&index), expected());
     assert_eq!(index.rows(), [2, 3, 1, 4, 0, 5]);
     let located: Vec<_> = (0..6).map(|rg| index.locate(rg)).collect();
     assert_eq!(located, [(0, 0), (1, 0), (1, 1), (3, 0), (3, 1), (3, 2)]);
@@ -90,27 +113,36 @@ async fn build_reads_row_groups() {
 #[test]
 #[should_panic(expected = "not in the index")]
 fn locate_past_end_panics() {
-    let files = vec![file("a", &[1, 1]), file("b", &[])];
-    Index::new(files).unwrap().locate(2);
+    index(vec![file("a", &[1, 1]), file("b", &[])]).locate(2);
 }
 
 fn file(path: &str, rows: &[u32]) -> File {
+    let group = |(i, &rows)| RowGroup {
+        rows,
+        start: 4 + 100 * i as u64,
+        len: 100,
+        codec: Codec::Snappy,
+    };
     File {
         path: path.into(),
-        size: 10,
+        size: 1000,
         e_tag: Some("t".into()),
-        rows: rows.to_vec(),
+        row_groups: rows.iter().enumerate().map(group).collect(),
     }
+}
+
+fn index(files: Vec<File>) -> Index {
+    Index::new("tokens".into(), "message schema {}".into(), files).unwrap()
 }
 
 #[tokio::test]
 async fn open_writes_and_reuses_cache() {
     let (dir, store, prefix) = dataset();
     let cache = dir.path().join("index.bin");
-    let built = Index::open(&store, &prefix, &cache).await.unwrap();
-    assert_eq!(summary(&built), EXPECTED);
+    let built = open(&store, &prefix, &cache).await.unwrap();
+    assert_eq!(summary(&built), expected());
     let written = std::fs::read(&cache).unwrap();
-    assert_eq!(Index::open(&store, &prefix, &cache).await.unwrap(), built);
+    assert_eq!(open(&store, &prefix, &cache).await.unwrap(), built);
     assert_eq!(std::fs::read(&cache).unwrap(), written);
 }
 
@@ -120,20 +152,22 @@ async fn open_writes_and_reuses_cache() {
 async fn open_uses_cache_without_footers() {
     let (dir, store, prefix) = dataset();
     let cache = dir.path().join("index.bin");
-    let mut files = Index::build(&store, &prefix).await.unwrap().files;
-    files[0].rows = vec![99];
-    std::fs::write(&cache, sidecar::encode(&files, true)).unwrap();
-    assert_eq!(
-        Index::open(&store, &prefix, &cache).await.unwrap().files[0].rows,
-        [99]
-    );
+    let mut fake = build(&store, &prefix).await.unwrap();
+    fake.files[0].row_groups[0].rows = 99;
+    std::fs::write(&cache, sidecar::encode(&fake, true)).unwrap();
+    let got = open(&store, &prefix, &cache).await.unwrap();
+    assert_eq!(got.files[0].row_groups[0].rows, 99);
+
+    // A sidecar for a different column is not trusted.
+    let other = Index::open(&store, &prefix, "id", &cache).await;
+    assert!(matches!(other, Err(Error::Column { .. })), "{other:?}");
 
     // The same sidecar with a stale ETag is not trusted.
-    files[0].e_tag = Some("stale".into());
-    std::fs::write(&cache, sidecar::encode(&files, true)).unwrap();
+    fake.files[0].e_tag = Some("stale".into());
+    std::fs::write(&cache, sidecar::encode(&fake, true)).unwrap();
     assert_eq!(
-        summary(&Index::open(&store, &prefix, &cache).await.unwrap()),
-        EXPECTED
+        summary(&open(&store, &prefix, &cache).await.unwrap()),
+        expected()
     );
 }
 
@@ -141,19 +175,19 @@ async fn open_uses_cache_without_footers() {
 async fn open_rebuilds_on_change() {
     let (dir, store, prefix) = dataset();
     let cache = dir.path().join("index.bin");
-    Index::open(&store, &prefix, &cache).await.unwrap();
+    open(&store, &prefix, &cache).await.unwrap();
 
     write_parquet(&dir.path().join("data/b.parquet"), &[7]);
     write_parquet(&dir.path().join("data/e.parquet"), &[1, 2]);
-    let index = Index::open(&store, &prefix, &cache).await.unwrap();
+    let index = open(&store, &prefix, &cache).await.unwrap();
     assert_eq!(index.rows(), [2, 7, 4, 0, 5, 1, 2]);
     assert_eq!(
         sidecar::decode(&std::fs::read(&cache).unwrap()).unwrap(),
-        index.files
+        index
     );
 
     std::fs::write(&cache, b"garbage").unwrap();
-    assert_eq!(Index::open(&store, &prefix, &cache).await.unwrap(), index);
+    assert_eq!(open(&store, &prefix, &cache).await.unwrap(), index);
 }
 
 #[tokio::test]
@@ -166,7 +200,7 @@ async fn bad_footer_names_file() {
     for bytes in [&b"PAR1 not a footer"[..], b"PAR1", &huge] {
         let (dir, store, prefix) = dataset();
         std::fs::write(dir.path().join("data/bad.parquet"), bytes).unwrap();
-        match Index::build(&store, &prefix).await {
+        match build(&store, &prefix).await {
             Err(Error::Footer { path, .. }) => assert_eq!(path, "bad.parquet"),
             other => panic!("expected a footer error, got {other:?}"),
         }
@@ -176,7 +210,7 @@ async fn bad_footer_names_file() {
 #[tokio::test]
 async fn no_files_is_an_error() {
     let (_dir, store, _) = dataset();
-    let result = Index::build(&store, &Path::from("typo")).await;
+    let result = build(&store, &Path::from("typo")).await;
     assert!(matches!(result, Err(Error::NoFiles { .. })), "{result:?}");
 }
 
@@ -190,8 +224,8 @@ fn concurrent_open_shares_cache() {
         let _ = std::fs::remove_file(&cache);
         open_at_once(&store, &prefix, &cache);
     }
-    let files = sidecar::decode(&std::fs::read(&cache).unwrap()).unwrap();
-    assert_eq!(files.len(), EXPECTED.len());
+    let cached = sidecar::decode(&std::fs::read(&cache).unwrap()).unwrap();
+    assert_eq!(summary(&cached), expected());
 }
 
 fn open_at_once(store: &LocalFileSystem, prefix: &Path, cache: &std::path::Path) {
@@ -202,50 +236,69 @@ fn open_at_once(store: &LocalFileSystem, prefix: &Path, cache: &std::path::Path)
                     let rt = tokio::runtime::Builder::new_current_thread()
                         .build()
                         .unwrap();
-                    rt.block_on(Index::open(store, prefix, cache)).unwrap()
+                    rt.block_on(open(store, prefix, cache)).unwrap()
                 })
             })
             .collect();
         for open in opens {
-            assert_eq!(summary(&open.join().unwrap()), EXPECTED);
+            assert_eq!(summary(&open.join().unwrap()), expected());
         }
     });
 }
 
 #[test]
 fn fingerprint_golden() {
-    let index = Index::new(vec![file("a/x.parquet", &[2]), file("b.parquet", &[3, 1])]).unwrap();
-    assert_eq!(index.fingerprint(), 2_109_774_877_995_249_362);
+    let golden = index(vec![file("a/x.parquet", &[2]), file("b.parquet", &[3, 1])]);
+    assert_eq!(golden.fingerprint(), 6_705_791_358_782_006_783);
     // The cache bytes, with ETags, are pinned too.
-    let cache = sidecar::fnv1a(&sidecar::encode(&index.files, true));
-    assert_eq!(cache, 10_182_121_034_693_317_030);
+    let cache = sidecar::fnv1a(&sidecar::encode(&golden, true));
+    assert_eq!(cache, 13_735_421_162_347_142_627);
 
-    let mut files = index.files.clone();
-    files[0].e_tag = None;
+    let mut other = golden.clone();
+    other.files[0].e_tag = None;
+    assert_eq!(other.fingerprint(), golden.fingerprint());
+    other.files[1].row_groups[1].rows = 2;
+    assert_ne!(other.fingerprint(), golden.fingerprint());
+}
+
+#[tokio::test]
+async fn old_sidecar_rebuilds() {
+    let (dir, store, prefix) = dataset();
+    let cache = dir.path().join("index.bin");
+    let mut bytes = sidecar::encode(&build(&store, &prefix).await.unwrap(), true);
+    bytes[8..12].copy_from_slice(&1u32.to_le_bytes());
+    assert_eq!(sidecar::decode(&bytes), None);
+    std::fs::write(&cache, bytes).unwrap();
     assert_eq!(
-        Index::new(files.clone()).unwrap().fingerprint(),
-        index.fingerprint()
-    );
-    files[1].rows[1] = 2;
-    assert_ne!(
-        Index::new(files).unwrap().fingerprint(),
-        index.fingerprint()
+        summary(&open(&store, &prefix, &cache).await.unwrap()),
+        expected()
     );
 }
 
+fn codec() -> impl Strategy<Value = Codec> {
+    (0u8..7).prop_map(|b| Codec::from_byte(b).unwrap())
+}
+
 fn files() -> impl Strategy<Value = Vec<File>> {
+    let group = (any::<u32>(), any::<u64>(), any::<u32>(), codec());
+    let group = group.prop_map(|(rows, start, len, codec)| RowGroup {
+        rows,
+        start,
+        len,
+        codec,
+    });
     let f = (
         ".{0,8}",
         any::<u64>(),
         proptest::option::of(".{0,8}"),
-        prop::collection::vec(any::<u32>(), 0..5),
+        prop::collection::vec(group, 0..5),
     );
     prop::collection::vec(
-        f.prop_map(|(path, size, e_tag, rows)| File {
+        f.prop_map(|(path, size, e_tag, row_groups)| File {
             path,
             size,
             e_tag,
-            rows,
+            row_groups,
         }),
         0..5,
     )
@@ -253,13 +306,14 @@ fn files() -> impl Strategy<Value = Vec<File>> {
 
 proptest! {
     #[test]
-    fn sidecar_roundtrip(files in files()) {
-        prop_assert_eq!(sidecar::decode(&sidecar::encode(&files, true)), Some(files));
+    fn sidecar_roundtrip(files in files(), column in ".{0,8}", schema in ".{0,16}") {
+        let index = Index::new(column, schema, files).unwrap();
+        prop_assert_eq!(sidecar::decode(&sidecar::encode(&index, true)), Some(index));
     }
 
     #[test]
     fn decode_never_panics(files in files(), cut in any::<prop::sample::Index>(), junk in prop::collection::vec(any::<u8>(), 0..64)) {
-        let bytes = sidecar::encode(&files, true);
+        let bytes = sidecar::encode(&index(files), true);
         let cut = cut.index(bytes.len());
         prop_assert_eq!(sidecar::decode(&bytes[..cut]), None);
         sidecar::decode(&junk);
