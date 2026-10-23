@@ -1,2 +1,7 @@
 /target
 .claude/settings.local.json
+.venv/
+__pycache__/
+# The extension that `maturin develop` builds in place.
+/plitzer-py/python/plitzer/*.so
+/plitzer-py/python/plitzer/*.pyd

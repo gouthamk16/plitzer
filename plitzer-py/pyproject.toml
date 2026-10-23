@@ -1,0 +1,45 @@
+[build-system]
+requires = ["maturin>=1.15,<2"]
+build-backend = "maturin"
+
+[project]
+name = "plitzer"
+description = "Deterministic, resumable dataloader for Parquet on local disk and S3"
+requires-python = ">=3.11"
+license = "MIT OR Apache-2.0"
+dynamic = ["version"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.urls]
+Repository = "https://github.com/gouthamk16/plitzer"
+
+[dependency-groups]
+dev = ["maturin>=1.15,<2", "mypy>=1.13", "numpy>=2.1", "pyarrow>=18", "pytest>=8", "ruff>=0.8"]
+
+[tool.maturin]
+python-source = "python"
+module-name = "plitzer._plitzer"
+
+[tool.ruff]
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ANN"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["plitzer", "conftest"]
+
+[tool.mypy]
+strict = true
+python_version = "3.11"
+# The stubs and conftest, without a built extension.
+mypy_path = ["python", "tests"]
+
+[[tool.mypy.overrides]]
+# pyarrow ships no type information.
+module = ["pyarrow", "pyarrow.*"]
+ignore_missing_imports = true

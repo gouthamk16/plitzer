@@ -5,7 +5,7 @@
 | Field | Value |
 |---|---|
 | Status | Active. It changes with each feature PR. The code is pre-alpha. |
-| Last change | 2026-10-23, PR #16 |
+| Last change | 2026-10-23, PR #18 |
 | Language standard | ASD-STE100 (Simplified Technical English) |
 | Code | `src/` at the commit of this file |
 
@@ -83,6 +83,8 @@ Each term has only one definition in this document.
 | Global checkpoint | A checkpoint that holds all B lanes. It resumes on each GPU count. |
 | Column chunk | The bytes of one column in one row group. |
 | Codec | The compression method of a column chunk, such as Snappy or Zstd. |
+| DLPack | A C interface that lets one library use the tensor memory of another library without a copy. |
+| Capsule | A Python object that holds a C pointer. DLPack and Arrow give their structs to Python in capsules. |
 
 ## 3. Requirements
 
@@ -98,6 +100,8 @@ Each term has only one definition in this document.
 | REQ-8 | A start with an unchanged dataset reads no Parquet footers. | `index::open_uses_cache_without_footers`. | Met |
 | REQ-9 | The decoded tokens in memory stay at or below the budget, and a budget that the loader accepts never stops it. | `load::budget_is_checked_and_kept`. | Met |
 | REQ-10 | A resume with different settings or a different dataset stops with an error that names the field. | `checkpoint::check_names_the_field` and `session::resume_refuses_other_runs`. | Met |
+| REQ-11 | Python reads each batch without a copy, through DLPack and Arrow. | `test_dlpack_versioned_and_legacy`, `test_arrow_export` and `test_data_outlives_the_batch_and_the_loader`. | Met |
+| REQ-12 | Input from Python gives a Python exception, never a panic or a wait with no end. | `test_bad_settings`, `test_resume_refuses_other_runs` and `test_forked_child_is_refused`. A manual test: Ctrl-C during a stopped S3 read gives `KeyboardInterrupt` in 0.51 s. | Met |
 
 ## 4. System overview
 
@@ -124,7 +128,9 @@ flowchart LR
 | Loader | `src/load.rs` | Implemented | [5.7](#57-loader) |
 | Checkpoint | `src/checkpoint.rs` | Implemented | [5.8](#58-checkpoint) |
 | Session | `src/session.rs` | Implemented | [5.9](#59-session) |
-| Python bindings | — | Planned | [5.10](#510-planned-components) |
+| Store | `src/store.rs` | Implemented | [5.10](#510-store) |
+| Python bindings | `plitzer-py/` | Implemented | [5.11](#511-python-bindings) |
+| PyTorch dataset | — | Planned | [5.12](#512-planned-components) |
 
 ## 5. Component design
 
@@ -791,11 +797,151 @@ pub enum Error { Config(String), Index(index::Error), Read(read::Error),
 | `open_refuses_bad_settings` | Unit | A world that does not divide B, a rank out of range, no GPUs, W = 0 and D = 0 each give `Error::Config`. |
 | `next_retries_after_a_failed_read` | Unit | After a failed read and a repair of the file, the next calls give the same batches as a run with no failure. |
 
-### 5.10 Planned components
+### 5.10 Store
 
-These components are not in the code yet. Their sections will have the full set of parts when they are implemented.
+**Function:** The store module changes a dataset location into an `object_store` store and a prefix.
 
-- **Python:** The bindings use PyO3 and maturin. Batches go to Python through DLPack and the Arrow PyCapsule interface. A PyTorch `IterableDataset` gives `state_dict()` and `load_state_dict()`. Users must set `num_workers=0`. The parallel work is in Rust, and a fork of a process with a tokio runtime is not safe.
+**Interface:**
+
+```rust
+pub fn open(location: &str, options: &[(String, String)])
+    -> Result<(Arc<dyn ObjectStore>, Path), Error>;
+
+pub enum Error { Store(object_store::Error), Scheme(String), Option(String) }
+```
+
+**Design:**
+
+| Location | Store | Prefix |
+|---|---|---|
+| A local path, such as `data/` or `C:\data` | `LocalFileSystem::new_with_prefix(path)` | empty |
+| `file:///data` | The same, for the path of the URL | empty |
+| `s3://bucket/prefix` (`s3` feature) | `AmazonS3Builder::from_env()` with the URL, then each option | the path of the URL |
+| Other schemes | `Error::Scheme` | — |
+
+**Rationale:**
+
+- `object_store::parse_url_opts` does not read the `AWS_*` environment variables. `from_env` reads them, and the options override them (D-49).
+- An unknown option gives `Error::Option`. If the store ignored an option, a wrong endpoint or a wrong key name would fail later with an unclear error.
+- A local folder takes no options, so an option for a local folder is an error.
+- A path such as `C:\data` parses as a URL with the scheme `c`. Thus a scheme of one letter is a local path.
+
+**Limits:**
+
+- Only local disk and S3. Google Cloud Storage and Azure need their `object_store` features and a row in the table above.
+
+**Verification:**
+
+| Test | Type | What it shows |
+|---|---|---|
+| `opens_local_folders` | Unit | A path and a `file://` URL open the same folder. |
+| `refuses_what_it_cannot_open` | Unit | A missing folder, an unknown scheme and an option for a local folder each give their error. |
+| `refuses_unknown_s3_options` | Unit | An unknown S3 option gives `Error::Option`. |
+| `open_an_s3_url` | Integration | An `s3://` URL with options opens versitygw with the correct prefix. |
+
+### 5.11 Python bindings
+
+**Function:** The `plitzer` Python package runs one `Session` for each Python `Loader`. It gives each step to Python as int32 arrays without a copy, through DLPack and the Arrow PyCapsule interface.
+
+**Interface (`plitzer/_plitzer.pyi`):**
+
+```python
+class Loader:
+    def __init__(self, location: str, *, seed: int, lanes: int, window: int, seq_len: int,
+                 docs: int, cap: int, pad: int, budget: int, rank: int = 0, world: int = 1,
+                 column: str = "tokens", cache: str | None = None,
+                 storage_options: Mapping[str, str] | None = None) -> None: ...
+    def __iter__(self) -> Loader: ...           # the rest of the current epoch
+    def __next__(self) -> Batch: ...
+    def set_epoch(self, epoch: int) -> None: ...
+    def checkpoint(self) -> bytes: ...          # the part of this GPU
+    def resume(self, checkpoint: bytes) -> None: ...
+    epoch: int; lanes: range                    # read-only properties
+class Batch:  tokens: Array                     # shape (lanes, seq_len)
+              lengths: Array                    # shape (lanes,): the real tokens of each row
+class Array:  shape; __dlpack__(...); __dlpack_device__(); __arrow_c_array__(...)
+def merge(parts: Sequence[bytes]) -> bytes: ...
+class PlitzerError(Exception); ConfigError, CheckpointError, DataError (PlitzerError)
+```
+
+**Design:**
+
+- The process has one multi-thread tokio runtime. It records the PID of the process that made it. In a forked child, each call gives `RuntimeError`.
+- `__next__` releases the GIL and waits on the runtime for 100 ms at a time. Between these waits it checks for signals. Thus Ctrl-C gives `KeyboardInterrupt` in 100 ms or less, and it drops the `next` future. `Loader::next` is cancel safe (D-44), so the next call does the same step again.
+- At the end of an epoch, `__next__` raises `StopIteration`, and the session is at the next epoch. A new `for` loop gives that epoch.
+- Each step writes into a new `Vec<u32>`. An arrow `Buffer` holds it, and each export holds a clone of that `Buffer`. Thus an exported array stays valid after the batch, the loader and the export call.
+- The default cache is `$PLITZER_CACHE_DIR`, else the user cache folder, then `plitzer/<hash of location and column>.idx`.
+
+The errors map to Python exceptions as follows:
+
+| Rust error | Python exception |
+|---|---|
+| `session::Error::Config`, `load::Error::Budget`, `store::Error::Scheme`, `store::Error::Option` | `ConfigError` |
+| `checkpoint::Error`, `session::Error::Checkpoint` | `CheckpointError` |
+| `store::Error::Store`, index, read and other load errors | `DataError` |
+
+The DLPack export is as follows:
+
+| Item | Value |
+|---|---|
+| Device | CPU, `(1, 0)` |
+| Data type | int32 (code 0, 32 bits, 1 lane) |
+| Strides | Set, C order, in elements |
+| `max_version` ≥ (1, 0) | Capsule `dltensor_versioned`, `DLManagedTensorVersioned` 1.0 |
+| No `max_version` | Capsule `dltensor`, `DLManagedTensor` |
+| `copy=True` | A copy of the data, with the flag `IS_COPIED` |
+| `dl_device` not CPU | `BufferError` |
+
+A consumer takes a DLPack capsule when it changes the capsule name to `used_dltensor` or `used_dltensor_versioned`. It then calls the deleter of the tensor. The capsule destructor calls the deleter only if the name did not change (D-48).
+
+The Arrow export is as follows:
+
+| Array | Arrow type |
+|---|---|
+| `tokens` | `FixedSizeList<int32, L>`, with the extension `arrow.fixed_shape_tensor` and the metadata `{"shape":[L]}` |
+| `lengths` | `Int32Array` |
+
+An Arrow consumer moves the structs out of the capsules and sets their `release` to null. The capsule then frees only an empty struct.
+
+**Rationale:**
+
+- Both DLPack ABIs: numpy 2 and current torch ask for the versioned ABI, and older consumers call `__dlpack__()` with no arguments (D-46).
+- int32: torch has little support for `uint32`, and vocabularies are much smaller than 2³¹. A pad token of 2³² − 1 shows as −1 (D-47).
+- `pad` has no default. Many tokenizers use 0 as a real token, so the user must choose (D-52).
+- The runtime has all its drivers. The S3 client needs the I/O driver, and the waits need the timer.
+- The PID check stops a forked child before it waits for runtime threads that it does not have (D-50).
+- The 100 ms slices let Ctrl-C work and cost one timer for each slice (D-51).
+
+**Limits:**
+
+- One wheel for each platform covers CPython 3.11 and later (abi3). It does not cover the free-threaded build.
+- A `Loader` is not shared between threads. A second thread that calls it during a step gets an error from PyO3.
+- The data is writable. Two exports of one array share the same memory.
+- Signals are checked only on the main thread, as in Python.
+
+**Verification:**
+
+| Test | Type | What it shows |
+|---|---|---|
+| `test_ranks_split_the_global_batch` | pytest | Two loaders on world 2 give the batches of one loader on world 1. |
+| `test_iteration_ends_each_epoch` | pytest | A `for` loop ends at the end of each epoch, and the next loop gives the next epoch. |
+| `test_batch_shapes_and_padding` | pytest | The shapes and the int32 type are correct. After the real tokens, each row holds the pad token. |
+| `test_dlpack_versioned_and_legacy` | pytest | Both ABIs give the same data, with the correct capsule names. |
+| `test_unused_capsules_are_freed` | pytest | Capsules that nobody takes are freed with no crash. |
+| `test_data_outlives_the_batch_and_the_loader` | pytest | DLPack and Arrow data stay correct after the batch and the loader are deleted. |
+| `test_copy_and_device` | pytest | `copy=True` gives separate memory. A device that is not the CPU gives `BufferError`. |
+| `test_arrow_export` | pytest | pyarrow reads `tokens` as a `FixedShapeTensorArray` and `lengths` as int32. |
+| `test_resume_on_another_world` | pytest | Parts from world 2, merged, resume on world 4 with the same tail as one run. |
+| `test_resume_refuses_other_runs` | pytest | A different L, bad bytes and an incomplete merge give `CheckpointError`. |
+| `test_bad_settings` | pytest | Bad settings give `ConfigError`. A missing folder gives `DataError`. |
+| `test_forked_child_is_refused` | pytest | A child of `os.fork` gets `RuntimeError`, and does not stop. |
+| `test_s3_matches_local` | pytest | The same files on versitygw and on local disk give the same batches. |
+
+### 5.12 Planned components
+
+This component is not in the code yet. Its section will have the full set of parts when it is implemented.
+
+- **PyTorch dataset:** `plitzer.torch` gives an `IterableDataset` with `state_dict()` and `load_state_dict()`. The state is `{"plitzer": bytes}`, gathered from all ranks of the data-parallel group. Users must set `num_workers=0`. The parallel work is in Rust, and a fork of a process with a tokio runtime is not safe.
 
 ## 6. Read amplification
 
@@ -858,6 +1004,14 @@ These components are not in the code yet. Their sections will have the full set 
 | D-43 | `set_epoch` only goes to a later epoch. | Trainers call it after a resume, also with the epoch before a checkpoint at an epoch end. A reset would repeat steps with no error. | Always go to step 0, or do nothing only for the same epoch. | #16 |
 | D-44 | `Loader::next` is cancel safe. The read in progress stays in the loader. | Python drops the future at Ctrl-C, and a timeout drops it too. A lost read stops the loader with a panic. | Document that a dropped `next` breaks the loader. | #16 |
 | D-45 | `from_bytes` checks the checksum before the version. | A damaged version field gives `Checksum`, not a false `Version` error. | Check the version first. | #16 |
+| D-46 | Export both the versioned (1.0) and the legacy DLPack ABI. | numpy 2 and current torch ask for 1.0. Older consumers call `__dlpack__()` with no arguments. | Only one ABI. | #18 |
+| D-47 | Export tokens as int32. | torch has little `uint32` support, and vocabularies are much smaller than 2³¹. | `uint32`, or int64 with a copy. | #18 |
+| D-48 | The DLPack capsules use our own destructor through `PyCapsule_New`. | A consumer renames the capsule and deletes the tensor itself. PyO3 destructors cannot see the name, so they would free the tensor a second time. | `PyCapsule::new_with_value`, as for the Arrow capsules. | #18 |
+| D-49 | S3 uses `AmazonS3Builder::from_env` and the options, in our `store` module. | `parse_url_opts` does not read the `AWS_*` environment variables. | `object_store::parse_url_opts`. | #18 |
+| D-50 | One runtime for each process, which refuses to work after a fork. | A forked child has none of the runtime threads, so a wait in it never ends. | A runtime for each `Loader`, which does not stop the fork problem. | #18 |
+| D-51 | Python waits in slices of 100 ms and checks for signals between them. | Ctrl-C works, and `Loader::next` is cancel safe. | One wait with no signal check: Ctrl-C does nothing until the step ends. | #18 |
+| D-52 | `pad` has no default. | Many tokenizers use 0 as a real token. `lengths` gives the real tokens, but a silent default hides the choice. | A default of 0. | #18 |
+| D-53 | The bindings are the `plitzer-py` workspace crate, built by maturin as abi3 wheels for CPython 3.11 and later. | The core crate stays free of PyO3, and one wheel covers each platform. | PyO3 in the core crate behind a feature. | #18 |
 | D-22 | The sidecar uses its own binary format and FNV-1a. | No new dependency, and the bytes are fixed by our code. | `serde` with `bincode`, or JSON. | #10 |
 | D-23 | A sidecar that does not exist or is corrupt causes a new build. | The sidecar is only a cache. | An error that the user must correct. | #10 |
 | D-24 | The index keeps the place of each token column chunk, and the reader reads no footer. | A window has row groups from approximately W files. A footer read for each row group costs approximately 1.5 times the data. | Read the footer of each file again, or keep footers in memory (9.4 GB for FineWeb-Edu). | #12 |
@@ -879,6 +1033,7 @@ These components are not in the code yet. Their sections will have the full set 
 | 2026-10-23 | #12 | Add the reader (`src/read.rs`) and the `s3` feature. Change the index to version 2, with the token column chunk of each row group. |
 | 2026-10-23 | #14 | Add the loader (`src/load.rs`) and `Order::lane_groups`. Change the index to version 3, with the value count. `Lane` holds an `Arc<Epoch>`. |
 | 2026-10-23 | #16 | Add the checkpoint (`src/checkpoint.rs`) and the session (`src/session.rs`). Add `Loader::ended`. Move the binary helpers to `src/codec.rs`. |
+| 2026-10-23 | #18 | Add the Python bindings (`plitzer-py/`) and the store (`src/store.rs`). Add a Python CI job on the three systems. |
 
 ## 10. Maintenance
 

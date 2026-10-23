@@ -8,3 +8,4 @@ pub mod read;
 pub mod seed;
 pub mod session;
 pub mod shuffle;
+pub mod store;
