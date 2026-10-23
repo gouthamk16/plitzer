@@ -656,6 +656,7 @@ The decoded row group keeps its permits. The loader releases the permits when it
 | `reads_only_own_row_groups` | Unit | The plans of all ranks cover all row groups. Ranks share only the row groups at the edges of their slices. |
 | `plan_matches_lane_streams` | Unit | Each document that a lane takes at step s, also at a resume, is in a row group that the plan needs at s. |
 | `lane_groups_match` | Property | `Order::lane_groups` gives the row groups that `Order::lane` uses. |
+| `next_is_cancel_safe` | Unit | Over a store with 20 ms reads, `next` futures dropped while a read is in flight lose no row group. The test counts these drops and needs at least one. |
 
 ### 5.8 Checkpoint
 
@@ -791,7 +792,7 @@ pub enum Error { Config(String), Index(index::Error), Read(read::Error),
 | `set_epoch_starts_that_epoch` | Unit | `set_epoch(1)` after some steps gives the batches of epoch 1. |
 | `set_epoch_keeps_a_resume_in_that_epoch` | Unit | `set_epoch(0)` after a resume in epoch 0 keeps the resumed position. |
 | `set_epoch_never_goes_back` | Unit | `set_epoch(0)` after a resume from the end of epoch 0 gives the batches of epoch 1. |
-| `next_is_cancel_safe` | Unit | Calls of `next` that are dropped before they finish give the same batches as a run with no drops. |
+| `next_is_cancel_safe` | Unit | Over a store with 5 ms reads, calls of `next` that are dropped after one poll give the same batches as a run with no drops. |
 | `resume_refuses_other_runs` | Unit | A different L, a different seed and an added file each give `Mismatch` with the name of the field. |
 | `resume_needs_this_ranks_lanes` | Unit | A part resumes the rank that holds its lanes, and another rank refuses it. |
 | `open_refuses_bad_settings` | Unit | A world that does not divide B, a rank out of range, no GPUs, W = 0 and D = 0 each give `Error::Config`. |

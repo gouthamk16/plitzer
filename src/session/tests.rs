@@ -2,7 +2,9 @@ use std::time::Duration;
 
 use arrow_array::builder::{GenericListBuilder, Int32Builder};
 use arrow_array::{ArrayRef, RecordBatch};
+use futures::FutureExt;
 use object_store::local::LocalFileSystem;
+use object_store::throttle::{ThrottleConfig, ThrottledStore};
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
 use tempfile::TempDir;
@@ -198,15 +200,32 @@ async fn set_epoch_never_goes_back() {
 async fn next_is_cancel_safe() {
     let d = data();
     let want = reference(&d).await;
-    let mut one = sessions(&d, 1).await;
+    // Each read takes 5 ms, so the first call, which must read files, is
+    // never ready at its first poll. `load::tests::next_is_cancel_safe`
+    // checks drops during a read.
+    let throttle = ThrottleConfig {
+        wait_get_per_call: Duration::from_millis(5),
+        ..ThrottleConfig::default()
+    };
+    let local = LocalFileSystem::new_with_prefix(d.files.path()).unwrap();
+    let store = Arc::new(ThrottledStore::new(local, throttle));
+    let cache = d.cache.path().join("index");
+    let mut one = Session::open(store, Path::from(""), &cache, config(), 0, 1, PLENTY)
+        .await
+        .unwrap();
+    // Poll each call once; if it is not ready, drop it and do the step again.
     let mut seq = vec![0; (4 * config().packing.seq_len) as usize];
     let mut got = Vec::new();
     let mut cancelled = 0;
     while got.len() < want.len() {
-        match tokio::time::timeout(Duration::ZERO, one[0].next(&mut seq)).await {
-            Ok(real) => got.push(real.unwrap().map(|_| seq.clone())),
-            Err(_) => cancelled += 1,
-        }
+        let real = match one.next(&mut seq).now_or_never() {
+            Some(real) => real,
+            None => {
+                cancelled += 1;
+                one.next(&mut seq).await
+            }
+        };
+        got.push(real.unwrap().map(|_| seq.clone()));
     }
     assert!(cancelled > 0, "no call was cancelled");
     assert_eq!(got, want);
