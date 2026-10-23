@@ -83,7 +83,7 @@ jobs:
             ghcr.io/versity/versitygw:v1.10.0
           for i in $(seq 30); do curl -s -o /dev/null "$PLITZER_S3_ENDPOINT" && exit 0; sleep 1; done
           docker logs s3; exit 1
-      - run: cargo test --features s3 --test s3
+      - run: cargo test --features s3
       - uses: astral-sh/setup-uv@v6
       - name: Python over S3
         run: |

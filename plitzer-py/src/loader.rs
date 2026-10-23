@@ -51,7 +51,10 @@ impl Loader {
         let mut options: Vec<_> = storage_options.unwrap_or_default().into_iter().collect();
         options.sort();
         let (store, prefix) = plitzer::store::open(location, &options).map_err(store_error)?;
-        let cache = cache.unwrap_or_else(|| default_cache(location, &column));
+        // The resolved store, not the spelling: `data` from two folders, or
+        // `s3://b/p/` and `s3://b/p`, must not share or split an index.
+        let resolved = format!("{store}/{prefix}");
+        let cache = cache.unwrap_or_else(|| default_cache(&resolved, &column));
         let packing = Packing {
             seq_len,
             docs,
@@ -112,7 +115,7 @@ impl Loader {
 }
 
 /// `$PLITZER_CACHE_DIR`, else the user cache folder, then one file per
-/// location and column. `DefaultHasher` can change with Rust; that only
+/// resolved location and column. `DefaultHasher` can change with Rust; that only
 /// rebuilds the index once.
 fn default_cache(location: &str, column: &str) -> PathBuf {
     let var = |name: &str| std::env::var_os(name).map(PathBuf::from);

@@ -102,7 +102,10 @@ fn file(r: &mut Reader) -> Option<File> {
 /// write at once, and no reader sees a half-written sidecar.
 pub(super) fn write(path: &std::path::Path, bytes: &[u8]) -> io::Result<()> {
     let dir = path.parent().filter(|d| !d.as_os_str().is_empty());
-    let mut tmp = tempfile::NamedTempFile::new_in(dir.unwrap_or(".".as_ref()))?;
+    let dir = dir.unwrap_or(".".as_ref());
+    // A default cache folder does not exist on a new machine.
+    std::fs::create_dir_all(dir)?;
+    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
     tmp.write_all(bytes)?;
     for attempt in 0.. {
         let Err(e) = tmp.persist(path) else {

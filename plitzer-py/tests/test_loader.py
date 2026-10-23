@@ -1,6 +1,7 @@
 import gc
 import os
 import signal
+import sys
 import time
 import warnings
 from collections.abc import Sequence
@@ -86,12 +87,34 @@ def test_dlpack_versioned_and_legacy(make: MakeLoader) -> None:
     assert batch.tokens.__dlpack_device__() == (1, 0)
 
 
+def max_rss_kib() -> int:
+    import resource  # POSIX only, so imported where the test runs
+
+    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="ru_maxrss is in KiB on Linux")
 def test_unused_capsules_are_freed(make: MakeLoader) -> None:
     batch = next(make())
-    for _ in range(1000):
+    for _ in range(10_000):  # reach the peak RSS before measuring
+        batch.tokens.__dlpack__()
+    before = max_rss_kib()
+    # Each leaked capsule would keep about 200 bytes: about 60 MiB in all.
+    for _ in range(150_000):
         batch.tokens.__dlpack__()
         batch.tokens.__dlpack__(max_version=(1, 0))
     gc.collect()
+    assert max_rss_kib() - before < 16 * 1024
+
+
+def test_default_cache_is_made_and_shared(
+    dataset: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cache = tmp_path / "new" / "cache"
+    monkeypatch.setenv("PLITZER_CACHE_DIR", str(cache))
+    for location in [str(dataset), str(dataset) + os.sep, dataset.as_uri()]:
+        next(plitzer.Loader(location, **SETTINGS))  # type: ignore[arg-type]
+    assert len(list(cache.iterdir())) == 1, "one index for each dataset"
 
 
 def test_data_outlives_the_batch_and_the_loader(make: MakeLoader) -> None:

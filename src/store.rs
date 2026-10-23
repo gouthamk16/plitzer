@@ -5,6 +5,8 @@ use std::fmt;
 use std::sync::Arc;
 
 use object_store::ObjectStore;
+#[cfg(feature = "s3")]
+use object_store::aws::{AmazonS3Builder, AmazonS3ConfigKey};
 use object_store::local::LocalFileSystem;
 use object_store::path::Path;
 use url::Url;
@@ -15,7 +17,8 @@ pub enum Error {
     Store(object_store::Error),
     /// A URL scheme that this build cannot open.
     Scheme(String),
-    /// A storage option that the store does not know, or a bad location.
+    /// A storage option that the store does not know, a bad S3 setting, or a
+    /// bad location.
     Option(String),
 }
 
@@ -77,8 +80,6 @@ fn local(
 
 #[cfg(feature = "s3")]
 fn s3(url: &Url, options: &[(String, String)]) -> Result<(Arc<dyn ObjectStore>, Path), Error> {
-    use object_store::aws::{AmazonS3Builder, AmazonS3ConfigKey};
-
     let bucket = url.host_str().unwrap_or_default();
     let mut builder = AmazonS3Builder::from_env().with_url(format!("s3://{bucket}"));
     for (key, value) in options {
@@ -86,7 +87,8 @@ fn s3(url: &Url, options: &[(String, String)]) -> Result<(Arc<dyn ObjectStore>, 
             .map_err(|_| Error::Option(format!("unknown S3 storage option {key:?}")))?;
         builder = builder.with_config(key, value);
     }
-    let store = builder.build().map_err(Error::Store)?;
+    // The builder fails only on settings, such as a missing bucket.
+    let store = (builder.build()).map_err(|e| Error::Option(format!("bad S3 settings: {e}")))?;
     let prefix = Path::from_url_path(url.path())
         .map_err(|e| Error::Option(format!("bad prefix in {url}: {e}")))?;
     Ok((Arc::new(store), prefix))
@@ -129,5 +131,9 @@ mod tests {
     fn refuses_unknown_s3_options() {
         let options = [("no_such_option".to_string(), "x".to_string())];
         assert!(matches!(open("s3://b/p", &options), Err(Error::Option(_))));
+        assert!(
+            matches!(open("s3:///p", &[]), Err(Error::Option(_))),
+            "no bucket"
+        );
     }
 }

@@ -26,9 +26,8 @@ loader = plitzer.Loader(
     budget=8 << 30,                      # bytes of decoded tokens kept in memory
     rank=0, world=8,                     # this GPU, of 8
 )
-for epoch in range(3):
-    loader.set_epoch(epoch)              # only moves forward, so a resume is kept
-    for batch in loader:                 # one epoch; the next loop gives the next
+while loader.epoch < 3:                  # also right after loader.resume(state)
+    for batch in loader:                 # the rest of this epoch; then epoch + 1
         tokens = np.from_dlpack(batch.tokens)    # or torch.from_dlpack, or pyarrow.array
         lengths = np.from_dlpack(batch.lengths)  # real tokens in each row
         ...

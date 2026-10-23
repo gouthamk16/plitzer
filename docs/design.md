@@ -823,6 +823,7 @@ pub enum Error { Store(object_store::Error), Scheme(String), Option(String) }
 
 - `object_store::parse_url_opts` does not read the `AWS_*` environment variables. `from_env` reads them, and the options override them (D-49).
 - An unknown option gives `Error::Option`. If the store ignored an option, a wrong endpoint or a wrong key name would fail later with an unclear error.
+- The S3 builder fails only on settings, such as a missing bucket. Thus its error is also `Error::Option`, and Python shows it as `ConfigError`.
 - A local folder takes no options, so an option for a local folder is an error.
 - A path such as `C:\data` parses as a URL with the scheme `c`. Thus a scheme of one letter is a local path.
 
@@ -836,7 +837,7 @@ pub enum Error { Store(object_store::Error), Scheme(String), Option(String) }
 |---|---|---|
 | `opens_local_folders` | Unit | A path and a `file://` URL open the same folder. |
 | `refuses_what_it_cannot_open` | Unit | A missing folder, an unknown scheme and an option for a local folder each give their error. |
-| `refuses_unknown_s3_options` | Unit | An unknown S3 option gives `Error::Option`. |
+| `refuses_unknown_s3_options` | Unit | An unknown S3 option and a URL with no bucket give `Error::Option`. |
 | `open_an_s3_url` | Integration | An `s3://` URL with options opens versitygw with the correct prefix. |
 
 ### 5.11 Python bindings
@@ -870,7 +871,7 @@ class PlitzerError(Exception); ConfigError, CheckpointError, DataError (PlitzerE
 - `__next__` releases the GIL and waits on the runtime for 100 ms at a time. Between these waits it checks for signals. Thus Ctrl-C gives `KeyboardInterrupt` in 100 ms or less, and it drops the `next` future. `Loader::next` is cancel safe (D-44), so the next call does the same step again.
 - At the end of an epoch, `__next__` raises `StopIteration`, and the session is at the next epoch. A new `for` loop gives that epoch.
 - Each step writes into a new `Vec<u32>`. An arrow `Buffer` holds it, and each export holds a clone of that `Buffer`. Thus an exported array stays valid after the batch, the loader and the export call.
-- The default cache is `$PLITZER_CACHE_DIR`, else the user cache folder, then `plitzer/<hash of location and column>.idx`.
+- The default cache is `$PLITZER_CACHE_DIR`, else the user cache folder, then `plitzer/<hash>.idx`. The hash is of the resolved store, the prefix and the column, not of the location text. Thus `data` from two folders gets two files, and `data/` and `file:///…/data` share one (D-54). The index makes the cache folder if it does not exist.
 
 The errors map to Python exceptions as follows:
 
@@ -915,7 +916,7 @@ An Arrow consumer moves the structs out of the capsules and sets their `release`
 **Limits:**
 
 - One wheel for each platform covers CPython 3.11 and later (abi3). It does not cover the free-threaded build.
-- A `Loader` is not shared between threads. A second thread that calls it during a step gets an error from PyO3.
+- A `Loader` is not shared between threads. A second thread that calls it during a step gets an error from PyO3. A Python signal handler that runs during a step gets the same error, so a handler must only set a flag. The step cannot release the `Loader`: a new load started in each 100 ms slice would never finish on a slow store.
 - The data is writable. Two exports of one array share the same memory.
 - Signals are checked only on the main thread, as in Python.
 
@@ -927,7 +928,8 @@ An Arrow consumer moves the structs out of the capsules and sets their `release`
 | `test_iteration_ends_each_epoch` | pytest | A `for` loop ends at the end of each epoch, and the next loop gives the next epoch. |
 | `test_batch_shapes_and_padding` | pytest | The shapes and the int32 type are correct. After the real tokens, each row holds the pad token. |
 | `test_dlpack_versioned_and_legacy` | pytest | Both ABIs give the same data, with the correct capsule names. |
-| `test_unused_capsules_are_freed` | pytest | Capsules that nobody takes are freed with no crash. |
+| `test_unused_capsules_are_freed` | pytest | 300 000 capsules that nobody takes are freed: the peak memory grows less than 16 MiB (Linux). |
+| `test_default_cache_is_made_and_shared` | pytest | With no `cache`, the index makes its cache folder. Three spellings of one folder use one cache file. |
 | `test_data_outlives_the_batch_and_the_loader` | pytest | DLPack and Arrow data stay correct after the batch and the loader are deleted. |
 | `test_copy_and_device` | pytest | `copy=True` gives separate memory. A device that is not the CPU gives `BufferError`. |
 | `test_arrow_export` | pytest | pyarrow reads `tokens` as a `FixedShapeTensorArray` and `lengths` as int32. |
@@ -1012,6 +1014,7 @@ This component is not in the code yet. Its section will have the full set of par
 | D-51 | Python waits in slices of 100 ms and checks for signals between them. | Ctrl-C works, and `Loader::next` is cancel safe. | One wait with no signal check: Ctrl-C does nothing until the step ends. | #18 |
 | D-52 | `pad` has no default. | Many tokenizers use 0 as a real token. `lengths` gives the real tokens, but a silent default hides the choice. | A default of 0. | #18 |
 | D-53 | The bindings are the `plitzer-py` workspace crate, built by maturin as abi3 wheels for CPython 3.11 and later. | The core crate stays free of PyO3, and one wheel covers each platform. | PyO3 in the core crate behind a feature. | #18 |
+| D-54 | The default cache name is a hash of the resolved store and prefix. | The same text can name two datasets, and two texts can name one dataset. | A hash of the location text. | #18 |
 | D-22 | The sidecar uses its own binary format and FNV-1a. | No new dependency, and the bytes are fixed by our code. | `serde` with `bincode`, or JSON. | #10 |
 | D-23 | A sidecar that does not exist or is corrupt causes a new build. | The sidecar is only a cache. | An error that the user must correct. | #10 |
 | D-24 | The index keeps the place of each token column chunk, and the reader reads no footer. | A window has row groups from approximately W files. A footer read for each row group costs approximately 1.5 times the data. | Read the footer of each file again, or keep footers in memory (9.4 GB for FineWeb-Edu). | #12 |
@@ -1033,7 +1036,7 @@ This component is not in the code yet. Its section will have the full set of par
 | 2026-10-23 | #12 | Add the reader (`src/read.rs`) and the `s3` feature. Change the index to version 2, with the token column chunk of each row group. |
 | 2026-10-23 | #14 | Add the loader (`src/load.rs`) and `Order::lane_groups`. Change the index to version 3, with the value count. `Lane` holds an `Arc<Epoch>`. |
 | 2026-10-23 | #16 | Add the checkpoint (`src/checkpoint.rs`) and the session (`src/session.rs`). Add `Loader::ended`. Move the binary helpers to `src/codec.rs`. |
-| 2026-10-23 | #18 | Add the Python bindings (`plitzer-py/`) and the store (`src/store.rs`). Add a Python CI job on the three systems. |
+| 2026-10-23 | #18 | Add the Python bindings (`plitzer-py/`) and the store (`src/store.rs`). Add a Python CI job on the three systems. The index makes the folder of its cache. |
 
 ## 10. Maintenance
 
