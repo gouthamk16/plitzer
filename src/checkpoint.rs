@@ -121,12 +121,21 @@ impl Checkpoint {
         if fnv1a(body) != u64::from_le_bytes(*sum) {
             return Err(Error::Checksum);
         }
-        let mut r = Reader(&body[12..]);
+        let mut r = Reader(body.get(12..).ok_or(Error::Bytes("truncated"))?);
         let checkpoint = fields(&mut r).ok_or(Error::Bytes("truncated"))?;
         if !r.0.is_empty() {
             return Err(Error::Bytes("trailing bytes"));
         }
         Ok(checkpoint)
+    }
+
+    /// True if `other` comes from the same run, epoch and step.
+    fn same_position(&self, other: &Checkpoint) -> bool {
+        let step = self.lanes.first().map(|s| s.step);
+        other.config == self.config
+            && other.fingerprint == self.fingerprint
+            && other.epoch == self.epoch
+            && other.lanes.iter().all(|s| Some(s.step) == step)
     }
 
     /// True if this checkpoint holds all B lanes.
@@ -140,14 +149,7 @@ impl Checkpoint {
             return Err(Error::Parts("no checkpoint parts to merge".into()));
         };
         let (config, fingerprint, epoch) = (first.config.clone(), first.fingerprint, first.epoch);
-        let step = first.lanes.first().map(|s| s.step);
-        let same = |p: &Checkpoint| {
-            p.config == config
-                && p.fingerprint == fingerprint
-                && p.epoch == epoch
-                && p.lanes.iter().all(|s| Some(s.step) == step)
-        };
-        if !parts.iter().all(same) {
+        if !parts.iter().all(|p| first.same_position(p)) {
             return Err(Error::Parts(
                 "the parts come from different runs or steps".into(),
             ));
@@ -178,7 +180,8 @@ impl Checkpoint {
     /// must be at one step, since a loader steps all its lanes together.
     pub fn states(&self, lanes: Range<u32>) -> Result<Vec<LaneState>, Error> {
         let held = u64::from(self.first_lane)..u64::from(self.first_lane) + self.lanes.len() as u64;
-        if u64::from(lanes.start) < held.start || u64::from(lanes.end) > held.end {
+        let (start, end) = (u64::from(lanes.start), u64::from(lanes.end));
+        if start > end || start < held.start || end > held.end {
             let why = format!("the checkpoint holds lanes {held:?}, but this rank needs {lanes:?}");
             return Err(Error::Parts(why));
         }

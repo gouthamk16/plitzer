@@ -54,7 +54,6 @@ pub struct Session {
     index: Arc<Index>,
     fingerprint: u64,
     reader: Arc<Reader>,
-    rows: Vec<u32>,
     lanes: Range<u32>,
     budget: u64,
     epoch: u64,
@@ -84,7 +83,6 @@ impl Session {
         let lanes = gpu_lanes(config.lanes, world, rank);
         Ok(Session {
             config,
-            rows: index.rows(),
             fingerprint: index.fingerprint(),
             index: Arc::new(index),
             reader: Arc::new(reader),
@@ -96,8 +94,16 @@ impl Session {
         })
     }
 
-    /// Stands before the first step of epoch `epoch`.
+    /// Stands before the first step of epoch `epoch`. Does nothing if the
+    /// session is in that epoch already: trainers call this at the start of
+    /// each epoch, also the epoch they resumed into.
     pub fn set_epoch(&mut self, epoch: u64) {
+        if epoch != self.epoch {
+            self.start_epoch(epoch);
+        }
+    }
+
+    fn start_epoch(&mut self, epoch: u64) {
         self.epoch = epoch;
         self.start = vec![LaneState::default(); self.lanes.len()];
         self.loader = None;
@@ -129,7 +135,7 @@ impl Session {
         match loader.next(out).await {
             Ok(Some(real)) => Ok(Some(real)),
             Ok(None) => {
-                self.set_epoch(self.epoch + 1);
+                self.start_epoch(self.epoch + 1);
                 Ok(None)
             }
             Err(e) => {
@@ -141,17 +147,21 @@ impl Session {
     }
 
     /// This GPU's part of a checkpoint. `Checkpoint::merge` joins the parts
-    /// of all GPUs into one that resumes on any number of GPUs.
+    /// of all GPUs into one that resumes on any number of GPUs. After the
+    /// last step of an epoch it is the start of the next epoch, also before
+    /// the call of `next` that returns `None`, so the parts of all GPUs agree.
     pub fn checkpoint(&self) -> Checkpoint {
+        let (epoch, lanes) = match &self.loader {
+            Some(l) if l.ended() => (self.epoch + 1, vec![LaneState::default(); self.lanes.len()]),
+            Some(l) => (self.epoch, l.states()),
+            None => (self.epoch, self.start.clone()),
+        };
         Checkpoint {
             config: self.config.clone(),
             fingerprint: self.fingerprint,
-            epoch: self.epoch,
+            epoch,
             first_lane: self.lanes.start,
-            lanes: self
-                .loader
-                .as_ref()
-                .map_or(self.start.clone(), Loader::states),
+            lanes,
         }
     }
 
@@ -170,7 +180,7 @@ impl Session {
             epoch: self.epoch,
             lanes: c.lanes,
             window: c.window,
-            rows: &self.rows,
+            rows: &self.index.rows(),
         };
         let epoch = Arc::new(Epoch::new(order, c.packing));
         let (reader, index) = (self.reader.clone(), self.index.clone());

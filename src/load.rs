@@ -159,12 +159,10 @@ impl Loader {
     /// written into `out`. Returns the real-token count of each sequence, or
     /// `None` after the last step of the epoch.
     pub async fn next(&mut self, out: &mut [u32]) -> Result<Option<Vec<u32>>, Error> {
-        let Some(step) = self.lanes.first().map(|l| l.state().step) else {
-            return Ok(None);
-        };
-        if step == self.epoch.steps() {
+        if self.ended() {
             return Ok(None);
         }
+        let step = self.lanes[0].state().step;
         if self.stopped {
             return Err(Error::Stopped);
         }
@@ -188,6 +186,11 @@ impl Loader {
             }
         }
         Ok(Some(real))
+    }
+
+    /// True after the last step of the epoch.
+    pub fn ended(&self) -> bool {
+        (self.lanes.first()).is_none_or(|l| l.state().step == self.epoch.steps())
     }
 
     /// The state of each lane, for a checkpoint. Prefetched row groups are

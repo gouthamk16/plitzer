@@ -578,6 +578,7 @@ impl Loader {
     pub async fn new(epoch: Arc<Epoch>, reader: Arc<Reader>, index: Arc<Index>,
                      lanes: Range<u32>, states: &[LaneState], budget: u64) -> Result<Loader, Error>;
     pub async fn next(&mut self, out: &mut [u32]) -> Result<Option<Vec<u32>>, Error>;
+    pub fn ended(&self) -> bool;               // true after the last step of the epoch
     pub fn states(&self) -> Vec<LaneState>;   // the part of the checkpoint for this GPU
     pub fn resident_bytes(&self) -> usize;
 }
@@ -756,14 +757,15 @@ pub enum Error { Config(String), Index(index::Error), Read(read::Error),
 **Design:**
 
 - `open` checks the config, opens the index with `Index::open`, and makes the reader. The lanes are `gpu_lanes(B, world, rank)`.
-- The session keeps the lane states to start from. `set_epoch` sets them to the start of an epoch. `resume` takes them from a checkpoint after `check`.
+- The session keeps the lane states to start from. `set_epoch` sets them to the start of an epoch, if the session is not in that epoch already. `resume` takes them from a checkpoint after `check`.
 - `next` makes the loader of the epoch at the first step. At the end of the epoch, `next` returns `None`, and the session goes to step 0 of the next epoch.
 - If `next` fails, the session keeps the lane states of the loader and drops the loader. The next call makes a new loader and tries the same step again.
-- `checkpoint` gives the lane states of the loader. Before the first step of an epoch, it gives the start states.
+- `checkpoint` gives the lane states of the loader. Before the first step of an epoch, it gives the start states. After the last step of an epoch, it gives `(epoch + 1, step 0)`, also before the call of `next` that returns `None`.
 
 **Rationale:**
 
-- After the last step of an epoch, a checkpoint holds `(epoch + 1, step 0)`. A resume from it starts the next epoch, not an empty end of the old epoch (D-40).
+- After the last step of an epoch, a checkpoint holds `(epoch + 1, step 0)`. A resume from it starts the next epoch, not an empty end of the old epoch. The parts of all GPUs agree, also if only some GPUs received `None` (D-40).
+- Trainers call `set_epoch` at the start of each epoch, also the epoch that they resumed into. Thus `set_epoch` does not change a session that is in that epoch (D-43).
 - The Python bindings give the config to `open`. Thus `open` returns `Error::Config` for a config that would cause a panic (D-41).
 - A failed read leaves the lane states before the failed step. Thus a retry can continue, and the caller does not have to make a new session (D-42).
 - The session calculates the fingerprint one time. The fingerprint encodes the full index.
@@ -778,8 +780,9 @@ pub enum Error { Config(String), Index(index::Error), Read(read::Error),
 | Test | Type | What it shows |
 |---|---|---|
 | `resume_on_another_world_matches_one_run` | Unit | Runs on world a stop at step k, also at and after the end of an epoch. Their merged checkpoint resumes on world b. The batches are the same as one run on world 1 with no stop. |
-| `epochs_roll_over` | Unit | After the last step, the session is at epoch 1, and its checkpoint holds the start states. The batches of epoch 1 are not the same as epoch 0. |
+| `epochs_roll_over` | Unit | After the last step, the checkpoint holds epoch 1 and the start states, before and after `None`. Parts from a GPU that received `None` and a GPU that did not merge. The batches of epoch 1 are not the same as epoch 0. |
 | `set_epoch_starts_that_epoch` | Unit | `set_epoch(1)` after some steps gives the batches of epoch 1. |
+| `set_epoch_keeps_a_resume_in_that_epoch` | Unit | `set_epoch(0)` after a resume in epoch 0 keeps the resumed position. |
 | `resume_refuses_other_runs` | Unit | A different L, a different seed and an added file each give `Mismatch` with the name of the field. |
 | `resume_needs_this_ranks_lanes` | Unit | A part resumes the rank that holds its lanes, and another rank refuses it. |
 | `open_refuses_bad_settings` | Unit | A world that does not divide B, a rank out of range, no GPUs, W = 0 and D = 0 each give `Error::Config`. |
@@ -849,6 +852,7 @@ These components are not in the code yet. Their sections will have the full set 
 | D-40 | After the last step of an epoch, the session goes to step 0 of the next epoch. | A checkpoint at the end of an epoch then starts the next epoch. | Stay at the end of the old epoch. | #16 |
 | D-41 | `Session::open` returns `Error::Config` for a config that would cause a panic. | Python gives the config. | A panic, which PyO3 shows as `PanicException`. | #16 |
 | D-42 | After a failed `next`, the session keeps the lane states and drops the loader. | The next call tries the same step again. | Stop the session, as the loader does. | #16 |
+| D-43 | `set_epoch` does nothing if the session is in that epoch. | Trainers call it after a resume, and a reset would repeat steps with no error. | Always go to step 0. | #16 |
 | D-22 | The sidecar uses its own binary format and FNV-1a. | No new dependency, and the bytes are fixed by our code. | `serde` with `bincode`, or JSON. | #10 |
 | D-23 | A sidecar that does not exist or is corrupt causes a new build. | The sidecar is only a cache. | An error that the user must correct. | #10 |
 | D-24 | The index keeps the place of each token column chunk, and the reader reads no footer. | A window has row groups from approximately W files. A footer read for each row group costs approximately 1.5 times the data. | Read the footer of each file again, or keep footers in memory (9.4 GB for FineWeb-Edu). | #12 |
@@ -869,7 +873,7 @@ These components are not in the code yet. Their sections will have the full set 
 | 2026-10-22 | #10 | Add the index (`src/index.rs`), `object_store` and `parquet`. Increase the minimum Rust version to 1.88. |
 | 2026-10-23 | #12 | Add the reader (`src/read.rs`) and the `s3` feature. Change the index to version 2, with the token column chunk of each row group. |
 | 2026-10-23 | #14 | Add the loader (`src/load.rs`) and `Order::lane_groups`. Change the index to version 3, with the value count. `Lane` holds an `Arc<Epoch>`. |
-| 2026-10-23 | #16 | Add the checkpoint (`src/checkpoint.rs`) and the session (`src/session.rs`). Move the binary helpers to `src/codec.rs`. |
+| 2026-10-23 | #16 | Add the checkpoint (`src/checkpoint.rs`) and the session (`src/session.rs`). Add `Loader::ended`. Move the binary helpers to `src/codec.rs`. |
 
 ## 10. Maintenance
 

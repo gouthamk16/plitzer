@@ -123,8 +123,18 @@ async fn resume_on_another_world_matches_one_run() {
             for s in &mut second {
                 s.resume(&checkpoint).unwrap();
             }
-            got.extend(run(&mut second, want.len() - k).await);
-            assert_eq!(got, want, "world {a} then {b}, resume at {k}");
+            // A checkpoint after the last step of an epoch is already at the
+            // next epoch, so the resumed run gives no `None` for the old one.
+            let mut tail = &want[k..];
+            if tail.first() == Some(&None) {
+                tail = &tail[1..];
+            }
+            got.extend(run(&mut second, tail.len()).await);
+            assert_eq!(
+                got,
+                [&want[..k], tail].concat(),
+                "world {a} then {b}, resume at {k}"
+            );
         }
     }
 }
@@ -135,12 +145,19 @@ async fn epochs_roll_over() {
     let want = reference(&d).await;
     let end = want.iter().position(Option::is_none).unwrap();
     assert_ne!(want[..end], want[end + 1..2 * end + 1], "epochs differ");
-    let mut one = sessions(&d, 1).await;
-    run(&mut one, end + 1).await;
-    assert_eq!(one[0].epoch(), 1);
-    let c = one[0].checkpoint();
-    assert_eq!(c.epoch, 1);
-    assert!(c.lanes.iter().all(|&s| s == LaneState::default()));
+    let next_epoch =
+        |c: Checkpoint| c.epoch == 1 && c.lanes.iter().all(|&s| s == LaneState::default());
+    let mut two = sessions(&d, 2).await;
+    run(&mut two, end).await;
+    assert!(
+        next_epoch(two[0].checkpoint()),
+        "before the call that gives None"
+    );
+    let mut seq = vec![0; (2 * config().packing.seq_len) as usize];
+    assert_eq!(two[0].next(&mut seq).await.unwrap(), None);
+    assert_eq!((two[0].epoch(), two[1].epoch()), (1, 0));
+    // One rank saw `None` and one did not: their parts still agree.
+    assert!(next_epoch(global(&two)));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -154,6 +171,23 @@ async fn set_epoch_starts_that_epoch() {
         s.set_epoch(1);
     }
     assert_eq!(run(&mut two, end + 1).await, want[end + 1..2 * end + 2]);
+}
+
+// Trainers call `set_epoch` at the start of each epoch, also the one they
+// resumed into, so it must keep the resumed position.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn set_epoch_keeps_a_resume_in_that_epoch() {
+    let d = data();
+    let want = reference(&d).await;
+    let mut two = sessions(&d, 2).await;
+    run(&mut two, 3).await;
+    let checkpoint = global(&two);
+    let mut again = sessions(&d, 2).await;
+    for s in &mut again {
+        s.resume(&checkpoint).unwrap();
+        s.set_epoch(0);
+    }
+    assert_eq!(run(&mut again, 4).await, want[3..7]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -112,6 +112,9 @@ fn states_of_a_part() {
     assert_eq!(p.states(2..4).unwrap(), p.lanes);
     assert!(matches!(p.states(0..2), Err(Error::Parts(_))));
     assert!(matches!(p.states(3..5), Err(Error::Parts(_))));
+    #[allow(clippy::reversed_empty_ranges)]
+    let reversed = 10..2;
+    assert!(matches!(p.states(reversed), Err(Error::Parts(_))));
     let mixed = part(0, &[4, 5]);
     assert!(matches!(mixed.states(0..2), Err(Error::Parts(_))));
     assert_eq!(mixed.states(1..2).unwrap(), mixed.lanes[1..]);
