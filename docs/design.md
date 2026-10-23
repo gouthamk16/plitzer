@@ -5,7 +5,7 @@
 | Field | Value |
 |---|---|
 | Status | Active. It changes with each feature PR. The code is pre-alpha. |
-| Last change | 2026-10-22, PR #10 |
+| Last change | 2026-10-23, PR #12 |
 | Language standard | ASD-STE100 (Simplified Technical English) |
 | Code | `src/` at the commit of this file |
 
@@ -54,7 +54,7 @@ Each term has only one definition in this document.
 |---|---|
 | Document | One row of a Parquet file. Plitzer identifies it as `(row_group, row)`. |
 | Row group | A Parquet row group. It is the smallest unit that Plitzer reads. |
-| Index | The list of row groups and their row counts. The id of a row group is its position in the index. |
+| Index | The list of row groups, their row counts and the place of their token column chunks. The id of a row group is its position in the index. |
 | Epoch | One full pass over the dataset. |
 | Window | A set of W row groups. The documents of a window mix with each other. |
 | W | The number of row groups in a window. |
@@ -76,6 +76,9 @@ Each term has only one definition in this document.
 | Sidecar | The file that keeps the index between starts. |
 | ETag | A version tag that the store gives to each file. It changes when the file changes. |
 | Fingerprint | A 64-bit hash of the index without the ETags. |
+| Token column | The Parquet column that holds the tokens of each document as a list of integers. |
+| Column chunk | The bytes of one column in one row group. |
+| Codec | The compression method of a column chunk, such as Snappy or Zstd. |
 
 ## 3. Requirements
 
@@ -86,7 +89,7 @@ Each term has only one definition in this document.
 | REQ-3 | Lanes and their slices depend only on `(seed, epoch, B, W)`. They do not depend on world. | `Order` has no world input. `order::gpu_lanes_partition` (property test). | Met |
 | REQ-4 | A resume at step k gives the same tail as a run without a stop. This is also true when world changes. | `pack::resume_matches_tail` and `pack::world_invariant` (property tests). Planned: end-to-end test. | Met in the packer |
 | REQ-5 | The output is the same on Linux, macOS and Windows. | CI runs the golden tests on the three systems. | Met |
-| REQ-6 | Read amplification is approximately 1 + world/W or less. | Planned: measurement on FineWeb-Edu. | Planned |
+| REQ-6 | Read amplification is approximately 1 + world/W or less. | The reader reads no footer (`read::reads_without_footer`). Planned: measurement on FineWeb-Edu. | Partly met |
 | REQ-7 | A dependency upgrade does not change the order without a test failure. | Golden tests pin the shuffle output and the key bytes. | Met |
 | REQ-8 | A start with an unchanged dataset reads no Parquet footers. | `index::open_uses_cache_without_footers`. | Met |
 
@@ -101,7 +104,7 @@ flowchart LR
     read --> pack["Pack<br/>L-token sequences"]
     pack --> python["Python<br/>IterableDataset"]
     classDef done fill:#d4edda,stroke:#2e7d32,color:#1b5e20
-    class index,order,pack done
+    class index,order,read,pack done
 ```
 
 | Component | Module | Status | Section |
@@ -111,9 +114,10 @@ flowchart LR
 | Order | `src/order.rs` | Implemented | [5.3](#53-order) |
 | Pack | `src/pack.rs` | Implemented | [5.4](#54-pack) |
 | Index | `src/index.rs` | Implemented | [5.5](#55-index) |
-| Checkpoint | — | Planned | [5.6](#56-planned-components) |
-| Read (I/O) | — | Planned | [5.6](#56-planned-components) |
-| Python bindings | — | Planned | [5.6](#56-planned-components) |
+| Checkpoint | — | Planned | [5.7](#57-planned-components) |
+| Read | `src/read.rs` | Implemented | [5.6](#56-read) |
+| Prefetch | — | Planned | [5.7](#57-planned-components) |
+| Python bindings | — | Planned | [5.7](#57-planned-components) |
 
 ## 5. Component design
 
@@ -257,7 +261,7 @@ A document shows as `row_group/row`. Step 6 then shuffles each lane. Lane 0 read
 - `Order::windows` panics if `window` is 0. `Order::lane` panics if `lane` is not less than B. `gpu_lanes` panics if world does not divide B, or if `rank` is not less than world (D-11).
 - A lane is empty if N is less than B.
 - A `Window` keeps its document count. Use it only with the `Order` that made it.
-- Row group ids and row numbers are `u32`. FineWeb-Edu has approximately 10⁵ row groups.
+- Row group ids and row numbers are `u32`. FineWeb-Edu has approximately 3 × 10⁶ row groups: approximately 2,900 files of approximately 1,000 row groups.
 - The documents of a window mix only inside each lane. The mix quality on sorted datasets is not measured yet (section 7).
 
 **Verification:**
@@ -368,7 +372,7 @@ The property tests use small inputs. Thus empty documents, empty lanes, C = 0, C
 
 ### 5.5 Index
 
-**Function:** The index module makes the list of all row groups of a dataset and their row counts. It reads only the Parquet footers. It keeps the list in a sidecar, so that a start with an unchanged dataset reads no footers.
+**Function:** The index module makes the list of all row groups of a dataset, their row counts and the place of their token column chunks. It reads only the Parquet footers. It keeps the list in a sidecar, so that a start with an unchanged dataset reads no footers.
 
 **Interface:**
 
@@ -377,17 +381,22 @@ pub struct File {
     pub path: String,          // below the prefix, with "/" separators
     pub size: u64,
     pub e_tag: Option<String>,
-    pub rows: Vec<u32>,        // row count of each row group
+    pub row_groups: Vec<RowGroup>,
 }
 
-pub struct Index { /* private: files, starts */ }
+pub struct RowGroup { pub rows: u32, pub start: u64, pub len: u32, pub codec: Codec }
 
-pub enum Error { Store(..), Footer { path, source }, TooLarge { path }, NoFiles { prefix }, Cache(..) }
+pub struct Index { /* private: column, schema, files, starts */ }
+
+pub enum Error { Store(..), Footer { path, source }, TooLarge { path }, Column { path, reason }, NoFiles { prefix }, Cache(..) }
 
 impl Index {
-    pub async fn build(store: &dyn ObjectStore, prefix: &Path) -> Result<Index, Error>;
-    pub async fn open(store: &dyn ObjectStore, prefix: &Path, cache: &std::path::Path) -> Result<Index, Error>;
+    pub async fn build(store: &dyn ObjectStore, prefix: &Path, column: &str) -> Result<Index, Error>;
+    pub async fn open(store: &dyn ObjectStore, prefix: &Path, column: &str, cache: &std::path::Path) -> Result<Index, Error>;
     pub fn files(&self) -> &[File];
+    pub fn column(&self) -> &str;
+    pub fn schema(&self) -> &str;                              // the token column's schema, as text
+    pub fn row_group(&self, row_group: u32) -> (&File, &RowGroup);
     pub fn rows(&self) -> Vec<u32>;                           // the input of Order::rows
     pub fn locate(&self, row_group: u32) -> (usize, usize);   // (file, row group in the file)
     pub fn fingerprint(&self) -> u64;
@@ -400,31 +409,41 @@ impl Index {
 2. Sort the files by path.
 3. Read the last 4 MiB of each file in one request. Make sure that the footer length is not larger than the file.
 4. Decode the footer with `ParquetMetaDataPushDecoder`. Do not read the page indexes. A footer larger than 4 MiB needs a second request.
-5. Keep the row count of each row group.
+5. Find the token column. It must be one list level of plain integers, with no date, time, timestamp or decimal type. Its schema must be the same in each file.
+6. For each row group, keep the row count and the token column chunk: its first byte, length and codec.
+7. Use the dictionary page as the first byte if its offset is from 4 to the data page offset. Some writers set the offset to 0 for no dictionary.
 
 The module reads 16 files at the same time.
 
 The id of a row group is its position in the index: files in path order, then row groups in file order. `locate` finds the file of an id with a binary search over the first id of each file.
 
-`Index::open` lists the files and reads the sidecar. If the path, size and ETag of each file are equal to the new list of files, `open` uses the sidecar and reads no footers. If not, it builds the index again and writes a new sidecar.
+`Index::open` lists the files and reads the sidecar. The sidecar must have the same column. If the path, size and ETag of each file are equal to the new list of files, `open` uses the sidecar and reads no footers. If not, it builds the index again and writes a new sidecar.
 
 The sidecar has this layout. All integers are little-endian.
 
 | Field | Type |
 |---|---|
 | Magic | 8 bytes, `PLTZIDX\0` |
-| Version | `u32`, 1 |
+| Version | `u32`, 2 |
+| Column | `u32` length, then UTF-8 bytes |
+| Schema | `u32` length, then UTF-8 bytes |
 | File count | `u32` |
 | For each file: path | `u32` length, then UTF-8 bytes |
 | For each file: size | `u64` |
 | For each file: ETag | `u8` flag (0 or 1), then a length and UTF-8 bytes if the flag is 1 |
-| For each file: rows | `u32` count, then one `u32` for each row group |
+| For each file: row groups | `u32` count, then for each row group: rows `u32`, start `u64`, length `u32`, codec `u8` |
 
-The fingerprint is the 64-bit FNV-1a hash of the same layout, with no ETags.
+A sidecar of version 1 does not decode, so `open` builds the index again. A row group record has 17 bytes. The ~3 × 10⁶ row groups of FineWeb-Edu need approximately 51 MB, not the 9.4 GB of the footers.
+
+The index keeps the schema text of the token column with the root name `tokens`. The schema printer does not quote names, so a real name with a space would not parse back. The index parses the text before it keeps it.
+
+The fingerprint is the 64-bit FNV-1a hash of the same layout, with no ETags and an empty schema.
 
 **Rationale:**
 
-- The push decoder needs no `arrow` and no `async` features of `parquet`. The async reader of `parquet` needs all of `arrow` (D-18).
+- The footer push decoder does no I/O of its own. The async reader of `parquet` needs a reader object for each file (D-18).
+- The index keeps the place of each token column chunk, so the reader needs no footer (D-24).
+- The schema of the token column is the same in each file, so one schema decodes each chunk.
 - The index uses `object_store` from the start. Thus local disk and S3 use the same code, and the footers of S3 are the expensive case (D-19).
 - The list of files from local disk comes in directory order, which is different on each machine. The sort makes the ids the same on each machine.
 - The paths are below the prefix and use `/`. Thus a copy of the dataset on S3 and on local disk gives the same index.
@@ -455,22 +474,91 @@ The fingerprint is the 64-bit FNV-1a hash of the same layout, with no ETags.
 |---|---|---|
 | `build_reads_row_groups` | Unit | The row groups of Parquet files in nested folders, in path order. Other files are not in the index. `locate` is correct at each file edge. |
 | `open_writes_and_reuses_cache` | Unit | `open` writes the sidecar, and a second `open` gives the same index. |
-| `open_uses_cache_without_footers` | Unit | A sidecar with false row counts that matches the list of files is used, so no footer is read. A stale ETag causes a new build. |
+| `open_uses_cache_without_footers` | Unit | A sidecar with false row counts that matches the list of files is used, so no footer is read. A different column or a stale ETag causes a new build. |
 | `open_rebuilds_on_change` | Unit | A changed file, a new file and a corrupt sidecar each cause a new build. |
 | `bad_footer_names_file` | Unit | A bad magic number, a file that is too short and a footer length larger than the file each give `Error::Footer` with the path. |
 | `no_files_is_an_error` | Unit | A prefix with no `.parquet` files gives `Error::NoFiles`. |
 | `concurrent_open_shares_cache` | Unit | Eight processes that open a cold cache at the same time all succeed, in ten rounds. |
 | `fingerprint_golden` | Unit | The fingerprint and the hash of the sidecar bytes are the same on each OS. The fingerprint does not change with the ETag, but it changes with a row count. |
+| `bad_schema_does_not_decode` | Unit | A sidecar with schema text that does not parse gives `None`. |
+| `dictionary_offset_only_when_real` | Unit | A dictionary offset of 0, or an offset not before the data page, is not used. |
 | `sidecar_roundtrip` | Property | Each index is the same after encode and decode. |
 | `decode_never_panics` | Property | A truncated sidecar and random bytes give `None`, not a panic. |
 | `locate_past_end_panics` | Unit | `locate` panics for an id after the last row group. |
+| `old_sidecar_rebuilds` | Unit | A sidecar of version 1 does not decode, and `open` builds the index again. |
 
-### 5.6 Planned components
+### 5.6 Read
+
+**Function:** The read module gives the tokens of each row of one row group. It reads only the token column chunk of that row group, and never the footer of its file.
+
+**Interface:**
+
+```rust
+pub struct Reader { /* private: store, prefix, schema */ }
+
+impl Reader {
+    pub fn new(store: Arc<dyn ObjectStore>, prefix: Path, index: &Index) -> Result<Reader, Error>;
+    pub async fn read(&self, index: &Index, row_group: u32) -> Result<RowGroupTokens, Error>;
+}
+
+pub struct RowGroupTokens { /* private: offsets, values */ }
+
+impl RowGroupTokens {
+    pub fn rows(&self) -> usize;
+    pub fn row(&self, row: usize) -> &[u32];
+    pub fn bytes(&self) -> usize;   // memory of the tokens, for the prefetch budget
+}
+
+pub enum Error { Schema(..), Fetch { path, source }, Decode { path, row_group, source }, BadToken { path, row_group } }
+```
+
+**Design:** `Reader::read` does these steps:
+
+1. Get the chunk record of the row group from the index: `start`, `len`, `codec` and `rows`.
+2. Fetch the bytes `start..start + len`. Cut a chunk larger than 16 MiB into pieces of 16 MiB or less.
+3. Fetch the pieces at the same time.
+4. Make a `ParquetMetaData` with one row group and one column from the record and the schema in the index.
+5. Decode the chunk with `ParquetPushDecoder` into one list array.
+6. Make `RowGroupTokens` from the list offsets and the values.
+
+The page reader of `parquet` uses only the codec and the byte range of the chunk from the metadata. It reads all other data from the page headers in the chunk. Thus the metadata that step 4 makes is sufficient.
+
+`RowGroupTokens` keeps `Int32` and `UInt32` values with no copy. It copies other integer types into `u32`. A null row is empty.
+
+**Rationale:**
+
+- A window has row groups from approximately W different files. A new read of a 3.1 MiB footer for each 2 MB row group costs approximately 1.5 times the data. The index records each chunk, so the reader reads no footer (D-24).
+- `ParquetPushDecoder` does no I/O of its own. The reader controls each request and knows its size before the fetch, which the prefetch budget needs (D-25).
+- The input of v1 is a column of token lists. Tokenization in the loader is a later item (D-26).
+- `object_store` does not cut a large range, and AWS advises requests of 8 to 16 MB at the same time. Each piece is a separate `get_ranges` call, so that `object_store` does not merge the pieces again (D-27).
+- A negative token, a null token or a token larger than `u32::MAX` gives `Error::BadToken`. A null token would otherwise become token 0.
+
+**Limits:**
+
+- The reader reads one row group at a time. The prefetch of many row groups is in the second PR of the I/O item.
+- A list column has 32-bit offsets after the decode, also for a `large_list` column. One row group never has 2³¹ tokens.
+- A column of more than one list level, or a column that is not a list of plain integers, gives an index error.
+
+**Verification:**
+
+| Test | Type | What it shows |
+|---|---|---|
+| `reads_every_variant` | Unit | Each token is correct for 48 files. They have four list types, null rows or not, three codecs, and a dictionary or not. The file name has a space and a percent sign. |
+| `reads_without_footer` | Unit | The reader still gives each token after the footer length and magic of the file are set to zero. |
+| `bad_columns_are_errors` | Unit | A nested list, text, dates, nanosecond timestamps, and an item name with a space each give `Error::Column`. |
+| `missing_or_differing_columns_are_errors` | Unit | A column that is not there, and a column type that differs between files, each give `Error::Column`. |
+| `odd_column_name_reads` | Unit | A column named `input ids` reads correctly. |
+| `schema_text_golden` | Unit | The schema text of a `list<uint32>` column is pinned, so a change of the `parquet` printer shows. |
+| `bad_tokens_are_errors` | Unit | A negative token and a null token each give `Error::BadToken`. |
+| `fetch_splits_large_ranges`, `pieces_cover_range` | Unit | The pieces cover the range with no gap and no overlap, and each piece is 16 MiB or less. |
+| `index_and_read_over_s3` | Integration | The index, the sidecar and the reader work against versitygw in the `s3` CI job. |
+
+### 5.7 Planned components
 
 These components are not in the code yet. Their sections will have the full set of parts when they are implemented.
 
 - **Checkpoint:** A checkpoint holds `seed`, `epoch` and the lane state of each lane. It also holds B, W, L, D, C and `Index::fingerprint`. A resume with different values must stop with an error.
-- **Read:** The read stage uses `object_store` and the async reader of the `parquet` crate, on tokio. It implements `AsyncFileReader` directly, because `ParquetObjectReader` is deprecated as of parquet 59.2. A byte limit controls the prefetch, not a batch count. It finds the file of each row group with `Index::locate`, and supplies tokens to the pack module through the `Tokens` trait.
+- **Prefetch:** For each window, each GPU reads the row groups of its lanes before it needs them. A byte limit controls the prefetch, not a batch count. The limit must hold at least the share of one window. The prefetched row groups supply tokens to the pack module through the `Tokens` trait.
 - **Python:** The bindings use PyO3 and maturin. Batches go to Python through the Arrow PyCapsule interface. A PyTorch `IterableDataset` gives `state_dict()` and `load_state_dict()`. Users must set `num_workers=0`. The parallel work is in Rust, and a fork of a process with a tokio runtime is not safe.
 
 ## 6. Read amplification
@@ -487,7 +575,6 @@ These components are not in the code yet. Their sections will have the full set 
 
 | Question | Effect |
 |---|---|
-| Is the input of v1 raw text, with tokenization in the loader, or pre-tokenized data? | Pack and Read design. |
 | How many tokens does the Pack stage lose to pad tokens and dropped leftover, on real FineWeb-Edu lengths? What part of the sequences are ends of documents only (section 5.4)? | The values of C and D. |
 | Must the loader add an EOS token between documents, or must the `Tokens` source do it? | The `Tokens` trait. |
 | How well do documents mix inside one sequence on a sorted dataset? | The value of W. |
@@ -519,8 +606,15 @@ These components are not in the code yet. Their sections will have the full set 
 | D-19 | Build the index over `object_store` from the start. | Local disk and S3 use the same code, and S3 is the expensive case. | Local files only, with S3 in the Read PR. | #10 |
 | D-20 | The cache is valid if the path, size and ETag of each file are the same. | A file can change and keep its size. | Path and size only. | #10 |
 | D-21 | The fingerprint does not include the ETag. | A local ETag holds the inode and modification time, so it is different on each copy. | A hash of the full sidecar. | #10 |
+| D-30 | The fingerprint does not include the schema text. | The `parquet` printer makes the text, and an upgrade could change it. A changed fingerprint would refuse all saved checkpoints. | A hash of the schema text. | #12 |
 | D-22 | The sidecar uses its own binary format and FNV-1a. | No new dependency, and the bytes are fixed by our code. | `serde` with `bincode`, or JSON. | #10 |
 | D-23 | A sidecar that does not exist or is corrupt causes a new build. | The sidecar is only a cache. | An error that the user must correct. | #10 |
+| D-24 | The index keeps the place of each token column chunk, and the reader reads no footer. | A window has row groups from approximately W files. A footer read for each row group costs approximately 1.5 times the data. | Read the footer of each file again, or keep footers in memory (9.4 GB for FineWeb-Edu). | #12 |
+| D-25 | Decode with `ParquetPushDecoder` and metadata that the reader makes. | No I/O in the decoder, so the reader knows each request and its size. | `ParquetRecordBatchStreamBuilder` with an `AsyncFileReader`: it needs the footer metadata. | #12 |
+| D-26 | The input of v1 is a column of token lists. | The simplest correct input. The reader takes `Int32` and `UInt32` with no copy. | Text with tokenization in the loader: a large dependency and more CPU load. It is a later item. | #12 |
+| D-27 | Fetch a chunk in separate pieces of 16 MiB or less. | `object_store` does not cut a large range, and its default timeout is 30 s. AWS advises 8 to 16 MB requests at the same time. | One request for each chunk. | #12 |
+| D-28 | Test S3 against versitygw in a Linux CI job. | MinIO stopped its images in October 2025. versitygw is Apache-2.0, active, and checks request signatures. | MinIO, LocalStack (needs a token since 2026), moto (no signature check). | #12 |
+| D-29 | S3 support is the `s3` cargo feature. | The `aws` feature of `object_store` adds an HTTP and TLS stack, which the default build does not need. | S3 in the default build. | #12 |
 
 ## 9. Change log
 
@@ -531,6 +625,7 @@ These components are not in the code yet. Their sections will have the full set 
 | 2026-10-21 | #6 | Add the order (`src/order.rs`) and `proptest`. Add this document. |
 | 2026-10-21 | #8 | Add the packer (`src/pack.rs`) and `Order::lane_len`. |
 | 2026-10-22 | #10 | Add the index (`src/index.rs`), `object_store` and `parquet`. Increase the minimum Rust version to 1.88. |
+| 2026-10-23 | #12 | Add the reader (`src/read.rs`) and the `s3` feature. Change the index to version 2, with the token column chunk of each row group. |
 
 ## 10. Maintenance
 

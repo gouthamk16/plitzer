@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Status
 
-Plitzer is a Rust-core ML dataloader. It feeds Parquet data from local disk or S3 to PyTorch with an order that is deterministic and resumable. So far it is a library crate with five modules: `src/shuffle.rs`, a deterministic Fisher-Yates shuffle; `src/seed.rs`, which derives each shuffle's 32-byte key; `src/order.rs`, the ordering core (row-group windows, lane slices, GPU lane blocks); `src/pack.rs`, the per-lane packer with resumable lane state; and `src/index.rs`, the row-group index built from Parquet footers through `object_store`, cached in a sidecar. The rest of the design below is the plan, not existing code. Update this file as pieces land.
+Plitzer is a Rust-core ML dataloader. It feeds Parquet data from local disk or S3 to PyTorch with an order that is deterministic and resumable. So far it is a library crate with six modules: `src/shuffle.rs`, a deterministic Fisher-Yates shuffle; `src/seed.rs`, which derives each shuffle's 32-byte key; `src/order.rs`, the ordering core (row-group windows, lane slices, GPU lane blocks); `src/pack.rs`, the per-lane packer with resumable lane state; `src/index.rs`, the row-group index built from Parquet footers through `object_store`, cached in a sidecar, recording where each row group's token column chunk is; and `src/read.rs`, which fetches and decodes one row group's token column from that record alone, never a footer. The rest of the design below is the plan, not existing code. Update this file as pieces land.
 
 ## Commands
 
@@ -12,13 +12,14 @@ Plitzer is a Rust-core ML dataloader. It feeds Parquet data from local disk or S
 cargo build
 cargo test
 cargo test <name>          # single test, substring match
-cargo clippy --all-targets
+cargo clippy --all-targets --all-features
 cargo fmt
+cargo test --features s3 --test s3   # needs PLITZER_S3_ENDPOINT, e.g. a local versitygw
 ```
 
 MSRV is Rust 1.88 (required by `parquet` 60).
 
-CI (`.github/workflows/ci.yml`) runs fmt, clippy with `-D warnings`, and tests on Linux, macOS and Windows. The cross-OS matrix is required because ordering output must match on every platform.
+CI (`.github/workflows/ci.yml`) runs fmt, clippy with `-D warnings`, and tests on Linux, macOS and Windows. The cross-OS matrix is required because ordering output must match on every platform. A separate Linux `s3` job runs `tests/s3.rs` against versitygw (MinIO no longer publishes images); S3 support is behind the `s3` cargo feature.
 
 ## Workflow
 
@@ -33,18 +34,17 @@ The pitch is MosaicML Streaming's guarantees, read directly from existing Parque
 
 Pipeline: **index → order → read → pack → Python**
 
-- **Index:** read only Parquet footers (parquet's `ParquetMetaDataPushDecoder` over `object_store`, no arrow) to build a list of `(file, row_group, num_rows)`, sorted by path, and cache it as a compact sidecar file. The cache is reused while every file's path, size and ETag match the listing. Footers are large: about 3.1 MiB per FineWeb-Edu file, about 9.4 GB across the dataset. Rereading them on every start isn't an option.
+- **Index:** read only Parquet footers (parquet's `ParquetMetaDataPushDecoder` over `object_store`) to build a list of `(file, row_group, num_rows)` plus each row group's token-column chunk `(start, len, codec)`, sorted by path, and cache it as a compact sidecar file. The cache is reused while every file's path, size and ETag match the listing. Footers are large: about 3.1 MiB per FineWeb-Edu file, about 9.4 GB across the dataset. Rereading them on every start isn't an option.
 - **Order:** a pure function of `(seed, epoch, step)`. Nothing about the order is stored.
   - Each epoch, shuffle the row groups (`Purpose::RowGroups`) and group them into windows of W row groups.
   - Within a window, row groups are in storage order. The global batch has B **lanes** (sequence slots), and each lane owns one contiguous slice of the window. Each lane shuffles its slice with `Purpose::Lane { window, lane }`.
 - **Pack:** a lane is a permanent packer. Each step it takes D documents from its slice, appends them to its leftover tokens, and emits exactly one sequence of L tokens. Leftover is capped at C tokens; past the cap the *oldest* tokens are dropped, so the leftover is always one run ending at the cursor (`min(step·D, lane_docs)`). A lane that runs short is padded. A lane's state is its next step plus the `(doc, offset)` where its leftover starts. Each epoch ends with `ceil(C/L)` flush steps, so nothing is dropped at epoch end. Tokens come in through the `Tokens` trait; the packer adds no EOS.
 - **Checkpoint:** `seed`, `epoch`, plus every lane's state `(step, doc, offset)`, and B, W, L, D, C and an index fingerprint so a resume with different settings is refused.
 - **Splitting across GPUs:** each GPU owns a contiguous block of `B/world` lanes. Lanes depend only on B, never on `world`. That's why resuming on a different GPU count gives identical sequences: each GPU rebuilds its lanes from the checkpoint. B must be divisible by `world`.
-- **I/O:** `object_store` plus the `parquet` crate's async reader, on tokio. Implement `AsyncFileReader` directly, since `ParquetObjectReader` is deprecated as of parquet 59.2. Prefetching is capped by bytes, not by number of batches.
+- **I/O:** `object_store` plus parquet's sans-I/O `ParquetPushDecoder`, fed with one-column metadata rebuilt from the index record, so no footer is ever re-read (row groups are shuffled across files, so footer re-reads would cost ~1.5× the data). Chunks are fetched in ≤16 MiB pieces. Input is a pre-tokenized list-of-integers column; `int32`/`uint32` tokens are zero-copy. Prefetching (next PR) is capped by bytes, not by number of batches.
 - **Python:** PyO3 and maturin. Batches are exported through the Arrow PyCapsule interface. A PyTorch `IterableDataset` provides `state_dict()` and `load_state_dict()`. Users set `num_workers=0`, since parallelism lives in Rust and forking a process with a running tokio runtime is unsafe.
 
 Still open:
-- The day-one input format: raw text with in-loader tokenization, or pre-tokenized.
 - Not yet measured on real FineWeb-Edu lengths: packing waste (padding plus dropped leftover), how well documents mix within a sequence on sorted datasets, per-GPU batch statistics, and the window-size/memory trade-off.
 
 ### Invariants that must not break

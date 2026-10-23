@@ -1,71 +1,96 @@
 //! The index cache file. All integers are little-endian:
 //!
 //! ```text
-//! magic "PLTZIDX\0" | version u32 | file count u32 | each file:
+//! magic "PLTZIDX\0" | version u32 | column (len u32, UTF-8) | schema (len u32, UTF-8) |
+//! file count u32 | each file:
 //!   path (len u32, UTF-8) | size u64 | e_tag (flag u8, then len u32, UTF-8) |
-//!   row-group count u32 | rows u32 × count
+//!   row-group count u32 | each row group: rows u32 | start u64 | len u32 | codec u8
 //! ```
 
 use std::io::{self, Write};
 
-use super::File;
+use super::{Codec, File, Index, RowGroup};
 
 const MAGIC: &[u8; 8] = b"PLTZIDX\0";
-const VERSION: u32 = 1;
+/// Version 1 held only row counts. A sidecar of another version does not
+/// decode, so `Index::open` rebuilds it.
+const VERSION: u32 = 2;
 
-/// The files in the cache format. Without `e_tags`, every ETag is written
-/// as absent, which makes the bytes the same on every copy of a dataset.
-pub(super) fn encode(files: &[File], e_tags: bool) -> Vec<u8> {
+/// The index in the cache format. Without `cache`, every ETag is written as
+/// absent and the schema as empty, for the fingerprint: ETags differ between
+/// copies of a dataset, and the schema text comes from `parquet`'s printer,
+/// which an upgrade could change.
+pub(super) fn encode(index: &Index, cache: bool) -> Vec<u8> {
     let mut out = MAGIC.to_vec();
     out.extend(VERSION.to_le_bytes());
-    out.extend(len(files.len()).to_le_bytes());
-    for f in files {
+    put_str(&mut out, &index.column);
+    put_str(&mut out, if cache { &index.schema } else { "" });
+    out.extend(len(index.files.len()).to_le_bytes());
+    for f in &index.files {
         put_str(&mut out, &f.path);
         out.extend(f.size.to_le_bytes());
-        match f.e_tag.as_deref().filter(|_| e_tags) {
+        match f.e_tag.as_deref().filter(|_| cache) {
             Some(tag) => {
                 out.push(1);
                 put_str(&mut out, tag);
             }
             None => out.push(0),
         }
-        out.extend(len(f.rows.len()).to_le_bytes());
-        for r in &f.rows {
-            out.extend(r.to_le_bytes());
+        out.extend(len(f.row_groups.len()).to_le_bytes());
+        for g in &f.row_groups {
+            out.extend(g.rows.to_le_bytes());
+            out.extend(g.start.to_le_bytes());
+            out.extend(g.len.to_le_bytes());
+            out.push(g.codec.byte());
         }
     }
     out
 }
 
-/// The files in `bytes`, or `None` if they are not a complete sidecar of
+/// The index in `bytes`, or `None` if they are not a complete sidecar of
 /// this version.
-pub(super) fn decode(bytes: &[u8]) -> Option<Vec<File>> {
+pub(super) fn decode(bytes: &[u8]) -> Option<Index> {
     let mut r = Reader(bytes);
     if r.take(8)? != MAGIC || r.u32()? != VERSION {
         return None;
     }
+    let column = r.str()?;
+    let schema = r.str()?;
+    super::parse_schema(&schema).ok()?;
     // Counts come from the file, so nothing is preallocated from them.
     let mut files = Vec::new();
     for _ in 0..r.u32()? {
-        let path = r.str()?;
-        let size = r.u64()?;
-        let e_tag = match r.take(1)? {
-            [0] => None,
-            [1] => Some(r.str()?),
-            _ => return None,
-        };
-        let mut rows = Vec::new();
-        for _ in 0..r.u32()? {
-            rows.push(r.u32()?);
-        }
-        files.push(File {
-            path,
-            size,
-            e_tag,
-            rows,
+        files.push(file(&mut r)?);
+    }
+    if !r.0.is_empty() {
+        return None;
+    }
+    Index::new(column, schema, files).ok()
+}
+
+fn file(r: &mut Reader) -> Option<File> {
+    let path = r.str()?;
+    let size = r.u64()?;
+    let e_tag = match r.take(1)? {
+        [0] => None,
+        [1] => Some(r.str()?),
+        _ => return None,
+    };
+    let mut row_groups = Vec::new();
+    for _ in 0..r.u32()? {
+        row_groups.push(RowGroup {
+            rows: r.u32()?,
+            start: r.u64()?,
+            len: r.u32()?,
+            codec: Codec::from_byte(r.take(1)?[0])?,
         });
     }
-    r.0.is_empty().then_some(files)
+    Some(File {
+        path,
+        size,
+        e_tag,
+        row_groups,
+    })
 }
 
 /// Writes `bytes` to a temporary file with a unique name next to `path`,
@@ -132,3 +157,6 @@ impl<'a> Reader<'a> {
         String::from_utf8(self.take(n)?.to_vec()).ok()
     }
 }
+
+#[cfg(test)]
+pub(super) mod tests;

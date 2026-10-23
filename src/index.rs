@@ -1,25 +1,19 @@
 use std::fmt;
 use std::future::ready;
-use std::ops::Range;
-
-use bytes::Bytes;
 
 use futures::{StreamExt, TryStreamExt, stream};
 use object_store::path::Path;
 use object_store::{ObjectMeta, ObjectStore};
-use parquet::DecodeResult;
 use parquet::errors::ParquetError;
-use parquet::file::metadata::{PageIndexPolicy, ParquetMetaData, ParquetMetaDataPushDecoder};
 
+mod column;
+mod footer;
 mod sidecar;
+
+pub use column::{Codec, RowGroup, parse as parse_schema};
 
 /// Footers read at once. This bounds the requests in flight against S3.
 const CONCURRENT_FOOTERS: usize = 16;
-
-/// Bytes read from the end of each file in the first request. FineWeb-Edu
-/// footers are about 3.1 MiB, so this fits one in a single request; a larger
-/// footer needs a second.
-const TAIL: u64 = 4 << 20;
 
 /// One Parquet file of the dataset.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -29,8 +23,8 @@ pub struct File {
     pub size: u64,
     /// The store's version tag of the file. Only the cache check uses it.
     pub e_tag: Option<String>,
-    /// The row count of each row group, in file order.
-    pub rows: Vec<u32>,
+    /// The token column chunk of each row group, in file order.
+    pub row_groups: Vec<RowGroup>,
 }
 
 #[derive(Debug)]
@@ -39,8 +33,11 @@ pub enum Error {
     Store(object_store::Error),
     /// A file's footer could not be fetched or decoded.
     Footer { path: String, source: ParquetError },
-    /// A row count or the number of row groups does not fit in `u32`.
+    /// The number of row groups does not fit in `u32`.
     TooLarge { path: String },
+    /// The token column is missing, has the wrong type, or differs from the
+    /// first file's.
+    Column { path: String, reason: String },
     /// No `.parquet` file is below the prefix.
     NoFiles { prefix: String },
     /// The sidecar could not be written.
@@ -54,9 +51,8 @@ impl fmt::Display for Error {
             Error::Footer { path, source } => {
                 write!(f, "reading the footer of {path} failed: {source}")
             }
-            Error::TooLarge { path } => {
-                write!(f, "{path} has more rows or row groups than fit in u32")
-            }
+            Error::TooLarge { path } => write!(f, "{path} has more row groups than fit in u32"),
+            Error::Column { path, reason } => write!(f, "{path}: {reason}"),
             Error::NoFiles { prefix } => write!(f, "no .parquet files below {prefix:?}"),
             Error::Cache(e) => write!(f, "writing the index cache failed: {e}"),
         }
@@ -68,7 +64,7 @@ impl std::error::Error for Error {
         match self {
             Error::Store(e) => Some(e),
             Error::Footer { source, .. } => Some(source),
-            Error::TooLarge { .. } | Error::NoFiles { .. } => None,
+            Error::TooLarge { .. } | Error::Column { .. } | Error::NoFiles { .. } => None,
             Error::Cache(e) => Some(e),
         }
     }
@@ -80,20 +76,29 @@ impl From<object_store::Error> for Error {
     }
 }
 
-/// The row groups of a dataset. A row group's id is its position: files in
-/// path order, then row groups in file order.
+/// The row groups of a dataset and where their token column is. A row
+/// group's id is its position: files in path order, then row groups in file
+/// order.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Index {
+    column: String,
+    /// The token column's schema, the same in every file. See `parse_schema`.
+    schema: String,
     files: Vec<File>,
     /// The id of each file's first row group.
     starts: Vec<u32>,
 }
 
 impl Index {
-    /// Reads the footer of every `.parquet` file below `prefix`.
-    pub async fn build(store: &dyn ObjectStore, prefix: &Path) -> Result<Self, Error> {
+    /// Reads the footer of every `.parquet` file below `prefix`, and records
+    /// where each row group's chunk of the token column `column` is.
+    pub async fn build(
+        store: &dyn ObjectStore,
+        prefix: &Path,
+        column: &str,
+    ) -> Result<Self, Error> {
         let metas = list(store, prefix).await?;
-        Self::from_footers(store, prefix, metas).await
+        Self::from_footers(store, prefix, column, metas).await
     }
 
     /// The index from the sidecar at `cache` if it still matches the listing,
@@ -102,16 +107,26 @@ impl Index {
     pub async fn open(
         store: &dyn ObjectStore,
         prefix: &Path,
+        column: &str,
         cache: &std::path::Path,
     ) -> Result<Self, Error> {
         let metas = list(store, prefix).await?;
         let cached = std::fs::read(cache).ok().and_then(|b| sidecar::decode(&b));
-        if let Some(files) = cached.filter(|files| matches(files, prefix, &metas)) {
-            return Self::new(files);
+        let fresh = |i: &Index| i.column == column && matches(&i.files, prefix, &metas);
+        if let Some(index) = cached.filter(fresh) {
+            return Ok(index);
         }
-        let index = Self::from_footers(store, prefix, metas).await?;
-        sidecar::write(cache, &sidecar::encode(&index.files, true)).map_err(Error::Cache)?;
+        let index = Self::from_footers(store, prefix, column, metas).await?;
+        sidecar::write(cache, &sidecar::encode(&index, true)).map_err(Error::Cache)?;
         Ok(index)
+    }
+
+    pub fn column(&self) -> &str {
+        &self.column
+    }
+
+    pub fn schema(&self) -> &str {
+        &self.schema
     }
 
     pub fn files(&self) -> &[File] {
@@ -122,8 +137,14 @@ impl Index {
     pub fn rows(&self) -> Vec<u32> {
         self.files
             .iter()
-            .flat_map(|f| f.rows.iter().copied())
+            .flat_map(|f| f.row_groups.iter().map(|g| g.rows))
             .collect()
+    }
+
+    /// The file of row group `row_group`, and where its token chunk is.
+    pub fn row_group(&self, row_group: u32) -> (&File, &RowGroup) {
+        let (f, r) = self.locate(row_group);
+        (&self.files[f], &self.files[f].row_groups[r])
     }
 
     /// The file of row group `row_group`, and its position in that file.
@@ -132,43 +153,58 @@ impl Index {
         let in_file = file
             .checked_sub(1)
             .map(|f| (f, (row_group - self.starts[f]) as usize))
-            .filter(|&(f, r)| r < self.files[f].rows.len());
+            .filter(|&(f, r)| r < self.files[f].row_groups.len());
         in_file.unwrap_or_else(|| panic!("row group {row_group} is not in the index"))
     }
 
-    /// A hash of the paths, sizes and row counts. It leaves out the ETags,
-    /// which hold inodes and modification times on local disk, so copies of
-    /// one dataset on different machines have the same fingerprint.
+    /// A hash of the column name, the paths, the sizes and the chunks. It
+    /// leaves out the ETags, which hold inodes and modification times on
+    /// local disk, so copies of one dataset have the same fingerprint. See
+    /// `sidecar::encode`.
     pub fn fingerprint(&self) -> u64 {
-        sidecar::fnv1a(&sidecar::encode(&self.files, false))
+        sidecar::fnv1a(&sidecar::encode(self, false))
     }
 
-    fn new(files: Vec<File>) -> Result<Self, Error> {
+    fn new(column: String, schema: String, files: Vec<File>) -> Result<Self, Error> {
         let mut starts = Vec::with_capacity(files.len());
         let mut next = 0u32;
         for f in &files {
             starts.push(next);
-            let count = u32::try_from(f.rows.len()).ok();
+            let count = u32::try_from(f.row_groups.len()).ok();
             next = count
                 .and_then(|c| next.checked_add(c))
                 .ok_or_else(|| Error::TooLarge {
                     path: f.path.clone(),
                 })?;
         }
-        Ok(Index { files, starts })
+        Ok(Index {
+            column,
+            schema,
+            files,
+            starts,
+        })
     }
 
     async fn from_footers(
         store: &dyn ObjectStore,
         prefix: &Path,
+        column: &str,
         metas: Vec<ObjectMeta>,
     ) -> Result<Self, Error> {
-        let files = stream::iter(metas)
-            .map(|meta| read_file(store, prefix, meta))
+        let read: Vec<(File, String)> = stream::iter(metas)
+            .map(|meta| read_file(store, prefix, column, meta))
             .buffered(CONCURRENT_FOOTERS)
             .try_collect()
             .await?;
-        Self::new(files)
+        let schema = read[0].1.clone();
+        if let Some((f, _)) = read.iter().find(|(_, s)| *s != schema) {
+            return Err(Error::Column {
+                path: f.path.clone(),
+                reason: format!("column {column:?} differs from {}", read[0].0.path),
+            });
+        }
+        let files = read.into_iter().map(|(f, _)| f).collect();
+        Self::new(column.to_owned(), schema, files)
     }
 }
 
@@ -208,85 +244,29 @@ fn matches(files: &[File], prefix: &Path, metas: &[ObjectMeta]) -> bool {
         })
 }
 
+/// One file of the index, and its token column's schema.
 async fn read_file(
     store: &dyn ObjectStore,
     prefix: &Path,
+    column: &str,
     meta: ObjectMeta,
-) -> Result<File, Error> {
+) -> Result<(File, String), Error> {
     let path = relative(prefix, &meta.location);
-    let footer = match footer(store, &meta).await {
+    let footer = match footer::read(store, &meta).await {
         Ok(footer) => footer,
         Err(source) => return Err(Error::Footer { path, source }),
     };
-    let rows: Result<Vec<u32>, _> = footer
-        .row_groups()
-        .iter()
-        .map(|rg| u32::try_from(rg.num_rows()))
-        .collect();
-    let Ok(rows) = rows else {
-        return Err(Error::TooLarge { path });
+    let (schema, row_groups) = match column::chunks(&footer, column) {
+        Ok(found) => found,
+        Err(reason) => return Err(Error::Column { path, reason }),
     };
-    Ok(File {
+    let file = File {
         path,
         size: meta.size,
         e_tag: meta.e_tag,
-        rows,
-    })
-}
-
-/// The file's footer, without its page indexes, which the index never needs.
-async fn footer(
-    store: &dyn ObjectStore,
-    meta: &ObjectMeta,
-) -> Result<ParquetMetaData, ParquetError> {
-    let mut decoder = ParquetMetaDataPushDecoder::try_new(meta.size)?
-        .with_page_index_policy(PageIndexPolicy::Skip);
-    let (range, tail) = tail(store, meta).await?;
-    decoder.push_range(range, tail)?;
-    loop {
-        match decoder.try_decode()? {
-            DecodeResult::Data(metadata) => return Ok(metadata),
-            DecodeResult::NeedsData(ranges) => {
-                let data = store
-                    .get_ranges(&meta.location, &ranges)
-                    .await
-                    .map_err(external)?;
-                decoder.push_ranges(ranges, data)?;
-            }
-            DecodeResult::Finished => {
-                return Err(ParquetError::General("no footer in file".into()));
-            }
-        }
-    }
-}
-
-/// The last `TAIL` bytes of the file, which usually hold the whole footer,
-/// so most files need one request. Also checks the footer length against
-/// the file size: parquet 60 panics on a length larger than the file.
-async fn tail(
-    store: &dyn ObjectStore,
-    meta: &ObjectMeta,
-) -> Result<(Range<u64>, Bytes), ParquetError> {
-    let range = meta.size.saturating_sub(TAIL)..meta.size;
-    let mut data = store
-        .get_ranges(&meta.location, std::slice::from_ref(&range))
-        .await
-        .map_err(external)?;
-    let tail = data.pop().unwrap_or_default();
-    let len = tail
-        .len()
-        .checked_sub(8)
-        .map(|end| u32::from_le_bytes(tail[end..end + 4].try_into().unwrap()));
-    match len {
-        Some(len) if u64::from(len) + 8 <= meta.size => Ok((range, tail)),
-        _ => Err(ParquetError::General(
-            "footer length is larger than the file".into(),
-        )),
-    }
-}
-
-fn external(e: object_store::Error) -> ParquetError {
-    ParquetError::External(Box::new(e))
+        row_groups,
+    };
+    Ok((file, schema))
 }
 
 #[cfg(test)]

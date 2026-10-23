@@ -8,12 +8,20 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/gouthamk16/plitzer"
 
 [dependencies]
+arrow-array = { version = "60.0.0", default-features = false }
+arrow-buffer = { version = "60.0.0", default-features = false }
+arrow-schema = { version = "60.0.0", default-features = false }
 bytes = "1.11.1"
 futures = "0.3.32"
 object_store = { version = "0.14.2", default-features = false, features = ["fs"] }
-parquet = { version = "60.0.0", default-features = false }
+# Default features: arrow for the column decoder, and every codec real files use.
+parquet = "60.0.0"
 rand_chacha = "0.10.0"
 tempfile = "3.27.0"
+
+[features]
+# S3 through object_store. Off by default: it pulls in an HTTP and TLS stack.
+s3 = ["object_store/aws"]
 
 [dev-dependencies]
 proptest = "1.11.0"

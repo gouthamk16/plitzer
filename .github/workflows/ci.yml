@@ -19,7 +19,7 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --check
-      - run: cargo clippy --all-targets
+      - run: cargo clippy --all-targets --all-features
 
   test:
     # Ordering must be bit-identical across platforms, so test on all three.
@@ -32,3 +32,32 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test
+
+  s3:
+    # Service containers run only on Linux runners, so S3 is tested here
+    # alone. versitygw serves each folder under /data as a bucket. It comes
+    # from GHCR, since MinIO no longer publishes images.
+    runs-on: ubuntu-latest
+    env:
+      PLITZER_S3_ENDPOINT: http://127.0.0.1:7070
+      PLITZER_S3_BUCKET: plitzer-test
+      PLITZER_S3_ACCESS_KEY: test
+      PLITZER_S3_SECRET_KEY: testsecret
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Start versitygw
+        run: |
+          mkdir -p "$RUNNER_TEMP/s3/$PLITZER_S3_BUCKET"
+          chmod -R 777 "$RUNNER_TEMP/s3"
+          docker run -d --name s3 -p 7070:7070 -v "$RUNNER_TEMP/s3:/data" \
+            -e ROOT_ACCESS_KEY="$PLITZER_S3_ACCESS_KEY" \
+            -e ROOT_SECRET_KEY="$PLITZER_S3_SECRET_KEY" \
+            -e VGW_BACKEND=posix -e VGW_BACKEND_ARGS=/data -e VGW_PORT=:7070 \
+            ghcr.io/versity/versitygw:v1.10.0
+          for i in $(seq 30); do curl -s -o /dev/null "$PLITZER_S3_ENDPOINT" && exit 0; sleep 1; done
+          docker logs s3; exit 1
+      - run: cargo test --features s3 --test s3
+      - if: failure()
+        run: docker logs s3
