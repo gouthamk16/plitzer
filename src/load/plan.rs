@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::ops::Range;
 
 use crate::index::Index;
+use crate::order::Window;
 use crate::pack::{Epoch, LaneState};
 
 /// One row group a GPU needs, and the steps it is needed over.
@@ -28,28 +29,10 @@ pub(super) fn plan(
     lanes: Range<u32>,
     states: &[LaneState],
 ) -> Vec<Need> {
-    let order = epoch.order();
-    let d = u64::from(epoch.packing().docs);
     let mut steps: HashMap<u32, (u64, u64)> = HashMap::new();
     let mut starts = vec![0u64; lanes.len()];
     for w in epoch.windows() {
-        for (i, groups) in order.lane_groups(w, lanes.clone()).into_iter().enumerate() {
-            let lane = lanes.start + i as u32;
-            let state = states[i];
-            let start = starts[i];
-            let end = start + order.lane_len(w, lane);
-            starts[i] = end;
-            let from = start.max(state.doc);
-            if from >= end {
-                continue;
-            }
-            let first = (from / d).max(state.step);
-            let last = ((end - 1) / d).max(state.step);
-            for &g in &w.groups()[groups] {
-                let range = steps.entry(g).or_insert((first, last));
-                *range = (range.0.min(first), range.1.max(last));
-            }
-        }
+        add_window(epoch, w, lanes.clone(), states, &mut starts, &mut steps);
     }
     let mut needs: Vec<Need> = steps
         .into_iter()
@@ -62,6 +45,36 @@ pub(super) fn plan(
         .collect();
     needs.sort_unstable_by_key(|n| (n.first, n.row_group));
     needs
+}
+
+/// Widens the step range of each row group of window `w` that the lanes
+/// take from. `starts` holds each lane's stream position at the window.
+fn add_window(
+    epoch: &Epoch,
+    w: &Window,
+    lanes: Range<u32>,
+    states: &[LaneState],
+    starts: &mut [u64],
+    steps: &mut HashMap<u32, (u64, u64)>,
+) {
+    let order = epoch.order();
+    let d = u64::from(epoch.packing().docs);
+    for (i, groups) in order.lane_groups(w, lanes.clone()).into_iter().enumerate() {
+        let state = states[i];
+        let start = starts[i];
+        let end = start + order.lane_len(w, lanes.start + i as u32);
+        starts[i] = end;
+        let from = start.max(state.doc);
+        if from >= end {
+            continue;
+        }
+        let first = (from / d).max(state.step);
+        let last = ((end - 1) / d).max(state.step);
+        for &g in &w.groups()[groups] {
+            let range = steps.entry(g).or_insert((first, last));
+            *range = (range.0.min(first), range.1.max(last));
+        }
+    }
 }
 
 /// The most KiB live at one step: row groups needed from `first` to `last`.

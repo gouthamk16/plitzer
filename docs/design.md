@@ -352,7 +352,7 @@ At step 0, the leftover has 9 tokens. The lane copies 4 tokens. Then it removes 
 
 - The cap removes the oldest tokens. Thus the leftover is one continuous run of tokens that ends at the cursor, and `(doc, offset)` can describe it (D-12).
 - The last `ceil(C / L)` steps empty the leftovers. Thus the cap is the only cause of dropped tokens, and the epoch length does not depend on token counts (D-13).
-- The pack module reads tokens through the `Tokens` trait. The Read stage does not exist yet, and the tests use a corpus in memory (D-16).
+- The pack module reads tokens through the `Tokens` trait. The loader implements it with the row groups in memory, and the tests use a corpus in memory (D-16).
 - The lane state holds its step. Thus a caller cannot give the state of one step with a different step (D-17).
 - `fill` writes into a buffer from the caller. The Python stage can then give one buffer of B/world × L tokens to each GPU, with no copy (D-15).
 - Each `Lane` reads the windows of its `Epoch`. Thus the row group shuffle occurs one time for each epoch, not one time for each lane.
@@ -362,7 +362,7 @@ At step 0, the leftover has 9 tokens. The lane copies 4 tokens. Then it removes 
 - If D documents have many more than L + C tokens, the sequences are mostly the ends of documents. The cap removes the starts (section 7).
 - The packer adds no tokens between documents. The `Tokens` source must add an EOS token if the model needs one.
 - A document can have a maximum of `u32::MAX` tokens.
-- A checkpoint is correct only with the same `Order` and `Packing` values. The checkpoint struct must store them (section 5.5).
+- A checkpoint is correct only with the same `Order` and `Packing` values. The checkpoint struct must store them (section 5.8).
 - `Epoch::new` panics if L or D is 0. `fill` panics if `out` does not have L tokens, or after the last step. `Epoch::lane` panics if the step or the state is not possible (D-11).
 
 **Verification:**
@@ -543,7 +543,7 @@ The page reader of `parquet` uses only the codec and the byte range of the chunk
 
 **Limits:**
 
-- The reader reads one row group at a time. The prefetch of many row groups is in the second PR of the I/O item.
+- The reader reads one row group at a time. The loader reads many row groups at the same time (section 5.7).
 - A list column has 32-bit offsets after the decode, also for a `large_list` column. One row group never has 2³¹ tokens.
 - A column of more than one list level, or a column that is not a list of plain integers, gives an index error.
 
@@ -578,7 +578,7 @@ impl Loader {
     pub fn resident_bytes(&self) -> usize;
 }
 
-pub enum Error { Budget { needed, budget }, Read(read::Error), Join(..) }
+pub enum Error { Budget { needed, budget }, Read(read::Error), Join(..), Stopped }
 ```
 
 The caller gives `lanes = gpu_lanes(B, world, rank)`. Thus the loader does not know world.
@@ -598,8 +598,9 @@ The cost of a row group is its decoded size: `values · 4 + (rows + 1) · 8` byt
 A driver task does these steps for each row group of the plan, in order:
 
 1. Get the permits of its cost, in KiB, from a semaphore of the budget size.
-2. Start a task that reads the row group.
-3. Send the task to the loader.
+2. Get one of 16 read slots.
+3. Start a task that reads the row group. The task releases its read slot when the read ends.
+4. Send the task to the loader.
 
 The decoded row group keeps its permits. The loader releases the permits when it removes the row group from memory.
 
@@ -618,11 +619,15 @@ The decoded row group keeps its permits. The loader releases the permits when it
 - The loader owns its epoch and its lanes. Thus `Lane` holds an `Arc<Epoch>`, and `Epoch` keeps a copy of the row counts (D-35).
 - A checkpoint does not hold the row groups in memory. A resume reads them again. torchdata, MosaicML Streaming and LitData do the same (D-36).
 - The loader stops all read tasks when it is dropped.
+- The loader has a maximum of 16 reads at the same time. Without this limit, a large budget starts thousands of requests at the start. The index has the same limit for footers.
+- If a read fails, `next` returns the error, and the next calls return `Error::Stopped`. The lanes did not change in the failed step, so `states()` is a correct point to resume from.
 
 **Limits:**
 
 - The budget does not include the memory of a decode in progress. Research measured approximately 3.5 times the decoded size of the row group during its decode.
-- The loader must run in a multi-thread tokio runtime. Thus the reads continue while Python runs the GPU step.
+- Use a multi-thread tokio runtime. On a single-thread runtime the loader is correct, but the reads progress only while the caller waits for `next`.
+- `new` makes the plan synchronously. At FineWeb-Edu scale this takes approximately 0.1 s in a release build.
+- The decode of a row group runs in a tokio task and blocks its worker thread for a few milliseconds.
 - All lane states must have the same step.
 - A plan for a resume can hold row groups that the lane read before the resume, if they are in the same slice.
 
@@ -634,6 +639,7 @@ The decoded row group keeps its permits. The loader releases the permits when it
 | `resume_matches_tail` | Unit | A stop at step k on world a and a resume on world b give the same batches as a run with no stop. |
 | `budget_is_checked_and_kept` | Unit | A budget below the peak gives `Error::Budget`. A budget equal to the peak runs to the end, and the bytes in memory stay at or below the budget. |
 | `evicts_everything` | Unit | After the last step, no row group is in memory. |
+| `failed_read_stops_the_loader` | Unit | A corrupt chunk gives `Error::Read` one time and then `Error::Stopped`. The lane states stay at the step before the failure. |
 | `prefetches_ahead` | Unit | With a large budget, the loader reads all row groups before `next` needs them. |
 | `reads_only_own_row_groups` | Unit | The plans of all ranks cover all row groups. Ranks share only the row groups at the edges of their slices. |
 | `plan_matches_lane_streams` | Unit | Each document that a lane takes at step s, also at a resume, is in a row group that the plan needs at s. |

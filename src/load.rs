@@ -28,6 +28,9 @@ pub enum Error {
     Read(read::Error),
     /// A read task panicked.
     Join(JoinError),
+    /// An earlier read failed. `states()` still holds the state before the
+    /// failed step, so build a new loader from it.
+    Stopped,
 }
 
 impl fmt::Display for Error {
@@ -39,6 +42,7 @@ impl fmt::Display for Error {
             ),
             Error::Read(e) => write!(f, "{e}"),
             Error::Join(e) => write!(f, "a read task failed: {e}"),
+            Error::Stopped => write!(f, "an earlier read failed; resume from states()"),
         }
     }
 }
@@ -46,7 +50,7 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Error::Budget { .. } => None,
+            Error::Budget { .. } | Error::Stopped => None,
             Error::Read(e) => Some(e),
             Error::Join(e) => Some(e),
         }
@@ -64,6 +68,10 @@ impl<T> Drop for Abort<T> {
 }
 
 type Read = Result<(RowGroupTokens, OwnedSemaphorePermit), read::Error>;
+
+/// Reads in flight at once. The budget alone would allow thousands of
+/// concurrent requests at start; the index caps footer reads the same way.
+const CONCURRENT_READS: usize = 16;
 
 /// The decoded row groups in memory. Each holds its budget permits until it
 /// is evicted.
@@ -92,13 +100,16 @@ pub struct Loader {
     /// Decoded bytes of every finished read not yet evicted, also those
     /// still waiting in `arrivals`.
     held: Arc<AtomicUsize>,
+    /// Set when a read failed: the lanes may be mid-step, so `next` stops.
+    stopped: bool,
     _driver: Abort<()>,
 }
 
 impl Loader {
     /// The loader for lanes `lanes`, each resumed from its state in
-    /// `states`. `budget` caps the bytes of decoded tokens in memory. Call it
-    /// within a multi-thread tokio runtime, which also runs the prefetch.
+    /// `states`. `budget` caps the bytes of decoded tokens in memory. The
+    /// reads run as tokio tasks; on a multi-thread runtime they continue in
+    /// the background while the caller trains.
     pub async fn new(
         epoch: Arc<Epoch>,
         reader: Arc<Reader>,
@@ -108,41 +119,38 @@ impl Loader {
         budget: u64,
     ) -> Result<Self, Error> {
         assert_eq!(states.len(), lanes.len(), "one state for each lane");
-        let needs = plan(&epoch, &index, lanes.clone(), states);
-        let budget_kib = budget / 1024;
-        let needed = peak(&needs);
-        if needed > budget_kib {
-            let needed = needed * 1024;
-            return Err(Error::Budget { needed, budget });
-        }
-        let mut evict: BTreeMap<u64, Vec<u32>> = BTreeMap::new();
-        needs
-            .iter()
-            .for_each(|n| evict.entry(n.last).or_default().push(n.row_group));
-        let held = Arc::new(AtomicUsize::new(0));
-        let (arrivals, driver) = prefetch(&needs, reader, index, budget_kib, held.clone());
-        let mut loader = Loader {
-            epoch: epoch.clone(),
-            lanes: Vec::new(),
-            needs,
-            next: 0,
-            evict,
-            buffer: Buffer::default(),
-            arrivals,
-            held,
-            _driver: driver,
-        };
-        // Resumed lanes replay their leftover now, so their row groups for
-        // the resume step must be in memory first.
         let step = states.first().map_or(0, |s| s.step);
         assert!(
             states.iter().all(|s| s.step == step),
             "lane states from one step"
         );
+        let needs = plan(&epoch, &index, lanes.clone(), states);
+        let (budget_kib, needed) = (budget / 1024, peak(&needs));
+        if needed > budget_kib {
+            let needed = needed * 1024;
+            return Err(Error::Budget { needed, budget });
+        }
+        let held = Arc::new(AtomicUsize::new(0));
+        let (arrivals, driver) = prefetch(&needs, reader, index, budget_kib, held.clone());
+        let mut loader = Loader {
+            epoch: epoch.clone(),
+            lanes: Vec::new(),
+            evict: evictions(&needs),
+            needs,
+            next: 0,
+            buffer: Buffer::default(),
+            arrivals,
+            held,
+            stopped: false,
+            _driver: driver,
+        };
+        // Resumed lanes replay their leftover now, so their row groups for
+        // the resume step must be in memory first.
         loader.receive(step).await?;
+        let buffer = &loader.buffer;
         loader.lanes = lanes
             .zip(states)
-            .map(|(l, &s)| epoch.lane(l, s, &loader.buffer))
+            .map(|(l, &s)| epoch.lane(l, s, buffer))
             .collect();
         Ok(loader)
     }
@@ -157,7 +165,13 @@ impl Loader {
         if step == self.epoch.steps() {
             return Ok(None);
         }
-        self.receive(step).await?;
+        if self.stopped {
+            return Err(Error::Stopped);
+        }
+        if let Err(e) = self.receive(step).await {
+            self.stopped = true;
+            return Err(e);
+        }
         let seq_len = self.epoch.packing().seq_len as usize;
         assert_eq!(
             out.len(),
@@ -207,8 +221,17 @@ impl Loader {
     }
 }
 
+/// The row groups to evict after each step: those whose last step it is.
+fn evictions(needs: &[Need]) -> BTreeMap<u64, Vec<u32>> {
+    let mut evict: BTreeMap<u64, Vec<u32>> = BTreeMap::new();
+    for n in needs {
+        evict.entry(n.last).or_default().push(n.row_group);
+    }
+    evict
+}
+
 /// Starts the prefetch. One driver takes the budget permits of each row
-/// group in plan order, then starts its read. Permits are taken one row
+/// group in plan order, then a read slot, then starts its read. Permits are taken one row
 /// group at a time: tokio's semaphore is first in, first out, so a later
 /// row group cannot take permits that an earlier one waits for.
 fn prefetch(
@@ -220,15 +243,21 @@ fn prefetch(
 ) -> (UnboundedReceiver<(u32, Abort<Read>)>, Abort<()>) {
     let (tx, rx) = unbounded_channel();
     let semaphore = Arc::new(Semaphore::new(budget_kib as usize));
+    let slots = Arc::new(Semaphore::new(CONCURRENT_READS));
     let needs: Vec<(u32, u32)> = needs.iter().map(|n| (n.row_group, n.kib as u32)).collect();
     let driver = tokio::spawn(async move {
         for (row_group, kib) in needs {
             let Ok(permit) = semaphore.clone().acquire_many_owned(kib).await else {
                 return;
             };
+            let Ok(slot) = slots.clone().acquire_owned().await else {
+                return;
+            };
             let (reader, index, held) = (reader.clone(), index.clone(), held.clone());
             let read = tokio::spawn(async move {
-                let tokens = reader.read(&index, row_group).await?;
+                let tokens = reader.read(&index, row_group).await;
+                drop(slot);
+                let tokens = tokens?;
                 held.fetch_add(tokens.bytes(), Ordering::Relaxed);
                 Ok((tokens, permit))
             });
