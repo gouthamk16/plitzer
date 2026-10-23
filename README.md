@@ -23,6 +23,9 @@ The design, its rationale and the decision log are in [docs/design.md](docs/desi
   - [x] read one row group's token column without its footer (local disk and S3)
   - [x] prefetch each GPU's row groups for a window, capped by bytes
 - [ ] **Python:** PyO3 and maturin bindings, a PyTorch `IterableDataset` with `state_dict()`, and Arrow PyCapsule export
+  - [x] typed checkpoint bytes that merge across GPUs, and a per-GPU session that runs epochs and refuses a mismatched resume
+  - [ ] bindings: a `plitzer` wheel exporting batches through DLPack and Arrow
+  - [ ] `plitzer.torch` `IterableDataset` with `state_dict()` and `load_state_dict()`
 - [ ] **End-to-end test:** kill training at a random step, resume on a different GPU count, and check the sample-stream hash matches
 - [ ] **Read amplification check:** measure bytes read per GPU on real data. Lane slices simulate at 1.01–1.25×. Add a per-node cache only if it's needed
 - [ ] **Benchmarks:** publish a comparison table against Mosaic and HF
