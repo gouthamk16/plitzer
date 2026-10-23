@@ -53,15 +53,24 @@ fn damaged_bytes_are_refused() {
     let mut flipped = bytes.clone();
     flipped[40] ^= 1;
     assert_eq!(Checkpoint::from_bytes(&flipped), Err(Error::Checksum));
-    let mut version = bytes.clone();
+    let mut version = bytes[..bytes.len() - 8].to_vec();
     version[8] = 9;
+    assert_eq!(
+        Checkpoint::from_bytes(&version),
+        Err(Error::Checksum),
+        "damage, not a version"
+    );
+    version.extend(fnv1a(&version).to_le_bytes());
     assert_eq!(Checkpoint::from_bytes(&version), Err(Error::Version(9)));
     assert_eq!(
         Checkpoint::from_bytes(b"PLTZ"),
         Err(Error::Bytes("no magic"))
     );
+    assert_eq!(Checkpoint::from_bytes(&bytes[..10]), Err(Error::Checksum));
+    let mut magic_only = MAGIC.to_vec();
+    magic_only.extend(fnv1a(MAGIC).to_le_bytes());
     assert_eq!(
-        Checkpoint::from_bytes(&bytes[..10]),
+        Checkpoint::from_bytes(&magic_only),
         Err(Error::Bytes("truncated"))
     );
     // A count larger than the lanes that follow, with a valid checksum.

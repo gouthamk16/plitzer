@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use arrow_array::builder::{GenericListBuilder, Int32Builder};
 use arrow_array::{ArrayRef, RecordBatch};
 use object_store::local::LocalFileSystem;
@@ -171,6 +173,43 @@ async fn set_epoch_starts_that_epoch() {
         s.set_epoch(1);
     }
     assert_eq!(run(&mut two, end + 1).await, want[end + 1..2 * end + 2]);
+}
+
+// A trainer that saved after an epoch's last step resumes into the next
+// epoch, then calls `set_epoch` with the epoch it saved in.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn set_epoch_never_goes_back() {
+    let d = data();
+    let want = reference(&d).await;
+    let end = want.iter().position(Option::is_none).unwrap();
+    let mut one = sessions(&d, 1).await;
+    run(&mut one, end).await;
+    let checkpoint = global(&one);
+    let mut again = sessions(&d, 1).await;
+    again[0].resume(&checkpoint).unwrap();
+    again[0].set_epoch(0);
+    assert_eq!(run(&mut again, 2).await, want[end + 1..end + 3]);
+}
+
+// A dropped `next` future, as from a timeout or Ctrl-C in Python, loses
+// no read: polling each call only once until it is ready gives the same
+// batches.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn next_is_cancel_safe() {
+    let d = data();
+    let want = reference(&d).await;
+    let mut one = sessions(&d, 1).await;
+    let mut seq = vec![0; (4 * config().packing.seq_len) as usize];
+    let mut got = Vec::new();
+    let mut cancelled = 0;
+    while got.len() < want.len() {
+        match tokio::time::timeout(Duration::ZERO, one[0].next(&mut seq)).await {
+            Ok(real) => got.push(real.unwrap().map(|_| seq.clone())),
+            Err(_) => cancelled += 1,
+        }
+    }
+    assert!(cancelled > 0, "no call was cancelled");
+    assert_eq!(got, want);
 }
 
 // Trainers call `set_epoch` at the start of each epoch, also the one they

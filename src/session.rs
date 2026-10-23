@@ -94,11 +94,13 @@ impl Session {
         })
     }
 
-    /// Stands before the first step of epoch `epoch`. Does nothing if the
-    /// session is in that epoch already: trainers call this at the start of
-    /// each epoch, also the epoch they resumed into.
+    /// Stands before the first step of epoch `epoch` if it is later than the
+    /// session's epoch, and does nothing otherwise. Trainers call this at the
+    /// start of each epoch, also the one they resumed into, and a checkpoint
+    /// after an epoch's last step is already at the next epoch. Going back
+    /// would repeat data with no error; open a new session to do that.
     pub fn set_epoch(&mut self, epoch: u64) {
-        if epoch != self.epoch {
+        if epoch > self.epoch {
             self.start_epoch(epoch);
         }
     }

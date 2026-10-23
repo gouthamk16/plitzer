@@ -626,6 +626,7 @@ The decoded row group keeps its permits. The loader releases the permits when it
 - The loader stops all read tasks when it is dropped.
 - The loader has a maximum of 16 reads at the same time. Without this limit, a large budget starts thousands of requests at the start. The index has the same limit for footers.
 - If a read fails, `next` returns the error, and the next calls return `Error::Stopped`. The lanes did not change in the failed step, so `states()` is a correct point to resume from.
+- `next` is cancel safe. The loader keeps the read that it waits for, so a dropped `next` loses no row group (D-44).
 
 **Limits:**
 
@@ -710,7 +711,7 @@ Each GPU gives a checkpoint part for its own lanes. `merge` puts the parts of al
 - The checkpoint is bytes. `torch.load(weights_only=True)` accepts bytes, but not a custom class. Rust and Python use the same format (D-37).
 - A global checkpoint resumes on each GPU count. Some trainers save the state of rank 0 only, so each rank must be able to make the global checkpoint (D-38).
 - Different settings or a different dataset give different batches with no error. Thus a resume with them stops (D-39).
-- The format has a version and a checksum, so a damaged or old checkpoint gives a clear error.
+- The format has a version and a checksum, so a damaged or old checkpoint gives a clear error. `from_bytes` checks the checksum first (D-45).
 - `from_bytes` does not reserve memory from the lane count in the bytes.
 
 **Limits:**
@@ -724,7 +725,7 @@ Each GPU gives a checkpoint part for its own lanes. `merge` puts the parts of al
 |---|---|---|
 | `golden_bytes` | Unit | The bytes of a fixed checkpoint are the same as bytes that Python's `struct` module made. |
 | `bytes_round_trip` | Property | `from_bytes(to_bytes(c))` gives `c`. |
-| `damaged_bytes_are_refused` | Unit | A changed bit, a different version, no magic and too few bytes each give their error. |
+| `damaged_bytes_are_refused` | Unit | A changed bit, a changed version without a new checksum, a different version, no magic and too few bytes each give their error. |
 | `any_bytes_give_an_error_not_a_panic` | Property | Random bytes never cause a panic, also with a correct checksum. |
 | `truncation_is_refused` | Property | A checkpoint with bytes removed from its end gives an error. |
 | `merge_tiles_the_lanes` | Unit | Parts in any order give one global checkpoint. |
@@ -757,7 +758,7 @@ pub enum Error { Config(String), Index(index::Error), Read(read::Error),
 **Design:**
 
 - `open` checks the config, opens the index with `Index::open`, and makes the reader. The lanes are `gpu_lanes(B, world, rank)`.
-- The session keeps the lane states to start from. `set_epoch` sets them to the start of an epoch, if the session is not in that epoch already. `resume` takes them from a checkpoint after `check`.
+- The session keeps the lane states to start from. `set_epoch` sets them to the start of a later epoch. It does nothing for the current epoch or an earlier one. `resume` takes them from a checkpoint after `check`.
 - `next` makes the loader of the epoch at the first step. At the end of the epoch, `next` returns `None`, and the session goes to step 0 of the next epoch.
 - If `next` fails, the session keeps the lane states of the loader and drops the loader. The next call makes a new loader and tries the same step again.
 - `checkpoint` gives the lane states of the loader. Before the first step of an epoch, it gives the start states. After the last step of an epoch, it gives `(epoch + 1, step 0)`, also before the call of `next` that returns `None`.
@@ -765,7 +766,7 @@ pub enum Error { Config(String), Index(index::Error), Read(read::Error),
 **Rationale:**
 
 - After the last step of an epoch, a checkpoint holds `(epoch + 1, step 0)`. A resume from it starts the next epoch, not an empty end of the old epoch. The parts of all GPUs agree, also if only some GPUs received `None` (D-40).
-- Trainers call `set_epoch` at the start of each epoch, also the epoch that they resumed into. Thus `set_epoch` does not change a session that is in that epoch (D-43).
+- Trainers call `set_epoch` at the start of each epoch, also the epoch that they resumed into. A checkpoint after the last step of an epoch is at the next epoch. Thus `set_epoch` only goes forward, and a resume never repeats data (D-43).
 - The Python bindings give the config to `open`. Thus `open` returns `Error::Config` for a config that would cause a panic (D-41).
 - A failed read leaves the lane states before the failed step. Thus a retry can continue, and the caller does not have to make a new session (D-42).
 - The session calculates the fingerprint one time. The fingerprint encodes the full index.
@@ -783,6 +784,8 @@ pub enum Error { Config(String), Index(index::Error), Read(read::Error),
 | `epochs_roll_over` | Unit | After the last step, the checkpoint holds epoch 1 and the start states, before and after `None`. Parts from a GPU that received `None` and a GPU that did not merge. The batches of epoch 1 are not the same as epoch 0. |
 | `set_epoch_starts_that_epoch` | Unit | `set_epoch(1)` after some steps gives the batches of epoch 1. |
 | `set_epoch_keeps_a_resume_in_that_epoch` | Unit | `set_epoch(0)` after a resume in epoch 0 keeps the resumed position. |
+| `set_epoch_never_goes_back` | Unit | `set_epoch(0)` after a resume from the end of epoch 0 gives the batches of epoch 1. |
+| `next_is_cancel_safe` | Unit | Calls of `next` that are dropped before they finish give the same batches as a run with no drops. |
 | `resume_refuses_other_runs` | Unit | A different L, a different seed and an added file each give `Mismatch` with the name of the field. |
 | `resume_needs_this_ranks_lanes` | Unit | A part resumes the rank that holds its lanes, and another rank refuses it. |
 | `open_refuses_bad_settings` | Unit | A world that does not divide B, a rank out of range, no GPUs, W = 0 and D = 0 each give `Error::Config`. |
@@ -852,7 +855,9 @@ These components are not in the code yet. Their sections will have the full set 
 | D-40 | After the last step of an epoch, the session goes to step 0 of the next epoch. | A checkpoint at the end of an epoch then starts the next epoch. | Stay at the end of the old epoch. | #16 |
 | D-41 | `Session::open` returns `Error::Config` for a config that would cause a panic. | Python gives the config. | A panic, which PyO3 shows as `PanicException`. | #16 |
 | D-42 | After a failed `next`, the session keeps the lane states and drops the loader. | The next call tries the same step again. | Stop the session, as the loader does. | #16 |
-| D-43 | `set_epoch` does nothing if the session is in that epoch. | Trainers call it after a resume, and a reset would repeat steps with no error. | Always go to step 0. | #16 |
+| D-43 | `set_epoch` only goes to a later epoch. | Trainers call it after a resume, also with the epoch before a checkpoint at an epoch end. A reset would repeat steps with no error. | Always go to step 0, or do nothing only for the same epoch. | #16 |
+| D-44 | `Loader::next` is cancel safe. The read in progress stays in the loader. | Python drops the future at Ctrl-C, and a timeout drops it too. A lost read stops the loader with a panic. | Document that a dropped `next` breaks the loader. | #16 |
+| D-45 | `from_bytes` checks the checksum before the version. | A damaged version field gives `Checksum`, not a false `Version` error. | Check the version first. | #16 |
 | D-22 | The sidecar uses its own binary format and FNV-1a. | No new dependency, and the bytes are fixed by our code. | `serde` with `bincode`, or JSON. | #10 |
 | D-23 | A sidecar that does not exist or is corrupt causes a new build. | The sidecar is only a cache. | An error that the user must correct. | #10 |
 | D-24 | The index keeps the place of each token column chunk, and the reader reads no footer. | A window has row groups from approximately W files. A footer read for each row group costs approximately 1.5 times the data. | Read the footer of each file again, or keep footers in memory (9.4 GB for FineWeb-Edu). | #12 |

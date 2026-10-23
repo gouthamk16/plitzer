@@ -97,6 +97,9 @@ pub struct Loader {
     evict: BTreeMap<u64, Vec<u32>>,
     buffer: Buffer,
     arrivals: UnboundedReceiver<(u32, Abort<Read>)>,
+    /// The read taken from `arrivals` and not yet finished. It lives here,
+    /// not in `receive`, so a dropped `next` future loses no read.
+    pending: Option<(u32, Abort<Read>)>,
     /// Decoded bytes of every finished read not yet evicted, also those
     /// still waiting in `arrivals`.
     held: Arc<AtomicUsize>,
@@ -140,6 +143,7 @@ impl Loader {
             next: 0,
             buffer: Buffer::default(),
             arrivals,
+            pending: None,
             held,
             stopped: false,
             _driver: driver,
@@ -206,17 +210,19 @@ impl Loader {
     }
 
     /// Waits until every row group needed at or before `step` is in memory.
+    /// Cancel safe: `recv` is, and the read in progress stays in `pending`.
     async fn receive(&mut self, step: u64) -> Result<(), Error> {
         while self.needs.get(self.next).is_some_and(|n| n.first <= step) {
             let want = self.needs[self.next].row_group;
-            let (row_group, mut task) = self
-                .arrivals
-                .recv()
-                .await
-                .expect("the driver sends every need");
-            debug_assert_eq!(row_group, want, "arrivals come in plan order");
-            let read = (&mut task.0).await.map_err(Error::Join)?;
-            let (tokens, permit) = read.map_err(Error::Read)?;
+            if self.pending.is_none() {
+                let arrival = self.arrivals.recv().await;
+                self.pending = Some(arrival.expect("the driver sends every need"));
+            }
+            let (row_group, task) = self.pending.as_mut().expect("set above");
+            debug_assert_eq!(*row_group, want, "arrivals come in plan order");
+            let read = (&mut task.0).await;
+            let (row_group, _) = self.pending.take().expect("set above");
+            let (tokens, permit) = read.map_err(Error::Join)?.map_err(Error::Read)?;
             self.buffer.0.insert(row_group, (tokens, permit));
             self.next += 1;
         }

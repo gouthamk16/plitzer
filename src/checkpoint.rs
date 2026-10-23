@@ -107,21 +107,22 @@ impl Checkpoint {
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, Error> {
-        let mut r = Reader(bytes);
-        if r.take(8) != Some(MAGIC) {
+        if !bytes.starts_with(MAGIC) {
             return Err(Error::Bytes("no magic"));
         }
-        let version = r.u32().ok_or(Error::Bytes("truncated"))?;
-        if version != VERSION {
-            return Err(Error::Version(version));
-        }
+        // The checksum comes first, so damage to the version field is not
+        // reported as a checkpoint from another version.
         let (body, sum) = bytes
             .split_last_chunk::<8>()
             .ok_or(Error::Bytes("truncated"))?;
         if fnv1a(body) != u64::from_le_bytes(*sum) {
             return Err(Error::Checksum);
         }
-        let mut r = Reader(body.get(12..).ok_or(Error::Bytes("truncated"))?);
+        let mut r = Reader(body.get(MAGIC.len()..).ok_or(Error::Bytes("truncated"))?);
+        let version = r.u32().ok_or(Error::Bytes("truncated"))?;
+        if version != VERSION {
+            return Err(Error::Version(version));
+        }
         let checkpoint = fields(&mut r).ok_or(Error::Bytes("truncated"))?;
         if !r.0.is_empty() {
             return Err(Error::Bytes("trailing bytes"));
