@@ -1,3 +1,4 @@
+pub mod index;
 pub mod order;
 pub mod pack;
 pub mod seed;
