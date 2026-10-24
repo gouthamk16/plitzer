@@ -85,8 +85,9 @@ fn local(dir: &std::path::Path, options: &[(String, String)]) -> Result<Location
         return Err(Error::Option(why));
     }
     let store = LocalFileSystem::new_with_prefix(dir).map_err(Error::Store)?;
-    // The store has made the folder absolute and resolved its links.
-    let id = store.to_string();
+    // The store opened the folder, so it exists; links are resolved.
+    let id = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let id = id.display().to_string();
     let (store, prefix) = (Arc::new(store), Path::from(""));
     Ok(Location { store, prefix, id })
 }

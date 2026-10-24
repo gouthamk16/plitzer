@@ -1,26 +1,18 @@
 import gc
 import os
 import signal
-import sys
 import threading
 import time
 import warnings
 from collections.abc import Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 import numpy as np
-
-if sys.platform != "win32":
-    pass
 import numpy.typing as npt
 import pytest
 
 import plitzer
 from conftest import SETTINGS, MakeLoader
-
-if TYPE_CHECKING:
-    pass
 
 Tokens = npt.NDArray[np.int32]
 
@@ -66,6 +58,24 @@ def test_iterator_protocol(make: MakeLoader) -> None:
     assert loader.epoch == 1
     second = epoch([loader])
     assert not same(first, second)
+
+
+def test_set_epoch_after_stop_iteration(make: MakeLoader) -> None:
+    """A trainer that steps with next() and calls set_epoch each epoch."""
+    want = make()
+    first, second = epoch([want]), epoch([want])
+    loader = make()
+    got: list[list[Tokens]] = []
+    for e in range(2):
+        loader.set_epoch(e)
+        got.append([])
+        try:
+            while True:
+                tokens = np.from_dlpack(next(loader).tokens)
+                got[e].append(tokens.astype(np.int32, copy=False))
+        except StopIteration:
+            pass
+    assert same(got[0], first) and same(got[1], second)
 
 
 def test_epoch_is_the_next_step(make: MakeLoader) -> None:
@@ -129,7 +139,7 @@ def test_no_default_cache_without_a_user_folder(
     # A relative folder would differ for each working directory: unset.
     monkeypatch.setenv("XDG_CACHE_HOME", ".cache")
     with pytest.raises(plitzer.ConfigError, match="cache"):
-        plitzer.Loader(str(dataset), **SETTINGS)  # type: ignore[arg-type]
+        plitzer.Loader(str(dataset), **SETTINGS)
 
 
 def test_default_cache_is_made_and_shared(
@@ -138,7 +148,7 @@ def test_default_cache_is_made_and_shared(
     cache = tmp_path / "new" / "cache"
     monkeypatch.setenv("PLITZER_CACHE_DIR", str(cache))
     for location in [str(dataset), str(dataset) + os.sep, dataset.as_uri()]:
-        next(plitzer.Loader(location, **SETTINGS))  # type: ignore[arg-type]
+        next(plitzer.Loader(location, **SETTINGS))
     assert len(list(cache.iterdir())) == 1, "one index for each dataset"
 
 
@@ -177,8 +187,10 @@ def test_bad_settings(make: MakeLoader, tmp_path: Path) -> None:
         make(world=-1)
     with pytest.raises(plitzer.ConfigError, match="epoch"):
         make().set_epoch(-1)
+    with pytest.raises(plitzer.ConfigError, match="epoch"):
+        make().set_epoch(2**62)
     with pytest.raises(plitzer.ConfigError, match="#"):
-        plitzer.Loader(str(tmp_path.as_uri()) + "/data#2", **SETTINGS)  # type: ignore[arg-type]
+        plitzer.Loader(str(tmp_path.as_uri()) + "/data#2", **SETTINGS)
     blocker = tmp_path / "file"
     blocker.write_bytes(b"")
     with pytest.raises(plitzer.ConfigError, match="cache"):
@@ -189,7 +201,7 @@ def test_bad_settings(make: MakeLoader, tmp_path: Path) -> None:
         next(make(budget=1))
     missing = str(tmp_path / "missing")
     with pytest.raises(plitzer.DataError):
-        plitzer.Loader(missing, **SETTINGS)  # type: ignore[arg-type]
+        plitzer.Loader(missing, **SETTINGS)
     assert issubclass(plitzer.ConfigError, plitzer.PlitzerError)
 
 

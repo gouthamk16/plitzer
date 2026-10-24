@@ -20,25 +20,42 @@ pub fn int<T: TryFrom<i128>>(name: &str, value: i128) -> PyResult<T> {
         .map_err(|_| ConfigError::new_err(format!("{name} = {value} is out of range")))
 }
 
+/// The integer settings of a `Loader`, as Python gave them. Named fields,
+/// so a call cannot swap two of them.
+pub struct Ints {
+    pub seed: i128,
+    pub lanes: i128,
+    pub window: i128,
+    pub seq_len: i128,
+    pub docs: i128,
+    pub cap: i128,
+    pub pad: i128,
+}
+
 /// The config from Python integers, each checked to fit.
-pub fn config(
-    column: String,
-    [seed, lanes, window]: [i128; 3],
-    [seq_len, docs, cap, pad]: [i128; 4],
-) -> PyResult<Config> {
+pub fn config(column: String, i: Ints) -> PyResult<Config> {
     let packing = Packing {
-        seq_len: int("seq_len", seq_len)?,
-        docs: int("docs", docs)?,
-        cap: int("cap", cap)?,
-        pad: int("pad", pad)?,
+        seq_len: int("seq_len", i.seq_len)?,
+        docs: int("docs", i.docs)?,
+        cap: int("cap", i.cap)?,
+        pad: pad(i.pad)?,
     };
     Ok(Config {
         column,
-        seed: int("seed", seed)?,
-        lanes: int("lanes", lanes)?,
-        window: int("window", window)?,
+        seed: int("seed", i.seed)?,
+        lanes: int("lanes", i.lanes)?,
+        window: int("window", i.window)?,
         packing,
     })
+}
+
+/// The pad token as a `u32`. Batches reach Python as int32, so a negative
+/// pad, such as -1, means the token with the same bits.
+fn pad(value: i128) -> PyResult<u32> {
+    match value < 0 {
+        true => int::<i32>("pad", value).map(|p| p as u32),
+        false => int("pad", value),
+    }
 }
 
 /// The store and prefix of `location`, and the index cache: `cache`, else
@@ -82,7 +99,9 @@ fn default_cache(key: impl Hash) -> Option<PathBuf> {
             .or_else(|| var("HOME").map(|h| h.join(".cache")));
         dir.map(|d| d.join("plitzer"))
     };
-    let dir = var("PLITZER_CACHE_DIR").or_else(user)?;
+    // plitzer's own variable is used as given, also when it is relative.
+    let own = std::env::var_os("PLITZER_CACHE_DIR").filter(|v| !v.is_empty());
+    let dir = own.map(PathBuf::from).or_else(user)?;
     let mut hasher = DefaultHasher::new();
     key.hash(&mut hasher);
     Some(dir.join(format!("{:016x}.idx", hasher.finish())))

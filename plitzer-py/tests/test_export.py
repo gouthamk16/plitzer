@@ -42,6 +42,12 @@ class Legacy:
         return self.array.__dlpack_device__()
 
 
+def test_negative_pad_is_the_same_token(make: MakeLoader) -> None:
+    a = np.from_dlpack(next(make(pad=-1)).tokens)
+    b = np.from_dlpack(next(make(pad=2**32 - 1)).tokens)
+    assert np.array_equal(a, b) and (a == -1).any()
+
+
 def test_dlpack_versioned_and_legacy(make: MakeLoader) -> None:
     batch = next(make())
     assert '"dltensor_versioned"' in repr(batch.tokens.__dlpack__(max_version=(1, 0)))

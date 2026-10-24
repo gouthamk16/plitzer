@@ -45,9 +45,9 @@ def test_s3_matches_local(dataset: Path, tmp_path: Path) -> None:
         f"s3://{bucket}/{prefix}",
         cache=str(tmp_path / "s3.idx"),
         storage_options=options,
-        **SETTINGS,  # type: ignore[arg-type]
+        **SETTINGS,
     )
-    local = plitzer.Loader(str(dataset), cache=str(tmp_path / "local.idx"), **SETTINGS)  # type: ignore[arg-type]
+    local = plitzer.Loader(str(dataset), cache=str(tmp_path / "local.idx"), **SETTINGS)
     pairs = list(zip(remote, local, strict=True))
     assert pairs
     for a, b in pairs:

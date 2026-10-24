@@ -103,7 +103,8 @@ impl Index {
 
     /// The index from the sidecar at `cache` if it still matches the listing,
     /// else a new build, which is then written to `cache`. A missing or
-    /// corrupt sidecar only causes a rebuild.
+    /// corrupt sidecar only causes a rebuild. A cache folder that cannot be
+    /// written is `Error::Cache`, before the build.
     pub async fn open(
         store: &dyn ObjectStore,
         prefix: &Path,
@@ -118,7 +119,10 @@ impl Index {
         }
         sidecar::check_writable(cache).map_err(Error::Cache)?;
         let index = Self::from_footers(store, prefix, column, metas).await?;
-        sidecar::write(cache, &sidecar::encode(&index, true)).map_err(Error::Cache)?;
+        // The check above catches a folder that cannot be written. A later
+        // failure, such as a full disk, costs a rebuild at the next start;
+        // this run keeps the index it built.
+        let _ = sidecar::write(cache, &sidecar::encode(&index, true));
         Ok(index)
     }
 

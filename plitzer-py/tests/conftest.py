@@ -1,5 +1,6 @@
-from collections.abc import Callable
+import os
 from pathlib import Path
+from typing import Protocol, TypedDict, Unpack
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -7,7 +8,49 @@ import pytest
 
 import plitzer
 
-SETTINGS = {
+
+class Settings(TypedDict):
+    """The keywords that `plitzer.Loader` needs."""
+
+    seed: int
+    lanes: int
+    window: int
+    seq_len: int
+    docs: int
+    cap: int
+    pad: int
+    budget: int
+
+
+class Args(Settings, total=False):
+    """Every keyword of `plitzer.Loader`."""
+
+    rank: int
+    world: int
+    column: str
+    cache: str | os.PathLike[str] | None
+    storage_options: dict[str, str] | None
+
+
+class Overrides(TypedDict, total=False):
+    """Any keyword of `plitzer.Loader`, to replace one in SETTINGS."""
+
+    seed: int
+    lanes: int
+    window: int
+    seq_len: int
+    docs: int
+    cap: int
+    pad: int
+    budget: int
+    rank: int
+    world: int
+    column: str
+    cache: str | os.PathLike[str] | None
+    storage_options: dict[str, str] | None
+
+
+SETTINGS: Settings = {
     "seed": 11,
     "lanes": 4,
     "window": 3,
@@ -18,7 +61,9 @@ SETTINGS = {
     "budget": 1 << 30,
 }
 
-MakeLoader = Callable[..., plitzer.Loader]
+
+class MakeLoader(Protocol):
+    def __call__(self, **overrides: Unpack[Overrides]) -> plitzer.Loader: ...
 
 
 @pytest.fixture
@@ -40,9 +85,8 @@ def dataset(tmp_path: Path) -> Path:
 def make(dataset: Path, tmp_path: Path) -> MakeLoader:
     """A Loader over `dataset` with SETTINGS, which keywords override."""
 
-    def make(**overrides: object) -> plitzer.Loader:
-        settings: dict[str, object] = {**SETTINGS, "cache": str(tmp_path / "index")}
-        settings.update(overrides)
-        return plitzer.Loader(str(dataset), **settings)  # type: ignore[arg-type]
+    def make(**overrides: Unpack[Overrides]) -> plitzer.Loader:
+        args: Args = {**SETTINGS, "cache": str(tmp_path / "index"), **overrides}
+        return plitzer.Loader(str(dataset), **args)
 
     return make

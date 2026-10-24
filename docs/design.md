@@ -468,7 +468,7 @@ The fingerprint is the 64-bit FNV-1a hash of the same layout, with no ETags and 
 - The cache check compares the ETag, because a file can change and keep its size (D-20).
 - The fingerprint does not include the ETag. A local ETag holds the inode and the modification time, which are different on each copy (D-21).
 - The sidecar uses its own small format. It needs no `serde` dependency, and a golden test pins the bytes (D-22).
-- Before a build, `open` makes the cache folder, and makes and deletes a test file in it. A cache that cannot be written then fails before the footer scan, which takes long on a large dataset (D-57).
+- Before a build, `open` makes the cache folder, and makes and deletes a test file in it. A cache that cannot be written then fails before the footer scan, which takes long on a large dataset (D-57). If the write after the build fails, such as on a full disk, `open` still returns the index: the next start builds it again.
 - If the sidecar does not exist or is corrupt, `open` builds the index again. This is not an error. The sidecar is only a cache (D-23).
 - The module writes the sidecar to a temporary file with a unique name and then renames it. Thus the processes of all GPUs on one node can write at the same time, and no process reads a half-written sidecar.
 - Windows does not replace a file while a different process has it open or replaces it. If the rename fails and the sidecar already has the same bytes, a different process wrote the same index, and the write is complete. If not, the module tries again up to five times.
@@ -843,7 +843,7 @@ pub enum Error { Store(object_store::Error), Scheme(String), Option(String) }
 
 | Test | Type | What it shows |
 |---|---|---|
-| `opens_local_folders` | Unit | A path, the path with a separator at the end, and a `file://` URL open the same folder with the same `id`. Another folder has another `id`. |
+| `opens_local_folders` | Unit | A path, the path with a separator at the end, and a `file://` URL open the same folder with the same `id` (the canonical path). Another folder has another `id`. |
 | `a_colon_in_a_path_is_not_a_scheme` | Unit | A folder named `runs:2024` opens as a folder (POSIX). |
 | `s3_id_has_the_endpoint_and_no_keys` | Unit | Two secret keys give one `id`, and two endpoints give two. The `id` holds no key. |
 | `refuses_what_it_cannot_open` | Unit | A missing folder, an unknown scheme, an option for a local folder, and URLs with `?` or `#` each give their error. |
@@ -884,7 +884,7 @@ class PlitzerError(Exception); ConfigError, CheckpointError, DataError (PlitzerE
 - `__next__` releases the GIL and waits on the runtime for 100 ms at a time. Between these waits it checks for signals. Thus Ctrl-C gives `KeyboardInterrupt` in 100 ms or less, and it drops the `next` future. `Loader::next` is cancel safe (D-44), so the next call does the same step again.
 - At the end of an epoch, `__next__` raises `StopIteration`, and it raises it again at each later call, as a Python iterator must. `__iter__` starts the next epoch: a new `for` loop gives it. `__iter__` also moves on a loader whose last step is taken but which did not raise `StopIteration` yet, such as the second loader in a `zip` (D-55).
 - Each step writes into a new `Vec<u32>`. An arrow `Buffer` holds it, and each export holds a clone of that `Buffer`. Thus an exported array stays valid after the batch, the loader and the export call.
-- The default cache is `$PLITZER_CACHE_DIR`, else the user cache folder, then `plitzer/<hash>.idx`. The hash is of the `id` of the store (section 5.10) and the column, not of the location text. Thus `data` from two folders gets two files, and `data/` and `file:///…/data` share one (D-54). The index makes the cache folder if it does not exist. These variables count only when they hold an absolute path: a relative folder would differ for each working directory. With no user cache folder (no absolute `HOME`, `XDG_CACHE_HOME` or `LOCALAPPDATA`), there is no default, and `Loader` gives `ConfigError` (D-61).
+- The default cache is `$PLITZER_CACHE_DIR`, else the user cache folder, then `plitzer/<hash>.idx`. The hash is of the `id` of the store (section 5.10) and the column, not of the location text. Thus `data` from two folders gets two files, and `data/` and `file:///…/data` share one (D-54). The index makes the cache folder if it does not exist. `HOME`, `XDG_CACHE_HOME` and `LOCALAPPDATA` count only when they hold an absolute path: a relative folder would differ for each working directory. `PLITZER_CACHE_DIR` is used as given. With no user cache folder, there is no default, and `Loader` gives `ConfigError` (D-61).
 - Integer settings, also the epoch of `set_epoch`, come in as Python integers of any size. A value that does not fit, such as `world=-1`, gives `ConfigError`.
 - If the runtime cannot start its threads, such as at a process limit, `Loader` gives `RuntimeError`.
 
@@ -923,7 +923,8 @@ An Arrow consumer moves the structs out of the capsules and sets their `release`
 
 - Both DLPack ABIs: numpy 2 and current torch ask for the versioned ABI, and older consumers call `__dlpack__()` with no arguments (D-46).
 - int32: torch has little support for `uint32`, and vocabularies are much smaller than 2³¹. A pad token of 2³² − 1 shows as −1 (D-47).
-- `pad` has no default. Many tokenizers use 0 as a real token, so the user must choose (D-52).
+- `pad` has no default. Many tokenizers use 0 as a real token, so the user must choose (D-52). A negative `pad` from −2³¹ is the token with the same bits, so `pad=-1` and `pad=2**32 - 1` give the same batches.
+- `set_epoch(e)` opens the iterator for epoch `e` when the loader stands at the start of `e`, also just after `StopIteration`. Thus a trainer that calls `set_epoch` and then `next` for each epoch gets each epoch. `set_epoch` refuses epochs from 2⁶², so the epoch after the last one always exists.
 - The runtime has all its drivers. The S3 client needs the I/O driver, and the waits need the timer.
 - The PID check stops a forked child before it waits for runtime threads that it does not have (D-50).
 - The 100 ms slices let Ctrl-C work and cost one timer for each slice (D-51).
@@ -944,11 +945,13 @@ An Arrow consumer moves the structs out of the capsules and sets their `release`
 |---|---|---|
 | `test_ranks_split_the_global_batch` | pytest | Two loaders on world 2 give the batches of one loader on world 1. |
 | `test_iteration_ends_each_epoch` | pytest | A `for` loop ends at the end of each epoch, and the next loop gives the next epoch. |
+| `test_set_epoch_after_stop_iteration` | pytest | `set_epoch(e)` and `next` until `StopIteration`, for two epochs, give the batches of both epochs. |
 | `test_epoch_is_the_next_step` | pytest | After the last step of an epoch, `epoch` is 1 before and after `StopIteration`. |
 | `test_checkpoint_during_a_step` | pytest | Another thread reads `checkpoint()` and `epoch` during all the steps of an epoch with no error. Each checkpoint it reads is complete. |
 | `test_iterator_protocol` | pytest | After the end of an epoch, `next` raises `StopIteration` again. The next `for` loop gives the next epoch. |
 | `test_non_strict_zip_keeps_ranks_together` | pytest | Two epochs through `zip` (not strict) of two world-2 loaders give the batches of one world-1 loader. |
 | `test_batch_shapes_and_padding` | pytest | The shapes and the int32 type are correct. After the real tokens, each row holds the pad token. |
+| `test_negative_pad_is_the_same_token` | pytest | `pad=-1` gives the same batches as `pad=2**32 - 1`. |
 | `test_dlpack_versioned_and_legacy` | pytest | Both ABIs give the same data, with the correct capsule names. |
 | `test_unused_capsules_are_freed` | pytest | 300 000 capsules that nobody takes are freed: the peak memory grows less than 16 MiB (Linux). |
 | `test_no_default_cache_without_a_user_folder` | pytest | With no user cache folder and no `cache`, `Loader` gives `ConfigError`. |
