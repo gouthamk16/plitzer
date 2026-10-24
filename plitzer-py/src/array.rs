@@ -16,7 +16,6 @@ use crate::dlpack;
 /// are `u32` in Rust; vocabularies are far below 2³¹, and torch has little
 /// `uint32` support.
 #[pyclass(module = "plitzer._plitzer", frozen)]
-#[derive(Clone)]
 pub struct Array {
     data: Buffer,
     shape: Vec<usize>,
@@ -137,17 +136,22 @@ impl Array {
 #[pyclass(module = "plitzer._plitzer", frozen)]
 pub struct Batch {
     #[pyo3(get)]
-    tokens: Array,
+    tokens: Py<Array>,
     #[pyo3(get)]
-    lengths: Array,
+    lengths: Py<Array>,
 }
 
 impl Batch {
-    pub fn new(tokens: Vec<u32>, lengths: Vec<u32>, seq_len: usize) -> Self {
+    pub fn new(
+        py: Python<'_>,
+        tokens: Vec<u32>,
+        lengths: Vec<u32>,
+        seq_len: usize,
+    ) -> PyResult<Self> {
         let lanes = lengths.len();
-        Batch {
-            tokens: Array::new(tokens, vec![lanes, seq_len], "tokens"),
-            lengths: Array::new(lengths, vec![lanes], "lengths"),
-        }
+        Ok(Batch {
+            tokens: Py::new(py, Array::new(tokens, vec![lanes, seq_len], "tokens"))?,
+            lengths: Py::new(py, Array::new(lengths, vec![lanes], "lengths"))?,
+        })
     }
 }

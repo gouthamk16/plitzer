@@ -252,6 +252,11 @@ async fn unwritable_cache_fails_before_the_build() {
     let cache = blocker.join("index.bin");
     let got = open(&store, &prefix, &cache).await;
     assert!(matches!(got, Err(Error::Cache(_))), "{got:?}");
+    let got = open(&store, &prefix, dir.path()).await;
+    assert!(
+        matches!(got, Err(Error::Cache(_))),
+        "a folder as the cache: {got:?}"
+    );
     // A missing cache folder is made.
     std::fs::remove_file(dir.path().join("data/z.parquet")).unwrap();
     let nested = dir.path().join("a/b/index.bin");

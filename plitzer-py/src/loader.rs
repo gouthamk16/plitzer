@@ -5,8 +5,7 @@ use std::mem::ManuallyDrop;
 use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard, TryLockError};
 
-use plitzer::checkpoint::{Checkpoint, Config};
-use plitzer::pack::Packing;
+use plitzer::checkpoint::Checkpoint;
 use plitzer::session::Session;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
@@ -15,7 +14,7 @@ use pyo3::types::{PyBytes, PyRange};
 use crate::array::Batch;
 use crate::errors::{checkpoint_error, session_error};
 use crate::runtime::block_on;
-use crate::settings::{int, locate};
+use crate::settings::{config, int, locate};
 
 /// The lanes of GPU `rank` of `world`, from one epoch to the next. Iterate
 /// it for the rest of the current epoch; the next iteration gives the next.
@@ -46,8 +45,11 @@ impl Loader {
         self.check_process()?;
         match self.state.try_lock() {
             Ok(state) => Ok(state),
-            // A panic in an earlier call is already a Python exception.
-            Err(TryLockError::Poisoned(e)) => Ok(e.into_inner()),
+            // A panic left the lanes part way through a step: refuse them,
+            // and keep the snapshot, which is still the last good state.
+            Err(TryLockError::Poisoned(_)) => Err(PyRuntimeError::new_err(
+                "an earlier call failed inside a step; make a new Loader and resume it from checkpoint()",
+            )),
             Err(TryLockError::WouldBlock) => Err(PyRuntimeError::new_err(
                 "another call is using this Loader; read checkpoint() and epoch at any time",
             )),
@@ -117,29 +119,14 @@ impl Loader {
         storage_options: Option<HashMap<String, String>>,
     ) -> PyResult<Self> {
         let (store, prefix, cache) = locate(location, storage_options, &column, cache)?;
-        let packing = Packing {
-            seq_len: int("seq_len", seq_len)?,
-            docs: int("docs", docs)?,
-            cap: int("cap", cap)?,
-            pad: int("pad", pad)?,
-        };
-        let config = Config {
-            column,
-            seed: int("seed", seed)?,
-            lanes: int("lanes", lanes)?,
-            window: int("window", window)?,
-            packing,
-        };
-        let (rank, world) = (int("rank", rank)?, int("world", world)?);
-        let open = Session::open(
-            store,
-            prefix,
-            &cache,
-            config,
-            rank,
-            world,
+        let config = config(column, [seed, lanes, window], [seq_len, docs, cap, pad])?;
+        let seq_len = config.packing.seq_len as usize;
+        let (rank, world, budget) = (
+            int("rank", rank)?,
+            int("world", world)?,
             int("budget", budget)?,
         );
+        let open = Session::open(store, prefix, &cache, config, rank, world, budget);
         let session = block_on(py, open)?.map_err(session_error)?;
         let state = State {
             session: ManuallyDrop::new(session),
@@ -148,7 +135,7 @@ impl Loader {
         Ok(Loader {
             snapshot: Mutex::new(state.session.checkpoint()),
             state: Mutex::new(state),
-            seq_len: packing.seq_len as usize,
+            seq_len,
             pid: std::process::id(),
         })
     }
@@ -180,7 +167,8 @@ impl Loader {
         self.save(&state);
         let real = real.map_err(session_error)?;
         state.exhausted = real.is_none();
-        Ok(real.map(|lengths| Batch::new(tokens, lengths, self.seq_len)))
+        let batch = real.map(|lengths| Batch::new(py, tokens, lengths, self.seq_len));
+        batch.transpose()
     }
 
     /// Goes to the start of `epoch` if it is later than the current one. An

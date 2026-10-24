@@ -7,6 +7,8 @@ use std::sync::Arc;
 
 use object_store::ObjectStore;
 use object_store::path::Path;
+use plitzer::checkpoint::Config;
+use plitzer::pack::Packing;
 use pyo3::prelude::*;
 
 use crate::errors::{ConfigError, store_error};
@@ -16,6 +18,27 @@ use crate::errors::{ConfigError, store_error};
 pub fn int<T: TryFrom<i128>>(name: &str, value: i128) -> PyResult<T> {
     T::try_from(value)
         .map_err(|_| ConfigError::new_err(format!("{name} = {value} is out of range")))
+}
+
+/// The config from Python integers, each checked to fit.
+pub fn config(
+    column: String,
+    [seed, lanes, window]: [i128; 3],
+    [seq_len, docs, cap, pad]: [i128; 4],
+) -> PyResult<Config> {
+    let packing = Packing {
+        seq_len: int("seq_len", seq_len)?,
+        docs: int("docs", docs)?,
+        cap: int("cap", cap)?,
+        pad: int("pad", pad)?,
+    };
+    Ok(Config {
+        column,
+        seed: int("seed", seed)?,
+        lanes: int("lanes", lanes)?,
+        window: int("window", window)?,
+        packing,
+    })
 }
 
 /// The store and prefix of `location`, and the index cache: `cache`, else

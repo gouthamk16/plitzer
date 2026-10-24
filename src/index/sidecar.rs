@@ -102,6 +102,10 @@ fn file(r: &mut Reader) -> Option<File> {
 /// before any footer is read. No file stays open during the build, so a
 /// process killed then leaves nothing behind.
 pub(super) fn check_writable(path: &std::path::Path) -> io::Result<()> {
+    if path.is_dir() {
+        let why = format!("the index cache {} is a folder, not a file", path.display());
+        return Err(io::Error::new(io::ErrorKind::IsADirectory, why));
+    }
     tempfile::NamedTempFile::new_in(folder(path)?).map(drop)
 }
 

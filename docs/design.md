@@ -494,7 +494,7 @@ The fingerprint is the 64-bit FNV-1a hash of the same layout, with no ETags and 
 | `build_reads_row_groups` | Unit | The row groups of Parquet files in nested folders, in path order. Other files are not in the index. `locate` is correct at each file edge. |
 | `open_writes_and_reuses_cache` | Unit | `open` writes the sidecar, and a second `open` gives the same index. |
 | `open_uses_cache_without_footers` | Unit | A sidecar with false row counts that matches the list of files is used, so no footer is read. A different column or a stale ETag causes a new build. |
-| `unwritable_cache_fails_before_the_build` | Unit | A cache below a file gives `Error::Cache`, not the `Error::Footer` of a corrupt file in the dataset. A missing cache folder is made. |
+| `unwritable_cache_fails_before_the_build` | Unit | A cache below a file, and a cache that is a folder, give `Error::Cache`, not the `Error::Footer` of a corrupt file in the dataset. A missing cache folder is made. |
 | `open_rebuilds_on_change` | Unit | A changed file, a new file and a corrupt sidecar each cause a new build. |
 | `bad_footer_names_file` | Unit | A bad magic number, a file that is too short and a footer length larger than the file each give `Error::Footer` with the path. |
 | `no_files_is_an_error` | Unit | A prefix with no `.parquet` files gives `Error::NoFiles`. |
@@ -859,8 +859,8 @@ pub enum Error { Store(object_store::Error), Scheme(String), Option(String) }
 class Loader:
     def __init__(self, location: str, *, seed: int, lanes: int, window: int, seq_len: int,
                  docs: int, cap: int, pad: int, budget: int, rank: int = 0, world: int = 1,
-                 column: str = "tokens", cache: str | None = None,
-                 storage_options: Mapping[str, str] | None = None) -> None: ...
+                 column: str = "tokens", cache: str | os.PathLike[str] | None = None,
+                 storage_options: dict[str, str] | None = None) -> None: ...
     def __iter__(self) -> Loader: ...           # the rest of the current epoch
     def __next__(self) -> Batch: ...
     def set_epoch(self, epoch: int) -> None: ...
@@ -930,6 +930,8 @@ An Arrow consumer moves the structs out of the capsules and sets their `release`
 
 - One wheel for each platform covers CPython 3.11 and later (abi3). It does not cover the free-threaded build.
 - During a step, only `checkpoint()`, `epoch` and `lanes` work from another thread or a signal handler. `__next__`, `__iter__`, `set_epoch` and `resume` give `RuntimeError` until the step ends.
+- If a step stops with a panic, the `Loader` gives `RuntimeError` for each later step: its lanes can be part way through the step. `checkpoint()` still gives the last good state, so a new `Loader` can resume from it.
+- Each epoch has its own peak (section 5.7), and the loader of each epoch checks the budget when it starts. Thus a budget that fits epoch 0 can give `ConfigError` at the start of a later epoch. The error gives the bytes that are necessary. The budget is not part of a checkpoint, so a resume with a larger budget continues the run.
 - The data is writable. Two exports of one array share the same memory.
 - Signals are checked only on the main thread, as in Python.
 - In a forked child, a `Loader` leaks its session when Python frees it. A drop would stop runtime tasks, and a lock that a parent thread held at the fork stays held (D-56).

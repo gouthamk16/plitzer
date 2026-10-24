@@ -13,8 +13,8 @@ use pyo3::types::PyBytes;
 
 /// One global checkpoint from the parts of all GPUs, in any order.
 #[pyfunction]
-fn merge<'py>(py: Python<'py>, parts: Vec<Vec<u8>>) -> PyResult<Bound<'py, PyBytes>> {
-    let parts = (parts.iter().map(|p| Checkpoint::from_bytes(p)))
+fn merge<'py>(py: Python<'py>, parts: Vec<Bound<'py, PyBytes>>) -> PyResult<Bound<'py, PyBytes>> {
+    let parts = (parts.iter().map(|p| Checkpoint::from_bytes(p.as_bytes())))
         .collect::<Result<Vec<_>, _>>()
         .map_err(errors::checkpoint_error)?;
     let merged = Checkpoint::merge(parts).map_err(errors::checkpoint_error)?;

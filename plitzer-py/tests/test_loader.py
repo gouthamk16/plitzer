@@ -124,6 +124,7 @@ def test_non_strict_zip_keeps_ranks_together(make: MakeLoader) -> None:
 
 def test_batch_shapes_and_padding(make: MakeLoader) -> None:
     batch = next(make())
+    assert batch.tokens is batch.tokens
     assert batch.tokens.shape == (4, 8)
     assert batch.lengths.shape == (4,)
     tokens = np.from_dlpack(batch.tokens)
@@ -252,6 +253,8 @@ def test_resume_refuses_other_runs(make: MakeLoader) -> None:
         other.resume(saved)
     with pytest.raises(plitzer.CheckpointError):
         other.resume(b"not a checkpoint")
+    with pytest.raises(TypeError):
+        plitzer.merge([list(saved)])  # type: ignore[list-item]
     with pytest.raises(plitzer.CheckpointError, match="missing"):
         plitzer.merge([make(rank=1, world=2).checkpoint()])
 
