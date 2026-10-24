@@ -2,6 +2,7 @@ import gc
 import os
 import signal
 import sys
+import threading
 import time
 import warnings
 from collections.abc import Sequence
@@ -66,6 +67,45 @@ def test_iterator_protocol(make: MakeLoader) -> None:
     assert loader.epoch == 1
     second = epoch([loader])
     assert not same(first, second)
+
+
+def test_epoch_is_the_next_step(make: MakeLoader) -> None:
+    steps = len(epoch([make()]))
+    loader = make()
+    for _ in range(steps):
+        next(loader)
+    # The last step is taken: the next step, and a checkpoint, are epoch 1.
+    assert loader.epoch == 1
+    with pytest.raises(StopIteration):
+        next(loader)
+    assert loader.epoch == 1
+
+
+def test_checkpoint_during_a_step(make: MakeLoader) -> None:
+    """A checkpoint from another thread while steps wait without the GIL."""
+    loader = make()
+    stop = threading.Event()
+    saved: list[bytes] = []
+    errors: list[BaseException] = []
+
+    def watch() -> None:
+        while not stop.is_set():
+            try:
+                saved.append(loader.checkpoint())
+                assert loader.epoch in (0, 1)
+            except BaseException as e:  # reported below, in the test thread
+                errors.append(e)
+                return
+
+    watcher = threading.Thread(target=watch)
+    watcher.start()
+    epoch([loader])
+    stop.set()
+    watcher.join()
+    assert not errors, errors
+    assert saved
+    for part in saved[:: max(1, len(saved) // 50)]:
+        plitzer.merge([part])  # world 1: every part is a whole checkpoint
 
 
 def test_non_strict_zip_keeps_ranks_together(make: MakeLoader) -> None:
@@ -133,6 +173,15 @@ def test_unused_capsules_are_freed(make: MakeLoader) -> None:
         batch.tokens.__dlpack__(max_version=(1, 0))
     gc.collect()
     assert max_rss_kib() - before < 16 * 1024
+
+
+def test_no_default_cache_without_a_user_folder(
+    dataset: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for name in ["PLITZER_CACHE_DIR", "XDG_CACHE_HOME", "LOCALAPPDATA", "HOME"]:
+        monkeypatch.delenv(name, raising=False)
+    with pytest.raises(plitzer.ConfigError, match="cache"):
+        plitzer.Loader(str(dataset), **SETTINGS)  # type: ignore[arg-type]
 
 
 def test_default_cache_is_made_and_shared(
@@ -210,6 +259,14 @@ def test_resume_refuses_other_runs(make: MakeLoader) -> None:
 def test_bad_settings(make: MakeLoader, tmp_path: Path) -> None:
     with pytest.raises(plitzer.ConfigError, match="divide"):
         make(world=3)
+    with pytest.raises(plitzer.ConfigError, match="world"):
+        make(world=-1)
+    with pytest.raises(plitzer.ConfigError, match="#"):
+        plitzer.Loader(str(tmp_path.as_uri()) + "/data#2", **SETTINGS)  # type: ignore[arg-type]
+    blocker = tmp_path / "file"
+    blocker.write_bytes(b"")
+    with pytest.raises(plitzer.ConfigError, match="cache"):
+        make(cache=blocker / "index")
     with pytest.raises(plitzer.ConfigError):
         make(storage_options={"region": "x"})
     with pytest.raises(plitzer.ConfigError, match="budget"):

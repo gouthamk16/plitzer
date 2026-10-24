@@ -101,7 +101,7 @@ Each term has only one definition in this document.
 | REQ-9 | The decoded tokens in memory stay at or below the budget, and a budget that the loader accepts never stops it. | `load::budget_is_checked_and_kept`. | Met |
 | REQ-10 | A resume with different settings or a different dataset stops with an error that names the field. | `checkpoint::check_names_the_field` and `session::resume_refuses_other_runs`. | Met |
 | REQ-11 | Python reads each batch without a copy, through DLPack and Arrow. | `test_dlpack_versioned_and_legacy`, `test_arrow_export` and `test_data_outlives_the_batch_and_the_loader`. | Met |
-| REQ-12 | Input from Python gives a Python exception, never a panic or a wait with no end. | `test_bad_settings`, `test_resume_refuses_other_runs` and `test_forked_child_makes_its_own_loader`. A manual test: Ctrl-C during a stopped S3 read gives `KeyboardInterrupt` in 0.51 s. | Met |
+| REQ-12 | Input from Python gives a Python exception, never a panic or a wait with no end. | `test_bad_settings`, `test_resume_refuses_other_runs` and `test_forked_child_makes_its_own_loader`. Manual tests: Ctrl-C during a stopped S3 read gives `KeyboardInterrupt` in 0.51 s. A SIGUSR1 handler that calls `checkpoint()` during a stopped S3 read saves a complete checkpoint. | Met |
 
 ## 4. System overview
 
@@ -831,6 +831,7 @@ pub enum Error { Store(object_store::Error), Scheme(String), Option(String) }
 - The S3 builder fails only on settings, such as a missing bucket. Thus its error is also `Error::Option`, and Python shows it as `ConfigError`.
 - A local folder takes no options, so an option for a local folder is an error.
 - Only text with `://` is a URL. `C:\data` and `runs:2024/data` parse as URLs, but they are local paths.
+- A URL with `?` or `#` gives `Error::Option`. These characters can be part of a folder or key name, and the URL parser would drop what follows them, so another dataset would open (D-62).
 - `id` is the same for each spelling of one dataset, and different for two datasets. It holds no keys or tokens, so new credentials keep the same cache. It holds the endpoint from the options or the environment, so two servers with the same bucket name get different caches (D-58).
 
 **Limits:**
@@ -844,7 +845,7 @@ pub enum Error { Store(object_store::Error), Scheme(String), Option(String) }
 | `opens_local_folders` | Unit | A path, the path with a separator at the end, and a `file://` URL open the same folder with the same `id`. Another folder has another `id`. |
 | `a_colon_in_a_path_is_not_a_scheme` | Unit | A folder named `runs:2024` opens as a folder (POSIX). |
 | `s3_id_has_the_endpoint_and_no_keys` | Unit | Two secret keys give one `id`, and two endpoints give two. The `id` holds no key. |
-| `refuses_what_it_cannot_open` | Unit | A missing folder, an unknown scheme and an option for a local folder each give their error. |
+| `refuses_what_it_cannot_open` | Unit | A missing folder, an unknown scheme, an option for a local folder, and URLs with `?` or `#` each give their error. |
 | `refuses_unknown_s3_options` | Unit | An unknown S3 option and a URL with no bucket give `Error::Option`. |
 | `open_an_s3_url` | Integration | An `s3://` URL with options opens versitygw with the correct prefix. |
 
@@ -875,18 +876,21 @@ class PlitzerError(Exception); ConfigError, CheckpointError, DataError (PlitzerE
 
 **Design:**
 
-- Each process has one multi-thread tokio runtime. A forked child makes a new runtime, and it never drops the copy of the parent's runtime: that drop would wait for threads that the child does not have.
+- Each process has one multi-thread tokio runtime with at most 8 worker threads and 32 threads for blocking calls. A loader has at most 16 reads in flight, and each GPU has its own process, so one worker for each CPU would start hundreds of threads in each process (D-60). A forked child makes a new runtime, and it never drops the copy of the parent's runtime: that drop would wait for threads that the child does not have.
 - Each `Loader` records the PID of the process that made it. In a forked child, a copied `Loader` gives `RuntimeError` for `__next__`, `__iter__`, `set_epoch` and `resume`. A new `Loader` in the child works.
+- The `Loader` is frozen. A lock holds its session for the whole of a step, and a snapshot holds the checkpoint before the next step. `checkpoint()`, `epoch` and `lanes` read only the snapshot, so a signal handler or another thread can read them during a step. A second call that needs the session during a step gets `RuntimeError`, never a deadlock (D-59).
+- `epoch` is the epoch of the next step, as in `checkpoint()`. After the last step of an epoch, it is the next epoch.
 - `__next__` releases the GIL and waits on the runtime for 100 ms at a time. Between these waits it checks for signals. Thus Ctrl-C gives `KeyboardInterrupt` in 100 ms or less, and it drops the `next` future. `Loader::next` is cancel safe (D-44), so the next call does the same step again.
 - At the end of an epoch, `__next__` raises `StopIteration`, and it raises it again at each later call, as a Python iterator must. `__iter__` starts the next epoch: a new `for` loop gives it. `__iter__` also moves on a loader whose last step is taken but which did not raise `StopIteration` yet, such as the second loader in a `zip` (D-55).
 - Each step writes into a new `Vec<u32>`. An arrow `Buffer` holds it, and each export holds a clone of that `Buffer`. Thus an exported array stays valid after the batch, the loader and the export call.
-- The default cache is `$PLITZER_CACHE_DIR`, else the user cache folder, then `plitzer/<hash>.idx`. The hash is of the `id` of the store (section 5.10) and the column, not of the location text. Thus `data` from two folders gets two files, and `data/` and `file:///…/data` share one (D-54). The index makes the cache folder if it does not exist.
+- The default cache is `$PLITZER_CACHE_DIR`, else the user cache folder, then `plitzer/<hash>.idx`. The hash is of the `id` of the store (section 5.10) and the column, not of the location text. Thus `data` from two folders gets two files, and `data/` and `file:///…/data` share one (D-54). The index makes the cache folder if it does not exist. With no user cache folder (no `HOME`, `XDG_CACHE_HOME` or `LOCALAPPDATA`), there is no default, and `Loader` gives `ConfigError` (D-61).
+- Integer settings come in as Python integers of any size. A value that does not fit, such as `world=-1`, gives `ConfigError`.
 
 The errors map to Python exceptions as follows:
 
 | Rust error | Python exception |
 |---|---|
-| `session::Error::Config`, `load::Error::Budget`, `store::Error::Scheme`, `store::Error::Option` | `ConfigError` |
+| `session::Error::Config`, `load::Error::Budget`, `index::Error::Cache`, `store::Error::Scheme`, `store::Error::Option`, an integer out of range, no cache folder | `ConfigError` |
 | `checkpoint::Error`, `session::Error::Checkpoint` | `CheckpointError` |
 | `store::Error::Store`, index, read and other load errors | `DataError` |
 
@@ -925,7 +929,7 @@ An Arrow consumer moves the structs out of the capsules and sets their `release`
 **Limits:**
 
 - One wheel for each platform covers CPython 3.11 and later (abi3). It does not cover the free-threaded build.
-- A `Loader` is not shared between threads. A second thread that calls it during a step gets an error from PyO3. A Python signal handler that runs during a step gets the same error, so a handler must only set a flag. The step cannot release the `Loader`: a new load started in each 100 ms slice would never finish on a slow store.
+- During a step, only `checkpoint()`, `epoch` and `lanes` work from another thread or a signal handler. `__next__`, `__iter__`, `set_epoch` and `resume` give `RuntimeError` until the step ends.
 - The data is writable. Two exports of one array share the same memory.
 - Signals are checked only on the main thread, as in Python.
 - In a forked child, a `Loader` leaks its session when Python frees it. A drop would stop runtime tasks, and a lock that a parent thread held at the fork stays held (D-56).
@@ -936,18 +940,21 @@ An Arrow consumer moves the structs out of the capsules and sets their `release`
 |---|---|---|
 | `test_ranks_split_the_global_batch` | pytest | Two loaders on world 2 give the batches of one loader on world 1. |
 | `test_iteration_ends_each_epoch` | pytest | A `for` loop ends at the end of each epoch, and the next loop gives the next epoch. |
+| `test_epoch_is_the_next_step` | pytest | After the last step of an epoch, `epoch` is 1 before and after `StopIteration`. |
+| `test_checkpoint_during_a_step` | pytest | Another thread reads `checkpoint()` and `epoch` during all the steps of an epoch with no error. Each checkpoint it reads is complete. |
 | `test_iterator_protocol` | pytest | After the end of an epoch, `next` raises `StopIteration` again. The next `for` loop gives the next epoch. |
 | `test_non_strict_zip_keeps_ranks_together` | pytest | Two epochs through `zip` (not strict) of two world-2 loaders give the batches of one world-1 loader. |
 | `test_batch_shapes_and_padding` | pytest | The shapes and the int32 type are correct. After the real tokens, each row holds the pad token. |
 | `test_dlpack_versioned_and_legacy` | pytest | Both ABIs give the same data, with the correct capsule names. |
 | `test_unused_capsules_are_freed` | pytest | 300 000 capsules that nobody takes are freed: the peak memory grows less than 16 MiB (Linux). |
+| `test_no_default_cache_without_a_user_folder` | pytest | With no user cache folder and no `cache`, `Loader` gives `ConfigError`. |
 | `test_default_cache_is_made_and_shared` | pytest | With no `cache`, the index makes its cache folder. Three spellings of one folder use one cache file. |
 | `test_data_outlives_the_batch_and_the_loader` | pytest | DLPack and Arrow data stay correct after the batch and the loader are deleted. |
 | `test_copy_and_device` | pytest | `copy=True` gives separate memory. A device that is not the CPU gives `BufferError`. |
 | `test_arrow_export` | pytest | pyarrow reads `tokens` as a `FixedShapeTensorArray` and `lengths` as int32. |
 | `test_resume_on_another_world` | pytest | Parts from world 2, merged, resume on world 4 with the same tail as one run. |
 | `test_resume_refuses_other_runs` | pytest | A different L, bad bytes and an incomplete merge give `CheckpointError`. |
-| `test_bad_settings` | pytest | Bad settings give `ConfigError`. A missing folder gives `DataError`. |
+| `test_bad_settings` | pytest | Bad settings, `world=-1`, a URL with `#` and a cache below a file give `ConfigError`. A missing folder gives `DataError`. |
 | `test_forked_child_makes_its_own_loader` | pytest | In a child of `os.fork`, the copied loader gives `RuntimeError`. A new loader gives the same first batch as the parent. The child frees the copy with no wait. |
 | `test_s3_matches_local` | pytest | The same files on versitygw and on local disk give the same batches. |
 
@@ -1031,6 +1038,10 @@ This component is not in the code yet. Its section will have the full set of par
 | D-56 | In a forked child, a `Loader` leaks its session. | A drop stops runtime tasks, which can wait on a lock that no thread in the child will release. | Drop as usual and risk a hang at exit. | #18 |
 | D-57 | `Index::open` makes and deletes a test file in the cache folder before it reads the footers. | A cache folder that cannot be written then fails at once, not after the full footer scan. No file stays open during the build. | Write the cache after the build only, or keep the temporary file open during the build. | #18 |
 | D-58 | The default cache name is a hash of `store::Location::id`, which holds the endpoint but no credentials. | New credentials keep the cache. Two servers with the same bucket name do not share it. | A hash of all storage options. | #18 |
+| D-59 | A frozen `Loader` with a lock for the session and a checkpoint snapshot that other calls read. | A preemption signal handler or a background thread can save a checkpoint during a step. A second step from another thread gets an error, not a deadlock. | A borrow for each call, which refuses all calls during a step. A lock that each call takes, which deadlocks a signal handler. | #18 |
+| D-60 | The runtime has at most 8 worker threads and 32 blocking threads. | Each GPU process has its own runtime, and a loader has at most 16 reads in flight. | One worker for each CPU: hundreds of threads in each process on a large node. | #18 |
+| D-61 | No default cache without a user cache folder. | A shared temporary folder lets other users break or poison the index. | A shared folder in the temporary directory. | #18 |
+| D-62 | A URL with `?` or `#` is an error. | The parser drops what follows them, and they can be part of a real name, so another dataset would open with no error. | Drop the query and the fragment. | #18 |
 | D-22 | The sidecar uses its own binary format and FNV-1a. | No new dependency, and the bytes are fixed by our code. | `serde` with `bincode`, or JSON. | #10 |
 | D-23 | A sidecar that does not exist or is corrupt causes a new build. | The sidecar is only a cache. | An error that the user must correct. | #10 |
 | D-24 | The index keeps the place of each token column chunk, and the reader reads no footer. | A window has row groups from approximately W files. A footer read for each row group costs approximately 1.5 times the data. | Read the footer of each file again, or keep footers in memory (9.4 GB for FineWeb-Edu). | #12 |

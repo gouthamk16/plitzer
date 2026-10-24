@@ -9,6 +9,13 @@ use tokio::runtime::Runtime;
 /// The runtime of this process, with the PID it belongs to.
 static RUNTIME: Mutex<Option<(u32, &'static Runtime)>> = Mutex::new(None);
 
+/// Worker threads: reads and their decodes, for one GPU's lanes.
+const WORKERS: usize = 8;
+
+/// Threads for blocking calls, such as local file reads: twice the reads a
+/// loader keeps in flight.
+const BLOCKING: usize = 32;
+
 /// How long Python waits without a signal check. Ctrl-C takes at most this.
 const SLICE: Duration = Duration::from_millis(100);
 
@@ -21,7 +28,13 @@ fn runtime() -> &'static Runtime {
     match *runtime {
         Some((owner, runtime)) if owner == pid => runtime,
         _ => {
+            // Each GPU's process has its own runtime, and a loader has at most
+            // 16 reads in flight: one worker per CPU would start hundreds of
+            // threads per process on a large node.
+            let cpus = std::thread::available_parallelism().map_or(4, |n| n.get());
             let new = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(cpus.min(WORKERS))
+                .max_blocking_threads(BLOCKING)
                 .enable_all()
                 .thread_name("plitzer")
                 .build()

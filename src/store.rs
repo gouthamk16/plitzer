@@ -61,6 +61,12 @@ pub fn open(location: &str, options: &[(String, String)]) -> Result<Location, Er
         return local(std::path::Path::new(location), options);
     }
     let url = Url::parse(location).map_err(|e| Error::Option(format!("{location:?}: {e}")))?;
+    // `?` and `#` may be part of a real folder or key name; dropping what
+    // follows them would open another dataset.
+    if url.query().is_some() || url.fragment().is_some() {
+        let why = format!("{location:?} has a `?` or `#`; percent-encode it as %3F or %23");
+        return Err(Error::Option(why));
+    }
     match url.scheme() {
         "file" => {
             let path = (url.to_file_path())
@@ -159,6 +165,9 @@ mod tests {
         let missing = missing.to_str().unwrap();
         assert!(matches!(open(missing, &[]), Err(Error::Store(_))));
         assert!(matches!(open("gs://bucket/x", &[]), Err(Error::Scheme(_))));
+        for odd in ["file:///data/runs#2", "file:///data?x=1", "s3://b/runs#2"] {
+            assert!(matches!(open(odd, &[]), Err(Error::Option(_))), "{odd}");
+        }
         let options = [("region".to_string(), "x".to_string())];
         let here = dir.path().to_str().unwrap();
         assert!(matches!(open(here, &options), Err(Error::Option(_))));

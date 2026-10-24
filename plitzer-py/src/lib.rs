@@ -5,6 +5,7 @@ mod dlpack;
 mod errors;
 mod loader;
 mod runtime;
+mod settings;
 
 use plitzer::checkpoint::Checkpoint;
 use pyo3::prelude::*;

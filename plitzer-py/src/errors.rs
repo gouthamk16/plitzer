@@ -1,6 +1,6 @@
 //! The Python exceptions, and which Rust error raises which.
 
-use plitzer::{checkpoint, load, session, store};
+use plitzer::{checkpoint, index, load, session, store};
 use pyo3::create_exception;
 use pyo3::exceptions::PyException;
 use pyo3::prelude::*;
@@ -33,9 +33,9 @@ create_exception!(
 pub fn session_error(e: session::Error) -> PyErr {
     let message = e.to_string();
     match e {
-        session::Error::Config(_) | session::Error::Load(load::Error::Budget { .. }) => {
-            ConfigError::new_err(message)
-        }
+        session::Error::Config(_)
+        | session::Error::Load(load::Error::Budget { .. })
+        | session::Error::Index(index::Error::Cache(_)) => ConfigError::new_err(message),
         session::Error::Checkpoint(_) => CheckpointError::new_err(message),
         session::Error::Index(_) | session::Error::Read(_) | session::Error::Load(_) => {
             DataError::new_err(message)

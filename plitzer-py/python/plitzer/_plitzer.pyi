@@ -1,5 +1,6 @@
+import os
 import sys
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 
 if sys.version_info >= (3, 13):
     from types import CapsuleType
@@ -72,8 +73,8 @@ class Loader:
         rank: int = 0,
         world: int = 1,
         column: str = "tokens",
-        cache: str | None = None,
-        storage_options: Mapping[str, str] | None = None,
+        cache: str | os.PathLike[str] | None = None,
+        storage_options: dict[str, str] | None = None,
     ) -> None: ...
     def __iter__(self) -> Loader:
         """The rest of the current epoch, or the next epoch if it has ended."""
@@ -82,10 +83,15 @@ class Loader:
     def set_epoch(self, epoch: int) -> None:
         """Go to the start of `epoch` if it is later than the current one."""
     def checkpoint(self) -> bytes:
-        """This GPU's part of a checkpoint. `merge` joins the parts of all GPUs."""
+        """This GPU's part of a checkpoint: the state before the next step.
+
+        It works during a step too, such as from a signal handler or another
+        thread. `merge` joins the parts of all GPUs.
+        """
     def resume(self, checkpoint: bytes) -> None: ...
     @property
-    def epoch(self) -> int: ...
+    def epoch(self) -> int:
+        """The epoch of the next step, as in `checkpoint()`."""
     @property
     def lanes(self) -> range: ...
 
