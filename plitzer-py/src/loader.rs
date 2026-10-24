@@ -1,7 +1,6 @@
 //! `Loader`: one GPU's `Session`, driven from Python.
 
 use std::collections::HashMap;
-use std::mem::ManuallyDrop;
 use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard, TryLockError};
 
@@ -32,10 +31,24 @@ pub struct Loader {
 }
 
 struct State {
-    session: ManuallyDrop<Session>,
+    /// Taken only by `Drop`, in a forked child.
+    session: Option<Session>,
     /// Set when the epoch ended, so `__next__` keeps raising `StopIteration`
     /// as Python iterators do, until `__iter__` starts the next epoch.
     exhausted: bool,
+}
+
+impl State {
+    fn session(&mut self) -> &mut Session {
+        self.session.as_mut().expect("only Drop takes the session")
+    }
+
+    fn checkpoint(&self) -> Checkpoint {
+        self.session
+            .as_ref()
+            .expect("only Drop takes the session")
+            .checkpoint()
+    }
 }
 
 impl Loader {
@@ -57,7 +70,8 @@ impl Loader {
     }
 
     fn save(&self, state: &State) {
-        *self.snapshot() = state.session.checkpoint();
+        let checkpoint = state.checkpoint();
+        *self.snapshot() = checkpoint;
     }
 
     fn snapshot(&self) -> MutexGuard<'_, Checkpoint> {
@@ -83,10 +97,9 @@ impl Drop for Loader {
         // A forked child has none of the runtime's threads, and a lock they
         // held at the fork stays held. Dropping the session aborts runtime
         // tasks, which could wait on such a lock, so the child leaks it.
-        if self.pid == std::process::id() {
+        if self.pid != std::process::id() {
             let state = self.state.get_mut().unwrap_or_else(|e| e.into_inner());
-            // SAFETY: the session is not used after this.
-            unsafe { ManuallyDrop::drop(&mut state.session) }
+            std::mem::forget(state.session.take());
         }
     }
 }
@@ -129,11 +142,11 @@ impl Loader {
         let open = Session::open(store, prefix, &cache, config, rank, world, budget);
         let session = block_on(py, open)?.map_err(session_error)?;
         let state = State {
-            session: ManuallyDrop::new(session),
+            session: Some(session),
             exhausted: false,
         };
         Ok(Loader {
-            snapshot: Mutex::new(state.session.checkpoint()),
+            snapshot: Mutex::new(state.checkpoint()),
             state: Mutex::new(state),
             seq_len,
             pid: std::process::id(),
@@ -146,9 +159,9 @@ impl Loader {
         {
             let mut state = slf.state()?;
             state.exhausted = false;
-            if state.session.ended() {
-                let next = state.session.epoch() + 1;
-                state.session.set_epoch(next);
+            if state.session().ended() {
+                let next = state.session().epoch() + 1;
+                state.session().set_epoch(next);
             }
             slf.save(&state);
         }
@@ -161,8 +174,8 @@ impl Loader {
         if state.exhausted {
             return Ok(None);
         }
-        let mut tokens = vec![0; state.session.lanes().len() * self.seq_len];
-        let real = block_on(py, state.session.next(&mut tokens))?;
+        let mut tokens = vec![0; state.session().lanes().len() * self.seq_len];
+        let real = block_on(py, state.session().next(&mut tokens))?;
         // Also after an error: the session then stands before the failed step.
         self.save(&state);
         let real = real.map_err(session_error)?;
@@ -173,11 +186,12 @@ impl Loader {
 
     /// Goes to the start of `epoch` if it is later than the current one. An
     /// ended iterator stays ended when the call changes nothing.
-    fn set_epoch(&self, epoch: u64) -> PyResult<()> {
+    fn set_epoch(&self, epoch: i128) -> PyResult<()> {
+        let epoch: u64 = int("epoch", epoch)?;
         let mut state = self.state()?;
-        if epoch > state.session.epoch() {
+        if epoch > state.session().epoch() {
             state.exhausted = false;
-            state.session.set_epoch(epoch);
+            state.session().set_epoch(epoch);
             self.save(&state);
         }
         Ok(())
@@ -188,13 +202,16 @@ impl Loader {
     /// `merge` joins the parts of all GPUs into one that resumes on any
     /// number of GPUs.
     fn checkpoint<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
-        PyBytes::new(py, &self.snapshot().to_bytes())
+        // The snapshot lock is never held while Python runs: Python can
+        // release the GIL, and `save` takes the lock while holding it.
+        let bytes = self.snapshot().to_bytes();
+        PyBytes::new(py, &bytes)
     }
 
     fn resume(&self, checkpoint: &[u8]) -> PyResult<()> {
         let mut state = self.state()?;
         let checkpoint = Checkpoint::from_bytes(checkpoint).map_err(checkpoint_error)?;
-        state.session.resume(&checkpoint).map_err(session_error)?;
+        state.session().resume(&checkpoint).map_err(session_error)?;
         state.exhausted = false;
         self.save(&state);
         Ok(())
@@ -209,8 +226,10 @@ impl Loader {
 
     #[getter]
     fn lanes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyRange>> {
-        let snapshot = self.snapshot();
-        let start = snapshot.first_lane as isize;
-        PyRange::new(py, start, start + snapshot.lanes.len() as isize)
+        let (start, len) = {
+            let snapshot = self.snapshot();
+            (snapshot.first_lane as isize, snapshot.lanes.len() as isize)
+        };
+        PyRange::new(py, start, start + len)
     }
 }

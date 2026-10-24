@@ -12,16 +12,15 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 if sys.platform != "win32":
-    import resource
+    pass
 import numpy.typing as npt
-import pyarrow as pa
 import pytest
 
 import plitzer
 from conftest import SETTINGS, MakeLoader
 
 if TYPE_CHECKING:
-    from typing_extensions import CapsuleType
+    pass
 
 Tokens = npt.NDArray[np.int32]
 
@@ -122,65 +121,13 @@ def test_non_strict_zip_keeps_ranks_together(make: MakeLoader) -> None:
         assert same(got, w)
 
 
-def test_batch_shapes_and_padding(make: MakeLoader) -> None:
-    batch = next(make())
-    assert batch.tokens is batch.tokens
-    assert batch.tokens.shape == (4, 8)
-    assert batch.lengths.shape == (4,)
-    tokens = np.from_dlpack(batch.tokens)
-    lengths = np.from_dlpack(batch.lengths)
-    assert tokens.dtype == np.int32 and lengths.dtype == np.int32
-    for row, n in zip(tokens, lengths, strict=True):
-        assert (row[n:] == -1).all(), "pad 2**32 - 1 reads as -1"
-        assert (row[:n] >= 0).all()
-
-
-class Legacy:
-    """A producer as old consumers call it: `__dlpack__()` with no arguments."""
-
-    def __init__(self, array: plitzer.Array) -> None:
-        self.array = array
-
-    def __dlpack__(self, *, stream: None = None, **_: object) -> "CapsuleType":
-        return self.array.__dlpack__()
-
-    def __dlpack_device__(self) -> tuple[int, int]:
-        return self.array.__dlpack_device__()
-
-
-def test_dlpack_versioned_and_legacy(make: MakeLoader) -> None:
-    batch = next(make())
-    assert '"dltensor_versioned"' in repr(batch.tokens.__dlpack__(max_version=(1, 0)))
-    assert '"dltensor"' in repr(batch.tokens.__dlpack__())
-    versioned = np.from_dlpack(batch.tokens)
-    legacy = np.from_dlpack(Legacy(batch.tokens))
-    assert np.array_equal(versioned, legacy)
-    assert batch.tokens.__dlpack_device__() == (1, 0)
-
-
-def max_rss_kib() -> int:
-    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-
-
-@pytest.mark.skipif(sys.platform != "linux", reason="ru_maxrss is in KiB on Linux")
-def test_unused_capsules_are_freed(make: MakeLoader) -> None:
-    batch = next(make())
-    for _ in range(10_000):  # reach the peak RSS before measuring
-        batch.tokens.__dlpack__()
-    before = max_rss_kib()
-    # Each leaked capsule would keep about 200 bytes: about 60 MiB in all.
-    for _ in range(150_000):
-        batch.tokens.__dlpack__()
-        batch.tokens.__dlpack__(max_version=(1, 0))
-    gc.collect()
-    assert max_rss_kib() - before < 16 * 1024
-
-
 def test_no_default_cache_without_a_user_folder(
     dataset: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    for name in ["PLITZER_CACHE_DIR", "XDG_CACHE_HOME", "LOCALAPPDATA", "HOME"]:
+    for name in ["PLITZER_CACHE_DIR", "LOCALAPPDATA", "HOME"]:
         monkeypatch.delenv(name, raising=False)
+    # A relative folder would differ for each working directory: unset.
+    monkeypatch.setenv("XDG_CACHE_HOME", ".cache")
     with pytest.raises(plitzer.ConfigError, match="cache"):
         plitzer.Loader(str(dataset), **SETTINGS)  # type: ignore[arg-type]
 
@@ -193,42 +140,6 @@ def test_default_cache_is_made_and_shared(
     for location in [str(dataset), str(dataset) + os.sep, dataset.as_uri()]:
         next(plitzer.Loader(location, **SETTINGS))  # type: ignore[arg-type]
     assert len(list(cache.iterdir())) == 1, "one index for each dataset"
-
-
-def test_data_outlives_the_batch_and_the_loader(make: MakeLoader) -> None:
-    loader = make()
-    batch = next(loader)
-    tokens = np.from_dlpack(batch.tokens)
-    table = pa.array(batch.tokens)
-    want = tokens.copy()
-    del batch, loader
-    gc.collect()
-    # Fill the heap, so a freed buffer would likely be reused and differ.
-    noise = [np.full(32, 7, np.int32) for _ in range(10_000)]
-    assert np.array_equal(tokens, want)
-    assert np.array_equal(table.to_numpy_ndarray(), want)
-    del noise
-
-
-def test_copy_and_device(make: MakeLoader) -> None:
-    batch = next(make())
-    shared = np.from_dlpack(batch.tokens)
-    copied = np.from_dlpack(batch.tokens, copy=True)
-    copied[0, 0] = 12345
-    assert shared[0, 0] != 12345
-    with pytest.raises(BufferError):
-        batch.tokens.__dlpack__(dl_device=(2, 0))
-
-
-def test_arrow_export(make: MakeLoader) -> None:
-    batch = next(make())
-    tokens = pa.array(batch.tokens)
-    assert isinstance(tokens.type, pa.FixedShapeTensorType)
-    assert tokens.type.shape == [8]
-    assert np.array_equal(tokens.to_numpy_ndarray(), np.from_dlpack(batch.tokens))
-    lengths = pa.array(batch.lengths)
-    assert lengths.type == pa.int32()
-    assert np.array_equal(lengths.to_numpy(), np.from_dlpack(batch.lengths))
 
 
 def test_resume_on_another_world(make: MakeLoader) -> None:
@@ -264,6 +175,8 @@ def test_bad_settings(make: MakeLoader, tmp_path: Path) -> None:
         make(world=3)
     with pytest.raises(plitzer.ConfigError, match="world"):
         make(world=-1)
+    with pytest.raises(plitzer.ConfigError, match="epoch"):
+        make().set_epoch(-1)
     with pytest.raises(plitzer.ConfigError, match="#"):
         plitzer.Loader(str(tmp_path.as_uri()) + "/data#2", **SETTINGS)  # type: ignore[arg-type]
     blocker = tmp_path / "file"

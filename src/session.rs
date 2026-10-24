@@ -198,7 +198,16 @@ impl Session {
     }
 }
 
-/// Refuses the settings that the order and the packer would panic on.
+/// The most lanes: far past any real global batch. Each GPU keeps a state
+/// for each of its lanes, so a larger value could only exhaust memory.
+const MAX_LANES: u32 = 1 << 24;
+
+/// The most tokens in one step of one GPU, 4 GiB of output: far past any
+/// real batch, and a larger buffer could only exhaust memory.
+const MAX_STEP_TOKENS: u64 = 1 << 30;
+
+/// Refuses the settings that the order and the packer would panic on, and
+/// sizes that could only exhaust memory.
 fn validate(c: &Config, rank: u32, world: u32) -> Result<(), Error> {
     let why = if c.lanes == 0 || c.window == 0 {
         "lanes and window must be positive".to_string()
@@ -208,6 +217,10 @@ fn validate(c: &Config, rank: u32, world: u32) -> Result<(), Error> {
         format!("world {world} must divide {} lanes", c.lanes)
     } else if rank >= world {
         format!("rank {rank} out of range for world {world}")
+    } else if c.lanes > MAX_LANES {
+        format!("lanes {} is more than {MAX_LANES}", c.lanes)
+    } else if u64::from(c.lanes / world) * u64::from(c.packing.seq_len) > MAX_STEP_TOKENS {
+        format!("one step of one GPU holds more than {MAX_STEP_TOKENS} tokens")
     } else {
         return Ok(());
     };

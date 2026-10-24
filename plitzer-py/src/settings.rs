@@ -70,10 +70,11 @@ pub fn locate(
 /// once. With no user folder, there is no default: a shared temp folder
 /// would let other users break or poison the index.
 fn default_cache(key: impl Hash) -> Option<PathBuf> {
-    // An empty variable counts as unset, as the XDG spec says.
+    // An empty or relative variable counts as unset, as the XDG spec says:
+    // a relative folder would differ for each working directory.
     let var = |name: &str| {
-        let value = std::env::var_os(name).filter(|v| !v.is_empty());
-        value.map(PathBuf::from)
+        let value = std::env::var_os(name).map(PathBuf::from);
+        value.filter(|v| v.is_absolute())
     };
     let user = || {
         let dir = var("XDG_CACHE_HOME")

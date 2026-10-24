@@ -768,6 +768,7 @@ pub enum Error { Config(String), Index(index::Error), Read(read::Error),
 **Design:**
 
 - `open` checks the config, opens the index with `Index::open`, and makes the reader. The lanes are `gpu_lanes(B, world, rank)`.
+- `open` refuses more than 2²⁴ lanes, and more than 2³⁰ tokens in one step of one GPU. These sizes are far past any real batch, and a larger value could only use all the memory (D-63).
 - The session keeps the lane states to start from. `set_epoch` sets them to the start of a later epoch. It does nothing for the current epoch or an earlier one. `resume` takes them from a checkpoint after `check`.
 - `next` makes the loader of the epoch at the first step. At the end of the epoch, `next` returns `None`, and the session goes to step 0 of the next epoch.
 - If `next` fails, the session keeps the lane states of the loader and drops the loader. The next call makes a new loader and tries the same step again.
@@ -798,7 +799,7 @@ pub enum Error { Config(String), Index(index::Error), Read(read::Error),
 | `next_is_cancel_safe` | Unit | Over a store with 5 ms reads, calls of `next` that are dropped after one poll give the same batches as a run with no drops. |
 | `resume_refuses_other_runs` | Unit | A different L, a different seed and an added file each give `Mismatch` with the name of the field. |
 | `resume_needs_this_ranks_lanes` | Unit | A part resumes the rank that holds its lanes, and another rank refuses it. |
-| `open_refuses_bad_settings` | Unit | A world that does not divide B, a rank out of range, no GPUs, W = 0 and D = 0 each give `Error::Config`. |
+| `open_refuses_bad_settings` | Unit | A world that does not divide B, a rank out of range, no GPUs, W = 0, D = 0, 2²⁵ lanes and L = 2³² − 1 each give `Error::Config`. |
 | `next_retries_after_a_failed_read` | Unit | After a failed read and a repair of the file, the next calls give the same batches as a run with no failure. |
 
 ### 5.10 Store
@@ -878,13 +879,14 @@ class PlitzerError(Exception); ConfigError, CheckpointError, DataError (PlitzerE
 
 - Each process has one multi-thread tokio runtime with at most 8 worker threads and 32 threads for blocking calls. A loader has at most 16 reads in flight, and each GPU has its own process, so one worker for each CPU would start hundreds of threads in each process (D-60). A forked child makes a new runtime, and it never drops the copy of the parent's runtime: that drop would wait for threads that the child does not have.
 - Each `Loader` records the PID of the process that made it. In a forked child, a copied `Loader` gives `RuntimeError` for `__next__`, `__iter__`, `set_epoch` and `resume`. A new `Loader` in the child works.
-- The `Loader` is frozen. A lock holds its session for the whole of a step, and a snapshot holds the checkpoint before the next step. `checkpoint()`, `epoch` and `lanes` read only the snapshot, so a signal handler or another thread can read them during a step. A second call that needs the session during a step gets `RuntimeError`, never a deadlock (D-59).
+- The `Loader` is frozen. A lock holds its session for the whole of a step, and a snapshot holds the checkpoint before the next step. `checkpoint()`, `epoch` and `lanes` read only the snapshot, so a signal handler or another thread can read them during a step. A second call that needs the session during a step gets `RuntimeError`, never a deadlock (D-59). No call holds the snapshot lock while Python runs, because Python can release the GIL and `save` takes the lock while it holds the GIL.
 - `epoch` is the epoch of the next step, as in `checkpoint()`. After the last step of an epoch, it is the next epoch.
 - `__next__` releases the GIL and waits on the runtime for 100 ms at a time. Between these waits it checks for signals. Thus Ctrl-C gives `KeyboardInterrupt` in 100 ms or less, and it drops the `next` future. `Loader::next` is cancel safe (D-44), so the next call does the same step again.
 - At the end of an epoch, `__next__` raises `StopIteration`, and it raises it again at each later call, as a Python iterator must. `__iter__` starts the next epoch: a new `for` loop gives it. `__iter__` also moves on a loader whose last step is taken but which did not raise `StopIteration` yet, such as the second loader in a `zip` (D-55).
 - Each step writes into a new `Vec<u32>`. An arrow `Buffer` holds it, and each export holds a clone of that `Buffer`. Thus an exported array stays valid after the batch, the loader and the export call.
-- The default cache is `$PLITZER_CACHE_DIR`, else the user cache folder, then `plitzer/<hash>.idx`. The hash is of the `id` of the store (section 5.10) and the column, not of the location text. Thus `data` from two folders gets two files, and `data/` and `file:///…/data` share one (D-54). The index makes the cache folder if it does not exist. With no user cache folder (no `HOME`, `XDG_CACHE_HOME` or `LOCALAPPDATA`), there is no default, and `Loader` gives `ConfigError` (D-61).
-- Integer settings come in as Python integers of any size. A value that does not fit, such as `world=-1`, gives `ConfigError`.
+- The default cache is `$PLITZER_CACHE_DIR`, else the user cache folder, then `plitzer/<hash>.idx`. The hash is of the `id` of the store (section 5.10) and the column, not of the location text. Thus `data` from two folders gets two files, and `data/` and `file:///…/data` share one (D-54). The index makes the cache folder if it does not exist. These variables count only when they hold an absolute path: a relative folder would differ for each working directory. With no user cache folder (no absolute `HOME`, `XDG_CACHE_HOME` or `LOCALAPPDATA`), there is no default, and `Loader` gives `ConfigError` (D-61).
+- Integer settings, also the epoch of `set_epoch`, come in as Python integers of any size. A value that does not fit, such as `world=-1`, gives `ConfigError`.
+- If the runtime cannot start its threads, such as at a process limit, `Loader` gives `RuntimeError`.
 
 The errors map to Python exceptions as follows:
 
@@ -1044,6 +1046,7 @@ This component is not in the code yet. Its section will have the full set of par
 | D-60 | The runtime has at most 8 worker threads and 32 blocking threads. | Each GPU process has its own runtime, and a loader has at most 16 reads in flight. | One worker for each CPU: hundreds of threads in each process on a large node. | #18 |
 | D-61 | No default cache without a user cache folder. | A shared temporary folder lets other users break or poison the index. | A shared folder in the temporary directory. | #18 |
 | D-62 | A URL with `?` or `#` is an error. | The parser drops what follows them, and they can be part of a real name, so another dataset would open with no error. | Drop the query and the fragment. | #18 |
+| D-63 | `Session::open` refuses more than 2²⁴ lanes and more than 2³⁰ tokens in one step of one GPU. | These sizes are far past any real batch. Larger values could only use all memory, which stops the process with no Python exception. | No bound. | #18 |
 | D-22 | The sidecar uses its own binary format and FNV-1a. | No new dependency, and the bytes are fixed by our code. | `serde` with `bincode`, or JSON. | #10 |
 | D-23 | A sidecar that does not exist or is corrupt causes a new build. | The sidecar is only a cache. | An error that the user must correct. | #10 |
 | D-24 | The index keeps the place of each token column chunk, and the reader reads no footer. | A window has row groups from approximately W files. A footer read for each row group costs approximately 1.5 times the data. | Read the footer of each file again, or keep footers in memory (9.4 GB for FineWeb-Edu). | #12 |

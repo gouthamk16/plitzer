@@ -3,6 +3,7 @@
 use std::sync::Mutex;
 use std::time::Duration;
 
+use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use tokio::runtime::Runtime;
 
@@ -22,11 +23,11 @@ const SLICE: Duration = Duration::from_millis(100);
 /// The runtime of this process. A forked child gets a new one: it has none
 /// of the parent runtime's threads. The parent's runtime is leaked, never
 /// dropped, since its drop would wait for those threads.
-fn runtime() -> &'static Runtime {
+fn runtime() -> PyResult<&'static Runtime> {
     let mut runtime = RUNTIME.lock().unwrap_or_else(|e| e.into_inner());
     let pid = std::process::id();
     match *runtime {
-        Some((owner, runtime)) if owner == pid => runtime,
+        Some((owner, runtime)) if owner == pid => Ok(runtime),
         _ => {
             // Each GPU's process has its own runtime, and a loader has at most
             // 16 reads in flight: one worker per CPU would start hundreds of
@@ -38,10 +39,12 @@ fn runtime() -> &'static Runtime {
                 .enable_all()
                 .thread_name("plitzer")
                 .build()
-                .expect("cannot start the plitzer runtime threads");
+                .map_err(|e| {
+                    PyRuntimeError::new_err(format!("cannot start plitzer threads: {e}"))
+                })?;
             let new: &'static Runtime = Box::leak(Box::new(new));
             *runtime = Some((pid, new));
-            new
+            Ok(new)
         }
     }
 }
@@ -52,7 +55,7 @@ pub fn block_on<F: Future + Send>(py: Python<'_>, fut: F) -> PyResult<F::Output>
 where
     F::Output: Send,
 {
-    let runtime = runtime();
+    let runtime = runtime()?;
     let mut fut = std::pin::pin!(fut);
     loop {
         // `timeout` makes its timer at once, so it must be made in the runtime.
