@@ -262,6 +262,12 @@ async fn unwritable_cache_fails_before_the_build() {
         matches!(got, Err(Error::Cache(_))),
         "an empty path: {got:?}"
     );
+    // The check changes no file, also not a stale sidecar it then rebuilds.
+    let stale = dir.path().join("stale.bin");
+    std::fs::write(&stale, b"stale").unwrap();
+    let got = open(&store, &prefix, &stale).await;
+    assert!(matches!(got, Err(Error::Footer { .. })), "{got:?}");
+    assert_eq!(std::fs::read(&stale).unwrap(), b"stale");
     // A missing cache folder is made.
     std::fs::remove_file(dir.path().join("data/z.parquet")).unwrap();
     let nested = dir.path().join("a/b/index.bin");

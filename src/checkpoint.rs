@@ -158,7 +158,8 @@ impl Checkpoint {
             ));
         }
         parts.sort_by_key(|p| p.first_lane);
-        let mut lanes = Vec::with_capacity(config.lanes as usize);
+        // `config.lanes` comes from the bytes, so nothing is reserved from it.
+        let mut lanes = Vec::new();
         for p in parts {
             if p.first_lane as usize != lanes.len() {
                 let why = format!("lane {} is missing or held twice", lanes.len());

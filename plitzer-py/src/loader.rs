@@ -71,11 +71,14 @@ impl Loader {
 
     fn save(&self, state: &State) {
         let checkpoint = state.checkpoint();
-        *self.snapshot() = checkpoint;
+        *self.snapshot.lock().unwrap_or_else(|e| e.into_inner()) = checkpoint;
     }
 
-    fn snapshot(&self) -> MutexGuard<'_, Checkpoint> {
-        self.snapshot.lock().unwrap_or_else(|e| e.into_inner())
+    /// The snapshot, refused in a forked child: a parent thread may have
+    /// held its lock at the fork, and no thread in the child releases it.
+    fn snapshot(&self) -> PyResult<MutexGuard<'_, Checkpoint>> {
+        self.check_process()?;
+        Ok(self.snapshot.lock().unwrap_or_else(|e| e.into_inner()))
     }
 
     /// Refuses a loader copied into a forked child. Its session holds tasks
@@ -213,11 +216,11 @@ impl Loader {
     /// step. It works during a step too, such as from a signal handler.
     /// `merge` joins the parts of all GPUs into one that resumes on any
     /// number of GPUs.
-    fn checkpoint<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
+    fn checkpoint<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
         // The snapshot lock is never held while Python runs: Python can
         // release the GIL, and `save` takes the lock while holding it.
-        let bytes = self.snapshot().to_bytes();
-        PyBytes::new(py, &bytes)
+        let bytes = self.snapshot()?.to_bytes();
+        Ok(PyBytes::new(py, &bytes))
     }
 
     fn resume(&self, checkpoint: &[u8]) -> PyResult<()> {
@@ -232,14 +235,14 @@ impl Loader {
     /// The epoch of the next step. After the last step of an epoch it is
     /// the next epoch, as in `checkpoint()`.
     #[getter]
-    fn epoch(&self) -> u64 {
-        self.snapshot().epoch
+    fn epoch(&self) -> PyResult<u64> {
+        Ok(self.snapshot()?.epoch)
     }
 
     #[getter]
     fn lanes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyRange>> {
         let (start, len) = {
-            let snapshot = self.snapshot();
+            let snapshot = self.snapshot()?;
             (snapshot.first_lane as isize, snapshot.lanes.len() as isize)
         };
         PyRange::new(py, start, start + len)

@@ -322,6 +322,7 @@ impl Epoch {
     pub fn steps(&self) -> u64;
     pub fn lane_docs(&self, lane: u32) -> u64;
     pub fn lane(self: &Arc<Self>, lane: u32, state: LaneState, tokens: &impl Tokens) -> Lane;
+    pub fn check(&self, lane: u32, state: LaneState) -> Result<(), String>;  // step and leftover in range
 }
 impl Lane {
     pub fn fill(&mut self, tokens: &impl Tokens, out: &mut [u32]) -> u32;
@@ -468,7 +469,7 @@ The fingerprint is the 64-bit FNV-1a hash of the same layout, with no ETags and 
 - The cache check compares the ETag, because a file can change and keep its size (D-20).
 - The fingerprint does not include the ETag. A local ETag holds the inode and the modification time, which are different on each copy (D-21).
 - The sidecar uses its own small format. It needs no `serde` dependency, and a golden test pins the bytes (D-22).
-- Before a build, `open` makes the cache folder and writes an empty sidecar at the cache path, as it writes the real one. A cache that cannot be written, such as a folder, an empty path or the file of another user, then fails before the footer scan, which takes long on a large dataset (D-57). If the write after the build fails, such as on a full disk, `open` still returns the index: the next start builds it again.
+- Before a build, `open` makes the cache folder and a file in it, and it opens an existing sidecar for writing. It refuses a cache path that is a folder or has no file name. It changes no file, because another process can have just written a good sidecar. A cache that cannot be written then fails before the footer scan, which takes long on a large dataset (D-57). If the write after the build fails, such as on a full disk, `open` still returns the index: the next start builds it again.
 - If the sidecar does not exist or is corrupt, `open` builds the index again. This is not an error. The sidecar is only a cache (D-23).
 - The module writes the sidecar to a temporary file with a unique name and then renames it. Thus the processes of all GPUs on one node can write at the same time, and no process reads a half-written sidecar.
 - Windows does not replace a file while a different process has it open or replaces it. If the rename fails and the sidecar already has the same bytes, a different process wrote the same index, and the write is complete. If not, the module tries again up to five times.
@@ -494,7 +495,7 @@ The fingerprint is the 64-bit FNV-1a hash of the same layout, with no ETags and 
 | `build_reads_row_groups` | Unit | The row groups of Parquet files in nested folders, in path order. Other files are not in the index. `locate` is correct at each file edge. |
 | `open_writes_and_reuses_cache` | Unit | `open` writes the sidecar, and a second `open` gives the same index. |
 | `open_uses_cache_without_footers` | Unit | A sidecar with false row counts that matches the list of files is used, so no footer is read. A different column or a stale ETag causes a new build. |
-| `unwritable_cache_fails_before_the_build` | Unit | A cache below a file, a cache that is a folder and an empty cache path give `Error::Cache`, not the `Error::Footer` of a corrupt file in the dataset. A missing cache folder is made. |
+| `unwritable_cache_fails_before_the_build` | Unit | A cache below a file, a cache that is a folder and an empty cache path give `Error::Cache`, not the `Error::Footer` of a corrupt file in the dataset. The check does not change a stale sidecar. A missing cache folder is made. |
 | `open_rebuilds_on_change` | Unit | A changed file, a new file and a corrupt sidecar each cause a new build. |
 | `bad_footer_names_file` | Unit | A bad magic number, a file that is too short and a footer length larger than the file each give `Error::Footer` with the path. |
 | `no_files_is_an_error` | Unit | A prefix with no `.parquet` files gives `Error::NoFiles`. |
@@ -726,7 +727,7 @@ Each GPU gives a checkpoint part for its own lanes. `merge` puts the parts of al
 **Limits:**
 
 - The checksum finds damage, not changes by an attacker.
-- `from_bytes` does not make sure that each lane state is correct for the epoch. `Session::resume` refuses a step past the epoch, a leftover past the cursor and an epoch from 2⁶² (D-64). An offset past the end of its document can be found only with the data, so a checkpoint made by hand with such an offset still causes a panic in `Epoch::lane`.
+- `from_bytes` does not make sure that each lane state is correct for the epoch. `Session::resume` refuses a step past the epoch, a leftover past the cursor and an epoch from 2⁶², through `Epoch::check`, which `Epoch::lane` also uses (D-64). `merge` reserves no memory from the B in the bytes. An offset past the end of its document can be found only with the data, so a checkpoint made by hand with such an offset still causes a panic in `Epoch::lane`.
 
 **Verification:**
 
@@ -738,7 +739,7 @@ Each GPU gives a checkpoint part for its own lanes. `merge` puts the parts of al
 | `any_bytes_give_an_error_not_a_panic` | Property | Random bytes never cause a panic, also with a correct checksum. |
 | `truncation_is_refused` | Property | A checkpoint with bytes removed from its end gives an error. |
 | `merge_tiles_the_lanes` | Unit | Parts in any order give one global checkpoint. |
-| `merge_refuses_bad_parts` | Unit | No parts, a missing lane, a gap, an overlap and different steps, configs or epochs each give `Error::Parts`. |
+| `merge_refuses_bad_parts` | Unit | No parts, a missing lane, a gap, an overlap, different steps, configs or epochs, and B = 2³² − 1 in the bytes each give `Error::Parts`, with no large allocation. |
 | `states_of_a_part` | Unit | `states` gives lanes that the part holds, and refuses other lanes and lanes at different steps. |
 | `check_names_the_field` | Unit | `check` gives the name of the field that is different. |
 
@@ -768,7 +769,7 @@ pub enum Error { Config(String), Index(index::Error), Read(read::Error),
 **Design:**
 
 - `open` checks the config, opens the index with `Index::open`, and makes the reader. The lanes are `gpu_lanes(B, world, rank)`.
-- `open` refuses more than 2²⁴ lanes, and more than 2³⁰ tokens in one step of one GPU. These sizes are far past any real batch, and a larger value could only use all the memory (D-63).
+- `open` refuses more than 2²⁴ lanes, and more than 2³⁰ tokens in one step of one GPU or in its leftovers (lanes × C). These sizes are far past any real batch, and a larger value could only use all the memory (D-63).
 - The session keeps the lane states to start from. `set_epoch` sets them to the start of a later epoch. It does nothing for the current epoch or an earlier one. `resume` takes them from a checkpoint after `check`.
 - `next` makes the loader of the epoch at the first step. At the end of the epoch, `next` returns `None`, and the session goes to step 0 of the next epoch.
 - If `next` fails, the session keeps the lane states of the loader and drops the loader. The next call makes a new loader and tries the same step again.
@@ -800,7 +801,7 @@ pub enum Error { Config(String), Index(index::Error), Read(read::Error),
 | `resume_refuses_other_runs` | Unit | A different L, a different seed and an added file each give `Mismatch` with the name of the field. |
 | `resume_needs_this_ranks_lanes` | Unit | A part resumes the rank that holds its lanes, and another rank refuses it. |
 | `resume_refuses_states_outside_the_epoch` | Unit | A step past the epoch, a leftover past the cursor and the epoch 2⁶² give `checkpoint::Error::Range`. `set_epoch(2⁶²)` gives `Error::Config`. |
-| `open_refuses_bad_settings` | Unit | A world that does not divide B, a rank out of range, no GPUs, W = 0, D = 0, 2²⁵ lanes and L = 2³² − 1 each give `Error::Config`. |
+| `open_refuses_bad_settings` | Unit | A world that does not divide B, a rank out of range, no GPUs, W = 0, D = 0, 2²⁵ lanes, L = 2³² − 1 and C = 2³² − 1 each give `Error::Config`. |
 | `next_retries_after_a_failed_read` | Unit | After a failed read and a repair of the file, the next calls give the same batches as a run with no failure. |
 
 ### 5.10 Store
@@ -879,7 +880,7 @@ class PlitzerError(Exception); ConfigError, CheckpointError, DataError (PlitzerE
 **Design:**
 
 - Each process has one multi-thread tokio runtime with at most 8 worker threads and 32 threads for blocking calls. A loader has at most 16 reads in flight, and each GPU has its own process, so one worker for each CPU would start hundreds of threads in each process (D-60). A forked child makes a new runtime, and it never drops the copy of the parent's runtime: that drop would wait for threads that the child does not have.
-- Each `Loader` records the PID of the process that made it. In a forked child, a copied `Loader` gives `RuntimeError` for `__next__`, `__iter__`, `set_epoch` and `resume`. A new `Loader` in the child works.
+- Each `Loader` records the PID of the process that made it. In a forked child, a copied `Loader` gives `RuntimeError` for each method and property: a parent thread can have held one of its locks at the fork. A new `Loader` in the child works.
 - The `Loader` is frozen. A lock holds its session for the whole of a step, and a snapshot holds the checkpoint before the next step. `checkpoint()`, `epoch` and `lanes` read only the snapshot, so a signal handler or another thread can read them during a step. A second call that needs the session during a step gets `RuntimeError`, never a deadlock (D-59). No call holds the snapshot lock while Python runs, because Python can release the GIL and `save` takes the lock while it holds the GIL.
 - `epoch` is the epoch of the next step, as in `checkpoint()`. After the last step of an epoch, it is the next epoch.
 - `__next__` releases the GIL and waits on the runtime for 100 ms at a time. Between these waits it checks for signals. Thus Ctrl-C gives `KeyboardInterrupt` in 100 ms or less, and it drops the `next` future. `Loader::next` is cancel safe (D-44), so the next call does the same step again.
@@ -887,7 +888,7 @@ class PlitzerError(Exception); ConfigError, CheckpointError, DataError (PlitzerE
 - Each step writes into a new `Vec<u32>`. An arrow `Buffer` holds it, and each export holds a clone of that `Buffer`. Thus an exported array stays valid after the batch, the loader and the export call.
 - The default cache is `$PLITZER_CACHE_DIR`, else the user cache folder, then `plitzer/<hash>.idx`. The hash is of the `id` of the store (section 5.10) and the column, not of the location text. Thus `data` from two folders gets two files, and `data/` and `file:///…/data` share one (D-54). The index makes the cache folder if it does not exist. `HOME`, `XDG_CACHE_HOME` and `LOCALAPPDATA` count only when they hold an absolute path: a relative folder would differ for each working directory. `PLITZER_CACHE_DIR` is used as given. With no user cache folder, there is no default, and `Loader` gives `ConfigError` (D-61).
 - Integer settings, also the epoch of `set_epoch`, come in as Python integers of any size. A value that does not fit, such as `world=-1`, gives `ConfigError`.
-- If the runtime cannot start its threads, such as at a process limit, `Loader` gives `RuntimeError`.
+- If the runtime cannot start its threads, such as at a process limit, `Loader` gives `RuntimeError`. A call from a thread that runs a tokio runtime, such as a callback from another Rust extension, also gives `RuntimeError`, because tokio cannot block that thread.
 
 The errors map to Python exceptions as follows:
 
@@ -1044,14 +1045,14 @@ This component is not in the code yet. Its section will have the full set of par
 | D-54 | The default cache name is a hash of the resolved store and prefix. | The same text can name two datasets, and two texts can name one dataset. | A hash of the location text. | #18 |
 | D-55 | `__next__` keeps raising `StopIteration` after an epoch ends, and `__iter__` starts the next epoch. | Python iterators stay ended. A `zip` stops at the first ended loader, so `__iter__` must move the others on. | Start the next epoch at the next `__next__`. | #18 |
 | D-56 | In a forked child, a `Loader` leaks its session. | A drop stops runtime tasks, which can wait on a lock that no thread in the child will release. | Drop as usual and risk a hang at exit. | #18 |
-| D-57 | `Index::open` writes an empty sidecar at the cache path before it reads the footers. | A cache that cannot be written then fails at once, not after the full footer scan. The old sidecar is stale at that point. No file stays open during the build. | Write the cache after the build only, or keep the temporary file open during the build. | #18 |
+| D-57 | Before it reads the footers, `Index::open` makes a file in the cache folder and opens an existing sidecar for writing. It changes no file. | A cache that cannot be written then fails at once, not after the full footer scan. Another process can have just written a good sidecar, so the check must not replace it. No file stays open during the build. | Write the cache after the build only, or keep the temporary file open during the build. | #18 |
 | D-64 | `Session::resume` checks the epoch and each lane's step and leftover against the epoch. | A checkpoint made by hand passes the checksum, and its states would stop the packer with a panic. | Trust each checksummed checkpoint. | #18 |
 | D-58 | The default cache name is a hash of `store::Location::id`, which holds the endpoint but no credentials. | New credentials keep the cache. Two servers with the same bucket name do not share it. | A hash of all storage options. | #18 |
 | D-59 | A frozen `Loader` with a lock for the session and a checkpoint snapshot that other calls read. | A preemption signal handler or a background thread can save a checkpoint during a step. A second step from another thread gets an error, not a deadlock. | A borrow for each call, which refuses all calls during a step. A lock that each call takes, which deadlocks a signal handler. | #18 |
 | D-60 | The runtime has at most 8 worker threads and 32 blocking threads. | Each GPU process has its own runtime, and a loader has at most 16 reads in flight. | One worker for each CPU: hundreds of threads in each process on a large node. | #18 |
 | D-61 | No default cache without a user cache folder. | A shared temporary folder lets other users break or poison the index. | A shared folder in the temporary directory. | #18 |
 | D-62 | A URL with `?` or `#` is an error. | The parser drops what follows them, and they can be part of a real name, so another dataset would open with no error. | Drop the query and the fragment. | #18 |
-| D-63 | `Session::open` refuses more than 2²⁴ lanes and more than 2³⁰ tokens in one step of one GPU. | These sizes are far past any real batch. Larger values could only use all memory, which stops the process with no Python exception. | No bound. | #18 |
+| D-63 | `Session::open` refuses more than 2²⁴ lanes, and more than 2³⁰ tokens in one step of one GPU or in its leftovers. | These sizes are far past any real batch. Larger values could only use all memory, which stops the process with no Python exception. | No bound. | #18 |
 | D-22 | The sidecar uses its own binary format and FNV-1a. | No new dependency, and the bytes are fixed by our code. | `serde` with `bincode`, or JSON. | #10 |
 | D-23 | A sidecar that does not exist or is corrupt causes a new build. | The sidecar is only a cache. | An error that the user must correct. | #10 |
 | D-24 | The index keeps the place of each token column chunk, and the reader reads no footer. | A window has row groups from approximately W files. A footer read for each row group costs approximately 1.5 times the data. | Read the footer of each file again, or keep footers in memory (9.4 GB for FineWeb-Edu). | #12 |

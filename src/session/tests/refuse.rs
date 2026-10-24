@@ -83,4 +83,7 @@ async fn open_refuses_bad_settings() {
     let mut c = config();
     c.packing.seq_len = u32::MAX;
     assert!(refused(open(&d, c, 0, 1).await), "a step too large");
+    let mut c = config();
+    c.packing.cap = u32::MAX;
+    assert!(refused(open(&d, c, 0, 1).await), "leftovers too large");
 }

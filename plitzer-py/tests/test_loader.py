@@ -214,9 +214,14 @@ def test_forked_child_makes_its_own_loader(make: MakeLoader) -> None:
             next(loader)
             code = 1
         except RuntimeError:
-            # The copied loader is refused, but a new one works.
-            fresh = np.from_dlpack(next(make()).tokens)
-            code = 0 if np.array_equal(fresh, first) else 3
+            # The copied loader is refused, also its checkpoint, whose lock a
+            # parent thread could hold. A new loader works.
+            try:
+                loader.checkpoint()
+                code = 4
+            except RuntimeError:
+                fresh = np.from_dlpack(next(make()).tokens)
+                code = 0 if np.array_equal(fresh, first) else 3
         except BaseException:
             code = 2
         # Freeing the copied loader must not wait on the parent's runtime.

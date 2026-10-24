@@ -96,6 +96,9 @@ fn merge_tiles_the_lanes() {
 fn merge_refuses_bad_parts() {
     let refused = |parts: Vec<Checkpoint>| matches!(Checkpoint::merge(parts), Err(Error::Parts(_)));
     assert!(refused(vec![]));
+    let mut huge = part(0, &[4, 4]);
+    huge.config.lanes = u32::MAX;
+    assert!(refused(vec![huge]), "B from the bytes is not reserved");
     assert!(refused(vec![part(0, &[4, 4])]), "lanes 2..4 missing");
     assert!(refused(vec![part(0, &[4, 4]), part(3, &[4, 4])]), "gap");
     assert!(

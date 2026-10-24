@@ -203,13 +203,10 @@ impl Session {
             )));
         }
         let plan = self.epoch_plan(epoch);
-        let docs = u64::from(plan.packing().docs);
-        for (lane, s) in self.lanes.clone().zip(&states) {
-            let cursor = s.step.saturating_mul(docs).min(plan.lane_docs(lane));
-            if s.step > plan.steps() || s.doc > cursor {
-                let why = format!("lane {lane} state {s:?} is outside epoch {epoch}");
-                return Err(checkpoint::Error::Range(why));
-            }
+        for (lane, &state) in self.lanes.clone().zip(&states) {
+            let at = |why| format!("lane {lane} of epoch {epoch}: {why}");
+            plan.check(lane, state)
+                .map_err(|why| checkpoint::Error::Range(at(why)))?;
         }
         Ok(states)
     }
@@ -243,8 +240,9 @@ pub const MAX_EPOCH: u64 = 1 << 62;
 /// for each of its lanes, so a larger value could only exhaust memory.
 const MAX_LANES: u32 = 1 << 24;
 
-/// The most tokens in one step of one GPU, 4 GiB of output: far past any
-/// real batch, and a larger buffer could only exhaust memory.
+/// The most tokens in one step of one GPU, 4 GiB of output, and in the
+/// leftovers of one GPU: far past any real batch, and more could only
+/// exhaust memory.
 const MAX_STEP_TOKENS: u64 = 1 << 30;
 
 /// Refuses the settings that the order and the packer would panic on, and
@@ -262,6 +260,8 @@ fn validate(c: &Config, rank: u32, world: u32) -> Result<(), Error> {
         format!("lanes {} is more than {MAX_LANES}", c.lanes)
     } else if u64::from(c.lanes / world) * u64::from(c.packing.seq_len) > MAX_STEP_TOKENS {
         format!("one step of one GPU holds more than {MAX_STEP_TOKENS} tokens")
+    } else if u64::from(c.lanes / world) * u64::from(c.packing.cap) > MAX_STEP_TOKENS {
+        format!("the leftovers of one GPU can hold more than {MAX_STEP_TOKENS} tokens")
     } else {
         return Ok(());
     };

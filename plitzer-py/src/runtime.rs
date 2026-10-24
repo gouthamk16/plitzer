@@ -55,6 +55,13 @@ pub fn block_on<F: Future + Send>(py: Python<'_>, fut: F) -> PyResult<F::Output>
 where
     F::Output: Send,
 {
+    // Tokio refuses, with a panic, to block a thread that runs a runtime,
+    // such as a callback from another Rust extension.
+    if tokio::runtime::Handle::try_current().is_ok() {
+        return Err(PyRuntimeError::new_err(
+            "plitzer cannot wait on a thread that runs a tokio runtime; call it from another thread",
+        ));
+    }
     let runtime = runtime()?;
     let mut fut = std::pin::pin!(fut);
     loop {
