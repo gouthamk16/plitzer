@@ -97,12 +97,36 @@ fn file(r: &mut Reader) -> Option<File> {
     })
 }
 
+/// Checks, before the build, that `write` can later put a sidecar at
+/// `path`, so a cache that cannot be written fails before any footer is
+/// read. It refuses a folder or a path with no file name, makes a file in
+/// the folder, and opens an existing sidecar for writing. It changes no
+/// file: another process may have just written a good sidecar there.
+pub(super) fn check_writable(path: &std::path::Path) -> io::Result<()> {
+    if path.is_dir() || path.file_name().is_none() {
+        let why = format!("the index cache {:?} is not a file path", path);
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, why));
+    }
+    tempfile::NamedTempFile::new_in(folder(path)?)?;
+    if path.exists() {
+        std::fs::OpenOptions::new().write(true).open(path)?;
+    }
+    Ok(())
+}
+
+/// The folder of `path`, made if it does not exist, as on a new machine.
+fn folder(path: &std::path::Path) -> io::Result<&std::path::Path> {
+    let dir = path.parent().filter(|d| !d.as_os_str().is_empty());
+    let dir = dir.unwrap_or(".".as_ref());
+    std::fs::create_dir_all(dir)?;
+    Ok(dir)
+}
+
 /// Writes `bytes` to a temporary file with a unique name next to `path`,
 /// then renames it. Processes that start together (one per GPU) can then
 /// write at once, and no reader sees a half-written sidecar.
 pub(super) fn write(path: &std::path::Path, bytes: &[u8]) -> io::Result<()> {
-    let dir = path.parent().filter(|d| !d.as_os_str().is_empty());
-    let mut tmp = tempfile::NamedTempFile::new_in(dir.unwrap_or(".".as_ref()))?;
+    let mut tmp = tempfile::NamedTempFile::new_in(folder(path)?)?;
     tmp.write_all(bytes)?;
     for attempt in 0.. {
         let Err(e) = tmp.persist(path) else {

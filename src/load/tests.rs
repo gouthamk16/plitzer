@@ -12,6 +12,7 @@ use tempfile::TempDir;
 use super::*;
 
 mod budget;
+mod cancel;
 mod plan;
 use crate::order::{Order, gpu_lanes};
 use crate::pack::Packing;

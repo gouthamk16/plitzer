@@ -99,10 +99,16 @@ impl Session {
     /// start of each epoch, also the one they resumed into, and a checkpoint
     /// after an epoch's last step is already at the next epoch. Going back
     /// would repeat data with no error; open a new session to do that.
-    pub fn set_epoch(&mut self, epoch: u64) {
+    /// Epochs from `MAX_EPOCH` on are refused, so the next epoch always
+    /// exists.
+    pub fn set_epoch(&mut self, epoch: u64) -> Result<(), Error> {
+        if epoch >= MAX_EPOCH {
+            return Err(Error::Config(format!("epoch {epoch} is too large")));
+        }
         if epoch > self.epoch {
             self.start_epoch(epoch);
         }
+        Ok(())
     }
 
     fn start_epoch(&mut self, epoch: u64) {
@@ -117,6 +123,7 @@ impl Session {
     pub fn resume(&mut self, checkpoint: &Checkpoint) -> Result<(), Error> {
         let states = (checkpoint.check(&self.config, self.fingerprint))
             .and_then(|()| checkpoint.states(self.lanes.clone()))
+            .and_then(|states| self.in_range(checkpoint.epoch, states))
             .map_err(Error::Checkpoint)?;
         self.epoch = checkpoint.epoch;
         self.start = states;
@@ -154,7 +161,7 @@ impl Session {
     /// the call of `next` that returns `None`, so the parts of all GPUs agree.
     pub fn checkpoint(&self) -> Checkpoint {
         let (epoch, lanes) = match &self.loader {
-            Some(l) if l.ended() => (self.epoch + 1, vec![LaneState::default(); self.lanes.len()]),
+            _ if self.ended() => (self.epoch + 1, vec![LaneState::default(); self.lanes.len()]),
             Some(l) => (self.epoch, l.states()),
             None => (self.epoch, self.start.clone()),
         };
@@ -167,6 +174,12 @@ impl Session {
         }
     }
 
+    /// True after the last step of the epoch, until the call of `next` that
+    /// returns `None` moves the session to the next epoch.
+    pub fn ended(&self) -> bool {
+        self.loader.as_ref().is_some_and(Loader::ended)
+    }
+
     pub fn epoch(&self) -> u64 {
         self.epoch
     }
@@ -175,16 +188,43 @@ impl Session {
         self.lanes.clone()
     }
 
-    async fn load(&self) -> Result<Loader, Error> {
+    /// `states` if each lies inside epoch `epoch`: no later than its last
+    /// step, with its leftover not past the documents it has taken. A
+    /// checksummed checkpoint from plitzer always passes; this refuses one
+    /// made by hand, which would stop the packer with a panic.
+    fn in_range(
+        &self,
+        epoch: u64,
+        states: Vec<LaneState>,
+    ) -> Result<Vec<LaneState>, checkpoint::Error> {
+        if epoch >= MAX_EPOCH {
+            return Err(checkpoint::Error::Range(format!(
+                "epoch {epoch} is too large"
+            )));
+        }
+        let plan = self.epoch_plan(epoch);
+        for (lane, &state) in self.lanes.clone().zip(&states) {
+            let at = |why| format!("lane {lane} of epoch {epoch}: {why}");
+            plan.check(lane, state)
+                .map_err(|why| checkpoint::Error::Range(at(why)))?;
+        }
+        Ok(states)
+    }
+
+    fn epoch_plan(&self, epoch: u64) -> Epoch {
         let c = &self.config;
         let order = Order {
             seed: c.seed,
-            epoch: self.epoch,
+            epoch,
             lanes: c.lanes,
             window: c.window,
             rows: &self.index.rows(),
         };
-        let epoch = Arc::new(Epoch::new(order, c.packing));
+        Epoch::new(order, c.packing)
+    }
+
+    async fn load(&self) -> Result<Loader, Error> {
+        let epoch = Arc::new(self.epoch_plan(self.epoch));
         let (reader, index) = (self.reader.clone(), self.index.clone());
         Loader::new(epoch, reader, index, self.lanes(), &self.start, self.budget)
             .await
@@ -192,7 +232,21 @@ impl Session {
     }
 }
 
-/// Refuses the settings that the order and the packer would panic on.
+/// The largest epoch: far past any run, and far from `u64::MAX`, so the
+/// epoch after it always exists.
+pub const MAX_EPOCH: u64 = 1 << 62;
+
+/// The most lanes: far past any real global batch. Each GPU keeps a state
+/// for each of its lanes, so a larger value could only exhaust memory.
+const MAX_LANES: u32 = 1 << 24;
+
+/// The most tokens in one step of one GPU, 4 GiB of output, and in the
+/// leftovers of one GPU: far past any real batch, and more could only
+/// exhaust memory.
+const MAX_STEP_TOKENS: u64 = 1 << 30;
+
+/// Refuses the settings that the order and the packer would panic on, and
+/// sizes that could only exhaust memory.
 fn validate(c: &Config, rank: u32, world: u32) -> Result<(), Error> {
     let why = if c.lanes == 0 || c.window == 0 {
         "lanes and window must be positive".to_string()
@@ -202,6 +256,12 @@ fn validate(c: &Config, rank: u32, world: u32) -> Result<(), Error> {
         format!("world {world} must divide {} lanes", c.lanes)
     } else if rank >= world {
         format!("rank {rank} out of range for world {world}")
+    } else if c.lanes > MAX_LANES {
+        format!("lanes {} is more than {MAX_LANES}", c.lanes)
+    } else if u64::from(c.lanes / world) * u64::from(c.packing.seq_len) > MAX_STEP_TOKENS {
+        format!("one step of one GPU holds more than {MAX_STEP_TOKENS} tokens")
+    } else if u64::from(c.lanes / world) * u64::from(c.packing.cap) > MAX_STEP_TOKENS {
+        format!("the leftovers of one GPU can hold more than {MAX_STEP_TOKENS} tokens")
     } else {
         return Ok(());
     };

@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Status
 
-Plitzer is a Rust-core ML dataloader. It feeds Parquet data from local disk or S3 to PyTorch with an order that is deterministic and resumable. So far it is a library crate with nine modules: `src/shuffle.rs`, a deterministic Fisher-Yates shuffle; `src/seed.rs`, which derives each shuffle's 32-byte key; `src/order.rs`, the ordering core (row-group windows, lane slices, GPU lane blocks); `src/pack.rs`, the per-lane packer with resumable lane state; `src/index.rs`, the row-group index built from Parquet footers through `object_store`, cached in a sidecar, recording where each row group's token column chunk is; `src/read.rs`, which fetches and decodes one row group's token column from that record alone, never a footer; `src/load.rs`, the per-GPU loader that prefetches its lanes' row groups under a byte budget and drives the packer step by step; `src/checkpoint.rs`, checkpoint bytes (versioned, checksummed) whose per-GPU parts merge into a global checkpoint; and `src/session.rs`, one GPU's lanes across epochs, which validates the config, rolls epochs and resumes from a checkpoint. `src/codec.rs` holds the binary helpers shared by the sidecar and the checkpoint. The rest of the design below is the plan, not existing code. Update this file as pieces land.
+Plitzer is a Rust-core ML dataloader. It feeds Parquet data from local disk or S3 to PyTorch with an order that is deterministic and resumable. So far it is a library crate with ten modules plus Python bindings: `src/shuffle.rs`, a deterministic Fisher-Yates shuffle; `src/seed.rs`, which derives each shuffle's 32-byte key; `src/order.rs`, the ordering core (row-group windows, lane slices, GPU lane blocks); `src/pack.rs`, the per-lane packer with resumable lane state; `src/index.rs`, the row-group index built from Parquet footers through `object_store`, cached in a sidecar, recording where each row group's token column chunk is; `src/read.rs`, which fetches and decodes one row group's token column from that record alone, never a footer; `src/load.rs`, the per-GPU loader that prefetches its lanes' row groups under a byte budget and drives the packer step by step; `src/checkpoint.rs`, checkpoint bytes (versioned, checksummed) whose per-GPU parts merge into a global checkpoint; and `src/session.rs`, one GPU's lanes across epochs, which validates the config, rolls epochs and resumes from a checkpoint. `src/store.rs` turns a local path or `s3://` URL into a store (S3 reads `AWS_*` from the environment via `from_env`). `src/codec.rs` holds the binary helpers shared by the sidecar and the checkpoint. `plitzer-py/` is a workspace crate (PyO3 0.30, maturin, abi3 wheels for CPython 3.11+) exposing `plitzer.Loader` (one GPU's `Session`), `Batch.tokens`/`lengths` as int32 arrays through DLPack (versioned and legacy) and the Arrow PyCapsule interface, `merge`, and typed exceptions. The rest of the design below is the plan, not existing code. Update this file as pieces land.
 
 ## Commands
 
@@ -15,11 +15,18 @@ cargo test <name>          # single test, substring match
 cargo clippy --all-targets --all-features
 cargo fmt
 cargo test --features s3 --test s3   # needs PLITZER_S3_ENDPOINT, e.g. a local versitygw
+
+# Python bindings (plitzer-py/), in a virtualenv with maturin, pytest, numpy, pyarrow
+maturin develop -m plitzer-py/Cargo.toml
+python -m pytest plitzer-py/tests     # test_s3.py runs when PLITZER_S3_ENDPOINT is set
+(cd plitzer-py && ruff check python tests && ruff format --check python tests && mypy python tests)
 ```
+
+`cargo test` at the root tests only the core crate; the bindings are tested through pytest. Lint with `cargo clippy --workspace --all-targets --all-features` and `cargo fmt --all`.
 
 MSRV is Rust 1.88 (required by `parquet` 60).
 
-CI (`.github/workflows/ci.yml`) runs fmt, clippy with `-D warnings`, and tests on Linux, macOS and Windows. The cross-OS matrix is required because ordering output must match on every platform. A separate Linux `s3` job runs `tests/s3.rs` against versitygw (MinIO no longer publishes images); S3 support is behind the `s3` cargo feature.
+CI (`.github/workflows/ci.yml`) runs fmt, clippy with `-D warnings`, ruff and `mypy --strict`, and Rust and Python (3.11, the abi3 floor) tests on Linux, macOS and Windows. The cross-OS matrix is required because ordering output must match on every platform. A separate Linux `s3` job runs `tests/s3.rs` and `plitzer-py/tests/test_s3.py` against versitygw (MinIO no longer publishes images); S3 support is behind the `s3` cargo feature.
 
 ## Workflow
 

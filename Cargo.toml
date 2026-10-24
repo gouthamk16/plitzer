@@ -1,3 +1,6 @@
+[workspace]
+members = ["plitzer-py"]
+
 [package]
 name = "plitzer"
 version = "0.1.0"
@@ -19,6 +22,7 @@ parquet = "60.0.0"
 rand_chacha = "0.10.0"
 tempfile = "3.27.0"
 tokio = { version = "1.52.1", features = ["rt", "sync"] }
+url = "2.5"
 
 [features]
 # S3 through object_store. Off by default: it pulls in an HTTP and TLS stack.

@@ -4,7 +4,37 @@ A deterministic, resumable dataloader for ML training that reads Parquet directl
 
 Batch order is a pure function of `(seed, epoch, step)`. Documents are packed into fixed-length sequences by *lanes*, which depend on the batch size and never on the GPU count. Resuming mid-epoch is exact, and the sequences stay identical when the GPU count changes.
 
-> **Status:** pre-alpha. Nothing usable yet.
+> **Status:** pre-alpha. The Python package builds from source; there is no PyPI release yet.
+
+## Quick start
+
+The input is a Parquet dataset with a pre-tokenized `list<int32>` (or `uint32`) column.
+
+```sh
+pip install maturin
+maturin develop -m plitzer-py/Cargo.toml   # into the active virtualenv
+```
+
+```python
+import numpy as np
+import plitzer
+
+loader = plitzer.Loader(
+    "s3://bucket/fineweb-edu",          # or a local folder
+    seed=0, lanes=512, window=64,        # B lanes, W row groups per window
+    seq_len=2048, docs=4, cap=4096, pad=0,
+    budget=8 << 30,                      # bytes of decoded tokens kept in memory
+    rank=0, world=8,                     # this GPU, of 8
+)
+while loader.epoch < 3:                  # also right after loader.resume(state)
+    for batch in loader:                 # the rest of this epoch; then epoch + 1
+        tokens = np.from_dlpack(batch.tokens)    # or torch.from_dlpack, or pyarrow.array
+        lengths = np.from_dlpack(batch.lengths)  # real tokens in each row
+        ...
+    state = loader.checkpoint()          # this GPU's part; plitzer.merge(parts) joins all GPUs
+```
+
+S3 credentials come from the usual `AWS_*` variables, or from `storage_options={"endpoint": ..., "region": ...}`.
 
 The design, its rationale and the decision log are in [docs/design.md](docs/design.md).
 
@@ -24,7 +54,7 @@ The design, its rationale and the decision log are in [docs/design.md](docs/desi
   - [x] prefetch each GPU's row groups for a window, capped by bytes
 - [ ] **Python:** PyO3 and maturin bindings, a PyTorch `IterableDataset` with `state_dict()`, and Arrow PyCapsule export
   - [x] typed checkpoint bytes that merge across GPUs, and a per-GPU session that runs epochs and refuses a mismatched resume
-  - [ ] bindings: a `plitzer` wheel exporting batches through DLPack and Arrow
+  - [x] bindings: a `plitzer` wheel exporting batches through DLPack and Arrow
   - [ ] `plitzer.torch` `IterableDataset` with `state_dict()` and `load_state_dict()`
 - [ ] **End-to-end test:** kill training at a random step, resume on a different GPU count, and check the sample-stream hash matches
 - [ ] **Read amplification check:** measure bytes read per GPU on real data. Lane slices simulate at 1.01–1.25×. Add a per-node cache only if it's needed
