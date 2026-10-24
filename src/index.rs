@@ -116,9 +116,9 @@ impl Index {
         if let Some(index) = cached.filter(fresh) {
             return Ok(index);
         }
-        let tmp = sidecar::temp_file(cache).map_err(Error::Cache)?;
+        sidecar::check_writable(cache).map_err(Error::Cache)?;
         let index = Self::from_footers(store, prefix, column, metas).await?;
-        sidecar::write(tmp, cache, &sidecar::encode(&index, true)).map_err(Error::Cache)?;
+        sidecar::write(cache, &sidecar::encode(&index, true)).map_err(Error::Cache)?;
         Ok(index)
     }
 

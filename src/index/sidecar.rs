@@ -97,24 +97,27 @@ fn file(r: &mut Reader) -> Option<File> {
     })
 }
 
+/// Makes the folder of `path` and a file in it, then deletes the file. It
+/// runs before the build, so a cache folder that cannot be written fails
+/// before any footer is read. No file stays open during the build, so a
+/// process killed then leaves nothing behind.
+pub(super) fn check_writable(path: &std::path::Path) -> io::Result<()> {
+    tempfile::NamedTempFile::new_in(folder(path)?).map(drop)
+}
+
+/// The folder of `path`, made if it does not exist, as on a new machine.
+fn folder(path: &std::path::Path) -> io::Result<&std::path::Path> {
+    let dir = path.parent().filter(|d| !d.as_os_str().is_empty());
+    let dir = dir.unwrap_or(".".as_ref());
+    std::fs::create_dir_all(dir)?;
+    Ok(dir)
+}
+
 /// Writes `bytes` to a temporary file with a unique name next to `path`,
 /// then renames it. Processes that start together (one per GPU) can then
 /// write at once, and no reader sees a half-written sidecar.
-/// A new file next to `path`, to `write` into. It is made before the build,
-/// so a cache folder that cannot be written fails before any footer is read.
-pub(super) fn temp_file(path: &std::path::Path) -> io::Result<tempfile::NamedTempFile> {
-    let dir = path.parent().filter(|d| !d.as_os_str().is_empty());
-    let dir = dir.unwrap_or(".".as_ref());
-    // A default cache folder does not exist on a new machine.
-    std::fs::create_dir_all(dir)?;
-    tempfile::NamedTempFile::new_in(dir)
-}
-
-pub(super) fn write(
-    mut tmp: tempfile::NamedTempFile,
-    path: &std::path::Path,
-    bytes: &[u8],
-) -> io::Result<()> {
+pub(super) fn write(path: &std::path::Path, bytes: &[u8]) -> io::Result<()> {
+    let mut tmp = tempfile::NamedTempFile::new_in(folder(path)?)?;
     tmp.write_all(bytes)?;
     for attempt in 0.. {
         let Err(e) = tmp.persist(path) else {

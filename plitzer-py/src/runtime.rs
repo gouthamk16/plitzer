@@ -1,36 +1,36 @@
 //! The one tokio runtime of the process, and how Python waits on it.
 
-use std::sync::OnceLock;
+use std::sync::Mutex;
 use std::time::Duration;
 
-use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use tokio::runtime::Runtime;
 
-/// The runtime and the PID of the process that made it.
-static RUNTIME: OnceLock<(Runtime, u32)> = OnceLock::new();
+/// The runtime of this process, with the PID it belongs to.
+static RUNTIME: Mutex<Option<(u32, &'static Runtime)>> = Mutex::new(None);
 
 /// How long Python waits without a signal check. Ctrl-C takes at most this.
 const SLICE: Duration = Duration::from_millis(100);
 
-/// The runtime, refused in a forked child: the child has none of the
-/// runtime's worker threads, so a wait in it would never end.
-fn runtime() -> PyResult<&'static Runtime> {
-    let (runtime, pid) = RUNTIME.get_or_init(|| {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .thread_name("plitzer")
-            .build()
-            .expect("cannot start the plitzer runtime threads");
-        (runtime, std::process::id())
-    });
-    if *pid != std::process::id() {
-        return Err(PyRuntimeError::new_err(
-            "plitzer cannot run in a forked process; make the Loader in the \
-             process that uses it, and use DataLoader(num_workers=0)",
-        ));
+/// The runtime of this process. A forked child gets a new one: it has none
+/// of the parent runtime's threads. The parent's runtime is leaked, never
+/// dropped, since its drop would wait for those threads.
+fn runtime() -> &'static Runtime {
+    let mut runtime = RUNTIME.lock().unwrap_or_else(|e| e.into_inner());
+    let pid = std::process::id();
+    match *runtime {
+        Some((owner, runtime)) if owner == pid => runtime,
+        _ => {
+            let new = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .thread_name("plitzer")
+                .build()
+                .expect("cannot start the plitzer runtime threads");
+            let new: &'static Runtime = Box::leak(Box::new(new));
+            *runtime = Some((pid, new));
+            new
+        }
     }
-    Ok(runtime)
 }
 
 /// Runs `fut` to its end without the GIL. Between slices of `SLICE` it
@@ -39,7 +39,7 @@ pub fn block_on<F: Future + Send>(py: Python<'_>, fut: F) -> PyResult<F::Output>
 where
     F::Output: Send,
 {
-    let runtime = runtime()?;
+    let runtime = runtime();
     let mut fut = std::pin::pin!(fut);
     loop {
         // `timeout` makes its timer at once, so it must be made in the runtime.

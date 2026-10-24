@@ -129,8 +129,10 @@ async fn open_an_s3_url() {
     .map(|(k, v)| (k.to_string(), v))
     .collect();
     let url = format!("s3://{bucket}/{prefix}");
-    let (store, at) = plitzer::store::open(&url, &options).unwrap();
-    assert_eq!(at, prefix);
-    let index = Index::build(&*store, &at, "tokens").await.unwrap();
+    let at = plitzer::store::open(&url, &options).unwrap();
+    assert_eq!(at.prefix, prefix);
+    let index = Index::build(&*at.store, &at.prefix, "tokens")
+        .await
+        .unwrap();
     assert_eq!(index.rows(), [7, 2]);
 }

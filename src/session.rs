@@ -154,7 +154,7 @@ impl Session {
     /// the call of `next` that returns `None`, so the parts of all GPUs agree.
     pub fn checkpoint(&self) -> Checkpoint {
         let (epoch, lanes) = match &self.loader {
-            Some(l) if l.ended() => (self.epoch + 1, vec![LaneState::default(); self.lanes.len()]),
+            _ if self.ended() => (self.epoch + 1, vec![LaneState::default(); self.lanes.len()]),
             Some(l) => (self.epoch, l.states()),
             None => (self.epoch, self.start.clone()),
         };
@@ -165,6 +165,12 @@ impl Session {
             first_lane: self.lanes.start,
             lanes,
         }
+    }
+
+    /// True after the last step of the epoch, until the call of `next` that
+    /// returns `None` moves the session to the next epoch.
+    pub fn ended(&self) -> bool {
+        self.loader.as_ref().is_some_and(Loader::ended)
     }
 
     pub fn epoch(&self) -> u64 {

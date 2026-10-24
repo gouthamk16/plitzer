@@ -60,6 +60,9 @@ def test_iterator_protocol(make: MakeLoader) -> None:
     first = epoch([loader])
     with pytest.raises(StopIteration):
         next(loader)  # an ended iterator stays ended
+    loader.set_epoch(0)  # changes nothing, so the iterator stays ended
+    with pytest.raises(StopIteration):
+        next(loader)
     assert loader.epoch == 1
     second = epoch([loader])
     assert not same(first, second)
@@ -218,9 +221,9 @@ def test_bad_settings(make: MakeLoader, tmp_path: Path) -> None:
 
 
 @pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
-def test_forked_child_is_refused(make: MakeLoader) -> None:
+def test_forked_child_makes_its_own_loader(make: MakeLoader) -> None:
     loader = make()
-    next(loader)
+    first = np.from_dlpack(next(loader).tokens).copy()
     with warnings.catch_warnings():
         # Python warns that fork in a process with threads can deadlock.
         warnings.simplefilter("ignore", DeprecationWarning)
@@ -230,7 +233,9 @@ def test_forked_child_is_refused(make: MakeLoader) -> None:
             next(loader)
             code = 1
         except RuntimeError:
-            code = 0
+            # The copied loader is refused, but a new one works.
+            fresh = np.from_dlpack(next(make()).tokens)
+            code = 0 if np.array_equal(fresh, first) else 3
         except BaseException:
             code = 2
         # Freeing the copied loader must not wait on the parent's runtime.

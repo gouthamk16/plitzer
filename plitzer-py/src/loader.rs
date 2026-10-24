@@ -12,6 +12,7 @@ use object_store::path::Path;
 use plitzer::checkpoint::{Checkpoint, Config};
 use plitzer::pack::Packing;
 use plitzer::session::Session;
+use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyRange};
 
@@ -30,6 +31,21 @@ pub struct Loader {
     exhausted: bool,
     /// The process that made the loader. See `Drop`.
     pid: u32,
+}
+
+impl Loader {
+    /// Refuses a loader copied into a forked child. Its session holds tasks
+    /// of the parent's runtime, which no thread in the child runs, so a step
+    /// would wait forever and a new epoch would drop tasks it cannot stop.
+    fn check_process(&self) -> PyResult<()> {
+        if self.pid == std::process::id() {
+            return Ok(());
+        }
+        Err(PyRuntimeError::new_err(
+            "this Loader was made in the parent of a forked process; make a \
+             new Loader in this process, and use DataLoader(num_workers=0)",
+        ))
+    }
 }
 
 impl Drop for Loader {
@@ -96,15 +112,19 @@ impl Loader {
 
     /// The rest of the current epoch. A loader whose last step is taken, but
     /// which has not raised `StopIteration` yet, goes to the next epoch.
-    fn __iter__(mut slf: PyRefMut<'_, Self>) -> PyRefMut<'_, Self> {
+    fn __iter__(mut slf: PyRefMut<'_, Self>) -> PyResult<PyRefMut<'_, Self>> {
+        slf.check_process()?;
         slf.exhausted = false;
-        let at = slf.session.checkpoint().epoch;
-        slf.session.set_epoch(at);
-        slf
+        if slf.session.ended() {
+            let next = slf.session.epoch() + 1;
+            slf.session.set_epoch(next);
+        }
+        Ok(slf)
     }
 
     /// The next step, or `StopIteration` after the last step of the epoch.
     fn __next__(&mut self, py: Python<'_>) -> PyResult<Option<Batch>> {
+        self.check_process()?;
         if self.exhausted {
             return Ok(None);
         }
@@ -114,9 +134,15 @@ impl Loader {
         Ok(real.map(|lengths| Batch::new(tokens, lengths, self.seq_len)))
     }
 
-    fn set_epoch(&mut self, epoch: u64) {
-        self.exhausted = false;
-        self.session.set_epoch(epoch);
+    /// Goes to the start of `epoch` if it is later than the current one. An
+    /// ended iterator stays ended when the call changes nothing.
+    fn set_epoch(&mut self, epoch: u64) -> PyResult<()> {
+        self.check_process()?;
+        if epoch > self.session.epoch() {
+            self.exhausted = false;
+            self.session.set_epoch(epoch);
+        }
+        Ok(())
     }
 
     /// This GPU's part of a checkpoint, as bytes. `merge` joins the parts of
@@ -126,6 +152,7 @@ impl Loader {
     }
 
     fn resume(&mut self, checkpoint: &[u8]) -> PyResult<()> {
+        self.check_process()?;
         let checkpoint = Checkpoint::from_bytes(checkpoint).map_err(checkpoint_error)?;
         self.session.resume(&checkpoint).map_err(session_error)?;
         self.exhausted = false;
@@ -154,13 +181,11 @@ fn locate(
 ) -> PyResult<(Arc<dyn ObjectStore>, Path, PathBuf)> {
     let mut options: Vec<_> = storage_options.unwrap_or_default().into_iter().collect();
     options.sort();
-    let (store, prefix) = plitzer::store::open(location, &options).map_err(store_error)?;
-    // The resolved store, not the spelling: `data` from two folders, or
-    // `s3://b/p/` and `s3://b/p`, must not share or split an index. The S3
-    // store prints only its bucket, so the options name the endpoint.
-    let key = (format!("{store}/{prefix}"), &options, column);
-    let cache = cache.unwrap_or_else(|| default_cache(key));
-    Ok((store, prefix, cache))
+    let at = plitzer::store::open(location, &options).map_err(store_error)?;
+    // The dataset's id, not the spelling: `data` from two folders, or
+    // `s3://b/p/` and `s3://b/p`, must not share or split an index.
+    let cache = cache.unwrap_or_else(|| default_cache((&at.id, column)));
+    Ok((at.store, at.prefix, cache))
 }
 
 /// `$PLITZER_CACHE_DIR`, else the user cache folder, then one file per

@@ -101,7 +101,7 @@ Each term has only one definition in this document.
 | REQ-9 | The decoded tokens in memory stay at or below the budget, and a budget that the loader accepts never stops it. | `load::budget_is_checked_and_kept`. | Met |
 | REQ-10 | A resume with different settings or a different dataset stops with an error that names the field. | `checkpoint::check_names_the_field` and `session::resume_refuses_other_runs`. | Met |
 | REQ-11 | Python reads each batch without a copy, through DLPack and Arrow. | `test_dlpack_versioned_and_legacy`, `test_arrow_export` and `test_data_outlives_the_batch_and_the_loader`. | Met |
-| REQ-12 | Input from Python gives a Python exception, never a panic or a wait with no end. | `test_bad_settings`, `test_resume_refuses_other_runs` and `test_forked_child_is_refused`. A manual test: Ctrl-C during a stopped S3 read gives `KeyboardInterrupt` in 0.51 s. | Met |
+| REQ-12 | Input from Python gives a Python exception, never a panic or a wait with no end. | `test_bad_settings`, `test_resume_refuses_other_runs` and `test_forked_child_makes_its_own_loader`. A manual test: Ctrl-C during a stopped S3 read gives `KeyboardInterrupt` in 0.51 s. | Met |
 
 ## 4. System overview
 
@@ -468,7 +468,7 @@ The fingerprint is the 64-bit FNV-1a hash of the same layout, with no ETags and 
 - The cache check compares the ETag, because a file can change and keep its size (D-20).
 - The fingerprint does not include the ETag. A local ETag holds the inode and the modification time, which are different on each copy (D-21).
 - The sidecar uses its own small format. It needs no `serde` dependency, and a golden test pins the bytes (D-22).
-- Before a build, `open` makes the cache folder and a temporary file in it. A cache that cannot be written then fails before the footer scan, which takes long on a large dataset (D-57).
+- Before a build, `open` makes the cache folder, and makes and deletes a test file in it. A cache that cannot be written then fails before the footer scan, which takes long on a large dataset (D-57).
 - If the sidecar does not exist or is corrupt, `open` builds the index again. This is not an error. The sidecar is only a cache (D-23).
 - The module writes the sidecar to a temporary file with a unique name and then renames it. Thus the processes of all GPUs on one node can write at the same time, and no process reads a half-written sidecar.
 - Windows does not replace a file while a different process has it open or replaces it. If the rename fails and the sidecar already has the same bytes, a different process wrote the same index, and the write is complete. If not, the module tries again up to five times.
@@ -756,6 +756,7 @@ impl Session {
     pub fn resume(&mut self, checkpoint: &Checkpoint) -> Result<(), Error>;
     pub async fn next(&mut self, out: &mut [u32]) -> Result<Option<Vec<u32>>, Error>;
     pub fn checkpoint(&self) -> Checkpoint;    // the part of this GPU
+    pub fn ended(&self) -> bool;               // the last step is taken; `next` gives `None` next
     pub fn epoch(&self) -> u64;
     pub fn lanes(&self) -> Range<u32>;
 }
@@ -790,7 +791,7 @@ pub enum Error { Config(String), Index(index::Error), Read(read::Error),
 | Test | Type | What it shows |
 |---|---|---|
 | `resume_on_another_world_matches_one_run` | Unit | Runs on world a stop at step k, also at and after the end of an epoch. Their merged checkpoint resumes on world b. The batches are the same as one run on world 1 with no stop. |
-| `epochs_roll_over` | Unit | After the last step, the checkpoint holds epoch 1 and the start states, before and after `None`. Parts from a GPU that received `None` and a GPU that did not merge. The batches of epoch 1 are not the same as epoch 0. |
+| `epochs_roll_over` | Unit | After the last step, `ended` is true, and the checkpoint holds epoch 1 and the start states, before and after `None`. Parts from a GPU that received `None` and a GPU that did not merge. The batches of epoch 1 are not the same as epoch 0. |
 | `set_epoch_starts_that_epoch` | Unit | `set_epoch(1)` after some steps gives the batches of epoch 1. |
 | `set_epoch_keeps_a_resume_in_that_epoch` | Unit | `set_epoch(0)` after a resume in epoch 0 keeps the resumed position. |
 | `set_epoch_never_goes_back` | Unit | `set_epoch(0)` after a resume from the end of epoch 0 gives the batches of epoch 1. |
@@ -807,20 +808,21 @@ pub enum Error { Config(String), Index(index::Error), Read(read::Error),
 **Interface:**
 
 ```rust
-pub fn open(location: &str, options: &[(String, String)])
-    -> Result<(Arc<dyn ObjectStore>, Path), Error>;
+pub struct Location { pub store: Arc<dyn ObjectStore>, pub prefix: Path, pub id: String }
+
+pub fn open(location: &str, options: &[(String, String)]) -> Result<Location, Error>;
 
 pub enum Error { Store(object_store::Error), Scheme(String), Option(String) }
 ```
 
 **Design:**
 
-| Location | Store | Prefix |
-|---|---|---|
-| A local path, such as `data/` or `C:\data` | `LocalFileSystem::new_with_prefix(path)` | empty |
-| `file:///data` | The same, for the path of the URL | empty |
-| `s3://bucket/prefix` (`s3` feature) | `AmazonS3Builder::from_env()` with the URL, then each option | the path of the URL |
-| Other schemes | `Error::Scheme` | — |
+| Location | Store | Prefix | `id` |
+|---|---|---|---|
+| Text with no `://`, such as `data/`, `C:\data` or `runs:2024/data` | `LocalFileSystem::new_with_prefix(path)` | empty | The absolute folder, with links resolved |
+| `file:///data` | The same, for the path of the URL | empty | The same |
+| `s3://bucket/prefix` (`s3` feature) | `AmazonS3Builder::from_env()` with the URL, then each option | the path of the URL | The bucket, the prefix and the endpoint |
+| Other schemes | `Error::Scheme` | — | — |
 
 **Rationale:**
 
@@ -828,7 +830,8 @@ pub enum Error { Store(object_store::Error), Scheme(String), Option(String) }
 - An unknown option gives `Error::Option`. If the store ignored an option, a wrong endpoint or a wrong key name would fail later with an unclear error.
 - The S3 builder fails only on settings, such as a missing bucket. Thus its error is also `Error::Option`, and Python shows it as `ConfigError`.
 - A local folder takes no options, so an option for a local folder is an error.
-- A path such as `C:\data` parses as a URL with the scheme `c`. Thus a scheme of one letter is a local path.
+- Only text with `://` is a URL. `C:\data` and `runs:2024/data` parse as URLs, but they are local paths.
+- `id` is the same for each spelling of one dataset, and different for two datasets. It holds no keys or tokens, so new credentials keep the same cache. It holds the endpoint from the options or the environment, so two servers with the same bucket name get different caches (D-58).
 
 **Limits:**
 
@@ -838,7 +841,9 @@ pub enum Error { Store(object_store::Error), Scheme(String), Option(String) }
 
 | Test | Type | What it shows |
 |---|---|---|
-| `opens_local_folders` | Unit | A path and a `file://` URL open the same folder. |
+| `opens_local_folders` | Unit | A path, the path with a separator at the end, and a `file://` URL open the same folder with the same `id`. Another folder has another `id`. |
+| `a_colon_in_a_path_is_not_a_scheme` | Unit | A folder named `runs:2024` opens as a folder (POSIX). |
+| `s3_id_has_the_endpoint_and_no_keys` | Unit | Two secret keys give one `id`, and two endpoints give two. The `id` holds no key. |
 | `refuses_what_it_cannot_open` | Unit | A missing folder, an unknown scheme and an option for a local folder each give their error. |
 | `refuses_unknown_s3_options` | Unit | An unknown S3 option and a URL with no bucket give `Error::Option`. |
 | `open_an_s3_url` | Integration | An `s3://` URL with options opens versitygw with the correct prefix. |
@@ -870,11 +875,12 @@ class PlitzerError(Exception); ConfigError, CheckpointError, DataError (PlitzerE
 
 **Design:**
 
-- The process has one multi-thread tokio runtime. It records the PID of the process that made it. In a forked child, each call gives `RuntimeError`.
+- Each process has one multi-thread tokio runtime. A forked child makes a new runtime, and it never drops the copy of the parent's runtime: that drop would wait for threads that the child does not have.
+- Each `Loader` records the PID of the process that made it. In a forked child, a copied `Loader` gives `RuntimeError` for `__next__`, `__iter__`, `set_epoch` and `resume`. A new `Loader` in the child works.
 - `__next__` releases the GIL and waits on the runtime for 100 ms at a time. Between these waits it checks for signals. Thus Ctrl-C gives `KeyboardInterrupt` in 100 ms or less, and it drops the `next` future. `Loader::next` is cancel safe (D-44), so the next call does the same step again.
 - At the end of an epoch, `__next__` raises `StopIteration`, and it raises it again at each later call, as a Python iterator must. `__iter__` starts the next epoch: a new `for` loop gives it. `__iter__` also moves on a loader whose last step is taken but which did not raise `StopIteration` yet, such as the second loader in a `zip` (D-55).
 - Each step writes into a new `Vec<u32>`. An arrow `Buffer` holds it, and each export holds a clone of that `Buffer`. Thus an exported array stays valid after the batch, the loader and the export call.
-- The default cache is `$PLITZER_CACHE_DIR`, else the user cache folder, then `plitzer/<hash>.idx`. The hash is of the resolved store, the prefix, the storage options and the column, not of the location text. The S3 store prints only its bucket, so the options separate two endpoints. Thus `data` from two folders gets two files, and `data/` and `file:///…/data` share one (D-54). The index makes the cache folder if it does not exist.
+- The default cache is `$PLITZER_CACHE_DIR`, else the user cache folder, then `plitzer/<hash>.idx`. The hash is of the `id` of the store (section 5.10) and the column, not of the location text. Thus `data` from two folders gets two files, and `data/` and `file:///…/data` share one (D-54). The index makes the cache folder if it does not exist.
 
 The errors map to Python exceptions as follows:
 
@@ -942,7 +948,7 @@ An Arrow consumer moves the structs out of the capsules and sets their `release`
 | `test_resume_on_another_world` | pytest | Parts from world 2, merged, resume on world 4 with the same tail as one run. |
 | `test_resume_refuses_other_runs` | pytest | A different L, bad bytes and an incomplete merge give `CheckpointError`. |
 | `test_bad_settings` | pytest | Bad settings give `ConfigError`. A missing folder gives `DataError`. |
-| `test_forked_child_is_refused` | pytest | A child of `os.fork` gets `RuntimeError`, and frees its copy of the loader with no wait. |
+| `test_forked_child_makes_its_own_loader` | pytest | In a child of `os.fork`, the copied loader gives `RuntimeError`. A new loader gives the same first batch as the parent. The child frees the copy with no wait. |
 | `test_s3_matches_local` | pytest | The same files on versitygw and on local disk give the same batches. |
 
 ### 5.12 Planned components
@@ -1016,14 +1022,15 @@ This component is not in the code yet. Its section will have the full set of par
 | D-47 | Export tokens as int32. | torch has little `uint32` support, and vocabularies are much smaller than 2³¹. | `uint32`, or int64 with a copy. | #18 |
 | D-48 | The DLPack capsules use our own destructor through `PyCapsule_New`. | A consumer renames the capsule and deletes the tensor itself. PyO3 destructors cannot see the name, so they would free the tensor a second time. | `PyCapsule::new_with_value`, as for the Arrow capsules. | #18 |
 | D-49 | S3 uses `AmazonS3Builder::from_env` and the options, in our `store` module. | `parse_url_opts` does not read the `AWS_*` environment variables. | `object_store::parse_url_opts`. | #18 |
-| D-50 | One runtime for each process, which refuses to work after a fork. | A forked child has none of the runtime threads, so a wait in it never ends. | A runtime for each `Loader`, which does not stop the fork problem. | #18 |
+| D-50 | One runtime for each process. A forked child makes its own, and a `Loader` copied into the child refuses to work. | A forked child has none of the parent's runtime threads, so a wait on the copied loader never ends. A new loader in the child must still work. | One runtime that refuses all work after a fork: the child can then never make a loader. | #18 |
 | D-51 | Python waits in slices of 100 ms and checks for signals between them. | Ctrl-C works, and `Loader::next` is cancel safe. | One wait with no signal check: Ctrl-C does nothing until the step ends. | #18 |
 | D-52 | `pad` has no default. | Many tokenizers use 0 as a real token. `lengths` gives the real tokens, but a silent default hides the choice. | A default of 0. | #18 |
 | D-53 | The bindings are the `plitzer-py` workspace crate, built by maturin as abi3 wheels for CPython 3.11 and later. | The core crate stays free of PyO3, and one wheel covers each platform. | PyO3 in the core crate behind a feature. | #18 |
 | D-54 | The default cache name is a hash of the resolved store and prefix. | The same text can name two datasets, and two texts can name one dataset. | A hash of the location text. | #18 |
 | D-55 | `__next__` keeps raising `StopIteration` after an epoch ends, and `__iter__` starts the next epoch. | Python iterators stay ended. A `zip` stops at the first ended loader, so `__iter__` must move the others on. | Start the next epoch at the next `__next__`. | #18 |
 | D-56 | In a forked child, a `Loader` leaks its session. | A drop stops runtime tasks, which can wait on a lock that no thread in the child will release. | Drop as usual and risk a hang at exit. | #18 |
-| D-57 | `Index::open` makes the cache file before it reads the footers. | A cache folder that cannot be written then fails at once, not after the full footer scan. | Write the cache after the build only. | #18 |
+| D-57 | `Index::open` makes and deletes a test file in the cache folder before it reads the footers. | A cache folder that cannot be written then fails at once, not after the full footer scan. No file stays open during the build. | Write the cache after the build only, or keep the temporary file open during the build. | #18 |
+| D-58 | The default cache name is a hash of `store::Location::id`, which holds the endpoint but no credentials. | New credentials keep the cache. Two servers with the same bucket name do not share it. | A hash of all storage options. | #18 |
 | D-22 | The sidecar uses its own binary format and FNV-1a. | No new dependency, and the bytes are fixed by our code. | `serde` with `bincode`, or JSON. | #10 |
 | D-23 | A sidecar that does not exist or is corrupt causes a new build. | The sidecar is only a cache. | An error that the user must correct. | #10 |
 | D-24 | The index keeps the place of each token column chunk, and the reader reads no footer. | A window has row groups from approximately W files. A footer read for each row group costs approximately 1.5 times the data. | Read the footer of each file again, or keep footers in memory (9.4 GB for FineWeb-Edu). | #12 |
@@ -1045,7 +1052,7 @@ This component is not in the code yet. Its section will have the full set of par
 | 2026-10-23 | #12 | Add the reader (`src/read.rs`) and the `s3` feature. Change the index to version 2, with the token column chunk of each row group. |
 | 2026-10-23 | #14 | Add the loader (`src/load.rs`) and `Order::lane_groups`. Change the index to version 3, with the value count. `Lane` holds an `Arc<Epoch>`. |
 | 2026-10-23 | #16 | Add the checkpoint (`src/checkpoint.rs`) and the session (`src/session.rs`). Add `Loader::ended`. Move the binary helpers to `src/codec.rs`. |
-| 2026-10-23 | #18 | Add the Python bindings (`plitzer-py/`) and the store (`src/store.rs`). Add a Python CI job on the three systems. The index makes the folder of its cache, and checks that it can write the cache before it reads the footers. |
+| 2026-10-23 | #18 | Add the Python bindings (`plitzer-py/`), the store (`src/store.rs`) and `Session::ended`. Add a Python CI job on the three systems. The index makes the folder of its cache, and checks that it can write the cache before it reads the footers. |
 
 ## 10. Maintenance
 

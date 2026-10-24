@@ -153,6 +153,7 @@ async fn epochs_roll_over() {
         |c: Checkpoint| c.epoch == 1 && c.lanes.iter().all(|&s| s == LaneState::default());
     let mut two = sessions(&d, 2).await;
     run(&mut two, end).await;
+    assert!(two[0].ended() && two[1].ended());
     assert!(
         next_epoch(two[0].checkpoint()),
         "before the call that gives None"
@@ -160,6 +161,7 @@ async fn epochs_roll_over() {
     let mut seq = vec![0; (2 * config().packing.seq_len) as usize];
     assert_eq!(two[0].next(&mut seq).await.unwrap(), None);
     assert_eq!((two[0].epoch(), two[1].epoch()), (1, 0));
+    assert!(!two[0].ended() && two[1].ended());
     // One rank saw `None` and one did not: their parts still agree.
     assert!(next_epoch(global(&two)));
 }
