@@ -16,33 +16,41 @@ ENDPOINT = os.environ.get("PLITZER_S3_ENDPOINT")
 pytestmark = pytest.mark.skipif(ENDPOINT is None, reason="PLITZER_S3_ENDPOINT not set")
 
 
-def test_s3_matches_local(dataset: Path, tmp_path: Path) -> None:
+BUCKET = os.environ.get("PLITZER_S3_BUCKET", "plitzer-test")
+KEY = os.environ.get("PLITZER_S3_ACCESS_KEY", "test")
+SECRET = os.environ.get("PLITZER_S3_SECRET_KEY", "testsecret")
+
+
+def upload(dataset: Path) -> str:
+    """The files of `dataset` under a new S3 prefix, byte for byte, so with
+    the same row groups and the same order. Returns the prefix."""
     assert ENDPOINT is not None
-    bucket = os.environ.get("PLITZER_S3_BUCKET", "plitzer-test")
-    key = os.environ.get("PLITZER_S3_ACCESS_KEY", "test")
-    secret = os.environ.get("PLITZER_S3_SECRET_KEY", "testsecret")
     scheme, host = ENDPOINT.split("://")
     fs = pafs.S3FileSystem(
-        access_key=key,
-        secret_key=secret,
+        access_key=KEY,
+        secret_key=SECRET,
         endpoint_override=host,
         scheme=scheme,
         region="us-east-1",
     )
     prefix = f"py-{time.time_ns()}"
-    # The same bytes, so the same row groups and the same order.
     for path in sorted(dataset.iterdir()):
-        with fs.open_output_stream(f"{bucket}/{prefix}/{path.name}") as out:
+        with fs.open_output_stream(f"{BUCKET}/{prefix}/{path.name}") as out:
             out.write(path.read_bytes())
+    return prefix
+
+
+def test_s3_matches_local(dataset: Path, tmp_path: Path) -> None:
+    assert ENDPOINT is not None
     options = {
         "endpoint": ENDPOINT,
         "allow_http": "true",
         "region": "us-east-1",
-        "access_key_id": key,
-        "secret_access_key": secret,
+        "access_key_id": KEY,
+        "secret_access_key": SECRET,
     }
     remote = plitzer.Loader(
-        f"s3://{bucket}/{prefix}",
+        f"s3://{BUCKET}/{upload(dataset)}",
         cache=str(tmp_path / "s3.idx"),
         storage_options=options,
         **SETTINGS,

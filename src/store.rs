@@ -87,7 +87,9 @@ fn local(dir: &std::path::Path, options: &[(String, String)]) -> Result<Location
     let store = LocalFileSystem::new_with_prefix(dir).map_err(Error::Store)?;
     // The store opened the folder, so it exists; links are resolved.
     let id = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
-    let id = id.display().to_string();
+    // `Debug` keeps bytes that are not UTF-8 apart; `Display` would merge
+    // two such folder names into one id.
+    let id = format!("{id:?}");
     let (store, prefix) = (Arc::new(store), Path::from(""));
     Ok(Location { store, prefix, id })
 }

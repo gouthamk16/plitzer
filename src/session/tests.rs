@@ -8,6 +8,7 @@ use tempfile::TempDir;
 use super::*;
 
 mod cancel;
+mod refuse;
 use crate::pack::Packing;
 
 fn config() -> Config {
@@ -172,7 +173,7 @@ async fn set_epoch_starts_that_epoch() {
     let mut two = sessions(&d, 2).await;
     run(&mut two, 3).await;
     for s in &mut two {
-        s.set_epoch(1);
+        s.set_epoch(1).unwrap();
     }
     assert_eq!(run(&mut two, end + 1).await, want[end + 1..2 * end + 2]);
 }
@@ -189,7 +190,7 @@ async fn set_epoch_never_goes_back() {
     let checkpoint = global(&one);
     let mut again = sessions(&d, 1).await;
     again[0].resume(&checkpoint).unwrap();
-    again[0].set_epoch(0);
+    again[0].set_epoch(0).unwrap();
     assert_eq!(run(&mut again, 2).await, want[end + 1..end + 3]);
 }
 
@@ -205,71 +206,9 @@ async fn set_epoch_keeps_a_resume_in_that_epoch() {
     let mut again = sessions(&d, 2).await;
     for s in &mut again {
         s.resume(&checkpoint).unwrap();
-        s.set_epoch(0);
+        s.set_epoch(0).unwrap();
     }
     assert_eq!(run(&mut again, 4).await, want[3..7]);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn resume_refuses_other_runs() {
-    let d = data();
-    let mut one = sessions(&d, 1).await;
-    run(&mut one, 2).await;
-    let saved = one[0].checkpoint();
-    let field = |r: Result<(), Error>| match r {
-        Err(Error::Checkpoint(checkpoint::Error::Mismatch { field, .. })) => field,
-        other => panic!("{other:?}"),
-    };
-    let mut c = config();
-    c.packing.seq_len = 16;
-    let mut other = open(&d, c, 0, 1).await.unwrap();
-    assert_eq!(field(other.resume(&saved)), "seq_len");
-    let mut c = config();
-    c.seed = 12;
-    let mut other = open(&d, c, 0, 1).await.unwrap();
-    assert_eq!(field(other.resume(&saved)), "seed");
-    write_file(d.files.path(), 4);
-    let mut other = open(&d, config(), 0, 1).await.unwrap();
-    assert_eq!(field(other.resume(&saved)), "fingerprint");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn resume_needs_this_ranks_lanes() {
-    let d = data();
-    let mut two = sessions(&d, 2).await;
-    run(&mut two, 2).await;
-    let part = two[1].checkpoint();
-    let mut again = sessions(&d, 2).await;
-    again[1].resume(&part).unwrap();
-    let refused = again[0].resume(&part);
-    assert!(matches!(
-        refused,
-        Err(Error::Checkpoint(checkpoint::Error::Parts(_)))
-    ));
-}
-
-#[tokio::test]
-async fn open_refuses_bad_settings() {
-    let d = data();
-    let refused = |r: Result<Session, Error>| matches!(r, Err(Error::Config(_)));
-    assert!(
-        refused(open(&d, config(), 0, 3).await),
-        "3 does not divide 4"
-    );
-    assert!(refused(open(&d, config(), 2, 2).await), "rank past world");
-    assert!(refused(open(&d, config(), 0, 0).await), "no GPUs");
-    let mut c = config();
-    c.window = 0;
-    assert!(refused(open(&d, c, 0, 1).await));
-    let mut c = config();
-    c.packing.docs = 0;
-    assert!(refused(open(&d, c, 0, 1).await));
-    let mut c = config();
-    c.lanes = 1 << 25;
-    assert!(refused(open(&d, c, 0, 1).await), "too many lanes");
-    let mut c = config();
-    c.packing.seq_len = u32::MAX;
-    assert!(refused(open(&d, c, 0, 1).await), "a step too large");
 }
 
 // A failed read leaves the session before the failed step, so the next call

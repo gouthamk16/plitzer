@@ -58,6 +58,8 @@ pub enum Error {
     },
     /// Parts that do not combine, or a part for other lanes.
     Parts(String),
+    /// A lane state or the epoch outside its range, which no run can make.
+    Range(String),
 }
 
 impl fmt::Display for Error {
@@ -75,7 +77,7 @@ impl fmt::Display for Error {
                     "the checkpoint has {field} = {saved}, but this run has {now}"
                 )
             }
-            Error::Parts(why) => write!(f, "{why}"),
+            Error::Parts(why) | Error::Range(why) => write!(f, "{why}"),
         }
     }
 }

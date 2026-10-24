@@ -97,16 +97,17 @@ fn file(r: &mut Reader) -> Option<File> {
     })
 }
 
-/// Makes the folder of `path` and a file in it, then deletes the file. It
-/// runs before the build, so a cache folder that cannot be written fails
-/// before any footer is read. No file stays open during the build, so a
-/// process killed then leaves nothing behind.
+/// Writes an empty sidecar at `path`, as the real one will be written. It
+/// runs before the build, so a cache that cannot be written, such as a
+/// folder, `""` or another user's file, fails before any footer is read.
+/// The old sidecar is stale at this point, and an empty one only causes a
+/// rebuild. No file stays open during the build.
 pub(super) fn check_writable(path: &std::path::Path) -> io::Result<()> {
     if path.is_dir() {
         let why = format!("the index cache {} is a folder, not a file", path.display());
         return Err(io::Error::new(io::ErrorKind::IsADirectory, why));
     }
-    tempfile::NamedTempFile::new_in(folder(path)?).map(drop)
+    write(path, &[])
 }
 
 /// The folder of `path`, made if it does not exist, as on a new machine.

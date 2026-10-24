@@ -11,13 +11,9 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyRange};
 
 use crate::array::Batch;
-use crate::errors::{ConfigError, checkpoint_error, session_error};
+use crate::errors::{checkpoint_error, session_error};
 use crate::runtime::block_on;
 use crate::settings::{Ints, config, int, locate};
-
-/// The largest epoch `set_epoch` takes: far past any run, and far from
-/// `u64::MAX`, so the epoch after it always exists.
-const MAX_EPOCH: u64 = 1 << 62;
 
 /// The lanes of GPU `rank` of `world`, from one epoch to the next. Iterate
 /// it for the rest of the current epoch; the next iteration gives the next.
@@ -174,7 +170,7 @@ impl Loader {
             state.exhausted = false;
             if state.session().ended() {
                 let next = state.session().epoch() + 1;
-                state.session().set_epoch(next);
+                state.session().set_epoch(next).map_err(session_error)?;
             }
             slf.save(&state);
         }
@@ -201,18 +197,13 @@ impl Loader {
     /// ended iterator stays ended when the call changes nothing.
     fn set_epoch(&self, epoch: i128) -> PyResult<()> {
         let epoch: u64 = int("epoch", epoch)?;
-        if epoch >= MAX_EPOCH {
-            return Err(ConfigError::new_err(format!("epoch {epoch} is too large")));
-        }
         let mut state = self.state()?;
         let at = state.session().epoch();
+        state.session().set_epoch(epoch).map_err(session_error)?;
         // `epoch == at` after `StopIteration`: the session already stands at
         // the start of `epoch`, so the iterator opens for it.
         if epoch >= at {
             state.exhausted = false;
-        }
-        if epoch > at {
-            state.session().set_epoch(epoch);
         }
         self.save(&state);
         Ok(())

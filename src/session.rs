@@ -99,10 +99,16 @@ impl Session {
     /// start of each epoch, also the one they resumed into, and a checkpoint
     /// after an epoch's last step is already at the next epoch. Going back
     /// would repeat data with no error; open a new session to do that.
-    pub fn set_epoch(&mut self, epoch: u64) {
+    /// Epochs from `MAX_EPOCH` on are refused, so the next epoch always
+    /// exists.
+    pub fn set_epoch(&mut self, epoch: u64) -> Result<(), Error> {
+        if epoch >= MAX_EPOCH {
+            return Err(Error::Config(format!("epoch {epoch} is too large")));
+        }
         if epoch > self.epoch {
             self.start_epoch(epoch);
         }
+        Ok(())
     }
 
     fn start_epoch(&mut self, epoch: u64) {
@@ -117,6 +123,7 @@ impl Session {
     pub fn resume(&mut self, checkpoint: &Checkpoint) -> Result<(), Error> {
         let states = (checkpoint.check(&self.config, self.fingerprint))
             .and_then(|()| checkpoint.states(self.lanes.clone()))
+            .and_then(|states| self.in_range(checkpoint.epoch, states))
             .map_err(Error::Checkpoint)?;
         self.epoch = checkpoint.epoch;
         self.start = states;
@@ -181,22 +188,56 @@ impl Session {
         self.lanes.clone()
     }
 
-    async fn load(&self) -> Result<Loader, Error> {
+    /// `states` if each lies inside epoch `epoch`: no later than its last
+    /// step, with its leftover not past the documents it has taken. A
+    /// checksummed checkpoint from plitzer always passes; this refuses one
+    /// made by hand, which would stop the packer with a panic.
+    fn in_range(
+        &self,
+        epoch: u64,
+        states: Vec<LaneState>,
+    ) -> Result<Vec<LaneState>, checkpoint::Error> {
+        if epoch >= MAX_EPOCH {
+            return Err(checkpoint::Error::Range(format!(
+                "epoch {epoch} is too large"
+            )));
+        }
+        let plan = self.epoch_plan(epoch);
+        let docs = u64::from(plan.packing().docs);
+        for (lane, s) in self.lanes.clone().zip(&states) {
+            let cursor = s.step.saturating_mul(docs).min(plan.lane_docs(lane));
+            if s.step > plan.steps() || s.doc > cursor {
+                let why = format!("lane {lane} state {s:?} is outside epoch {epoch}");
+                return Err(checkpoint::Error::Range(why));
+            }
+        }
+        Ok(states)
+    }
+
+    fn epoch_plan(&self, epoch: u64) -> Epoch {
         let c = &self.config;
         let order = Order {
             seed: c.seed,
-            epoch: self.epoch,
+            epoch,
             lanes: c.lanes,
             window: c.window,
             rows: &self.index.rows(),
         };
-        let epoch = Arc::new(Epoch::new(order, c.packing));
+        Epoch::new(order, c.packing)
+    }
+
+    async fn load(&self) -> Result<Loader, Error> {
+        let epoch = Arc::new(self.epoch_plan(self.epoch));
         let (reader, index) = (self.reader.clone(), self.index.clone());
         Loader::new(epoch, reader, index, self.lanes(), &self.start, self.budget)
             .await
             .map_err(Error::Load)
     }
 }
+
+/// The largest epoch: far past any run, and far from `u64::MAX`, so the
+/// epoch after it always exists.
+pub const MAX_EPOCH: u64 = 1 << 62;
 
 /// The most lanes: far past any real global batch. Each GPU keeps a state
 /// for each of its lanes, so a larger value could only exhaust memory.

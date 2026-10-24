@@ -17,12 +17,14 @@ from conftest import SETTINGS, MakeLoader
 Tokens = npt.NDArray[np.int32]
 
 
+def global_batch(batches: Sequence[plitzer.Batch]) -> Tokens:
+    """The tokens of one step of all ranks, in rank order."""
+    return np.concatenate([np.from_dlpack(b.tokens) for b in batches])
+
+
 def epoch(loaders: Sequence[plitzer.Loader]) -> list[Tokens]:
-    """The rest of the epoch: each step's global batch, all ranks in order."""
-    return [
-        np.concatenate([np.from_dlpack(b.tokens) for b in batches])
-        for batches in zip(*loaders, strict=True)
-    ]
+    """The rest of the epoch: each step's global batch."""
+    return [global_batch(batches) for batches in zip(*loaders, strict=True)]
 
 
 def same(a: Sequence[Tokens], b: Sequence[Tokens]) -> bool:
@@ -124,10 +126,7 @@ def test_non_strict_zip_keeps_ranks_together(make: MakeLoader) -> None:
     for w in want:
         # zip stops at the first StopIteration and never asks rank 1 for its
         # end; `iter` moves rank 1 on to the next epoch too.
-        got = [
-            np.concatenate([np.from_dlpack(b.tokens) for b in pair])
-            for pair in zip(*two, strict=False)
-        ]
+        got = [global_batch(pair) for pair in zip(*two, strict=False)]
         assert same(got, w)
 
 
@@ -156,10 +155,7 @@ def test_resume_on_another_world(make: MakeLoader) -> None:
     want = epoch([make()])
     for k in [0, 1, len(want) // 2]:
         two = [make(rank=r, world=2) for r in range(2)]
-        head = [
-            np.concatenate([np.from_dlpack(next(rank).tokens) for rank in two])
-            for _ in range(k)
-        ]
+        head = [global_batch([next(rank) for rank in two]) for _ in range(k)]
         checkpoint = plitzer.merge([rank.checkpoint() for rank in reversed(two)])
         four = [make(rank=r, world=4) for r in range(4)]
         for rank in four:

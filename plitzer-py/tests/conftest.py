@@ -9,6 +9,16 @@ import pytest
 import plitzer
 
 
+class Extras(TypedDict, total=False):
+    """The keywords of `plitzer.Loader` that have defaults."""
+
+    rank: int
+    world: int
+    column: str
+    cache: str | os.PathLike[str] | None
+    storage_options: dict[str, str] | None
+
+
 class Settings(TypedDict):
     """The keywords that `plitzer.Loader` needs."""
 
@@ -22,18 +32,12 @@ class Settings(TypedDict):
     budget: int
 
 
-class Args(Settings, total=False):
-    """Every keyword of `plitzer.Loader`."""
-
-    rank: int
-    world: int
-    column: str
-    cache: str | os.PathLike[str] | None
-    storage_options: dict[str, str] | None
+class Args(Settings, Extras):
+    """The keywords of a whole `plitzer.Loader` call."""
 
 
-class Overrides(TypedDict, total=False):
-    """Any keyword of `plitzer.Loader`, to replace one in SETTINGS."""
+class Overrides(Extras, total=False):
+    """Any keyword of `plitzer.Loader`, to replace one of SETTINGS."""
 
     seed: int
     lanes: int
@@ -43,11 +47,6 @@ class Overrides(TypedDict, total=False):
     cap: int
     pad: int
     budget: int
-    rank: int
-    world: int
-    column: str
-    cache: str | os.PathLike[str] | None
-    storage_options: dict[str, str] | None
 
 
 SETTINGS: Settings = {
