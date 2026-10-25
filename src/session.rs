@@ -122,9 +122,10 @@ impl Session {
             .map_err(Error::Checkpoint)?;
         let plan = Arc::new(self.epoch_plan(checkpoint.epoch));
         self.in_range(&plan, &states).map_err(Error::Checkpoint)?;
-        // Stop the old loader first, so two never hold the budget at once.
-        // The session keeps its position, so an error or a dropped future
-        // leaves it where it was: nothing below changes it before the end.
+        // Drop the old loader first: its row groups are freed before the new
+        // one fills its budget, and only reads still in flight outlive it,
+        // until their next await. The session keeps its position, so an
+        // error or a dropped future leaves it where it was.
         self.park();
         let loader = self.load(plan, &states).await?;
         (self.epoch, self.start, self.loader) = (checkpoint.epoch, states, Some(loader));
@@ -173,7 +174,7 @@ impl Session {
     /// the call of `next` that returns `None`, so the parts of all GPUs agree.
     pub fn checkpoint(&self) -> Checkpoint {
         let (epoch, lanes) = match &self.loader {
-            _ if self.ended() => (
+            Some(l) if l.ended() => (
                 self.epoch.saturating_add(1),
                 vec![LaneState::default(); self.lanes.len()],
             ),

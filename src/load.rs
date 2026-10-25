@@ -157,7 +157,10 @@ impl Loader {
         let buffer = &loader.buffer;
         loader.lanes = lanes
             .zip(states)
-            .map(|(l, &s)| epoch.lane(l, s, buffer))
+            .map(|(l, &s)| {
+                let at = |why| format!("lane {l} of epoch {}: {why}", epoch.order().epoch);
+                epoch.lane(l, s, buffer).map_err(at)
+            })
             .collect::<Result<_, _>>()
             .map_err(Error::State)?;
         Ok(loader)

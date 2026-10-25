@@ -150,9 +150,6 @@ impl Loader {
         cache: Option<PathBuf>,
         storage_options: Option<HashMap<String, String>>,
     ) -> PyResult<Self> {
-        let location = (location.to_str())
-            .ok_or_else(|| ConfigError::new_err(format!("{location:?} is not UTF-8")))?;
-        let (store, prefix, cache) = locate(location, storage_options, &column, cache)?;
         let ints = Ints {
             seed,
             lanes,
@@ -162,8 +159,12 @@ impl Loader {
             cap,
             pad,
         };
-        let config = config(column, ints)?;
+        // The settings first: their errors are the simplest to fix.
         let (rank, world, budget) = placement(rank, world, budget)?;
+        let config = config(column, ints)?;
+        let location = (location.to_str())
+            .ok_or_else(|| ConfigError::new_err(format!("{location:?} is not UTF-8")))?;
+        let (store, prefix, cache) = locate(location, storage_options, &config.column, cache)?;
         let open = Session::open(store, prefix, &cache, config, rank, world, budget);
         let session = block_on(py, open)?.map_err(session_error)?;
         Ok(Loader::from_session(session))

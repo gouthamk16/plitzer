@@ -14,7 +14,7 @@ cargo test
 cargo test <name>          # single test, substring match
 cargo clippy --all-targets --all-features
 cargo fmt
-cargo test --features s3 --test s3   # needs PLITZER_S3_ENDPOINT, e.g. a local versitygw
+cargo test --features s3   # tests/s3.rs needs PLITZER_S3_ENDPOINT, e.g. a local versitygw
 
 # Python bindings (plitzer-py/), in a virtualenv with maturin, pytest, numpy, pyarrow
 maturin develop -m plitzer-py/Cargo.toml

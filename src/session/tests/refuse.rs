@@ -52,6 +52,7 @@ async fn resume_refuses_states_outside_the_epoch() {
         };
         match one[0].resume(&bad).await {
             Err(Error::Checkpoint(checkpoint::Error::Range(why))) => {
+                assert!(why.starts_with("lane 0 of epoch 0: "), "{why}");
                 over_cap |= why.contains("more than the cap");
             }
             other => panic!("doc {doc}: {other:?}"),

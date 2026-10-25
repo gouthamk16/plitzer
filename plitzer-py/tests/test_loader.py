@@ -219,7 +219,8 @@ def test_bad_settings(make: MakeLoader, tmp_path: Path) -> None:
     with pytest.raises(plitzer.ConfigError, match="epoch"):
         make().set_epoch(-1)
     with pytest.raises(plitzer.ConfigError, match="lanes must be an int, not float"):
-        make(lanes=4.0)  # type: ignore[arg-type]
+        # Also with a bad location: the settings are checked first.
+        make(lanes=4.0, storage_options={"region": "x"})  # type: ignore[arg-type]
     with pytest.raises(plitzer.ConfigError, match="docs must be an int, not bool"):
         make(docs=True)
     make().set_epoch(np.int64(1))  # has __index__

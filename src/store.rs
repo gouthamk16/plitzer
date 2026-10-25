@@ -104,21 +104,7 @@ fn s3(env: AmazonS3Builder, url: &Url, options: &[(String, String)]) -> Result<L
         return Err(Error::Option(why));
     }
     let bucket = url.host_str().unwrap_or_default();
-    let mut builder = env.with_url(format!("s3://{bucket}"));
-    let mut keys = Vec::new();
-    for (key, value) in options {
-        let key: AmazonS3ConfigKey = (key.to_ascii_lowercase().parse())
-            .map_err(|_| Error::Option(format!("unknown S3 storage option {key:?}")))?;
-        builder = builder.with_config(key, value);
-        keys.push(key);
-    }
-    // The builder prefers the S3-only endpoint, which can come from
-    // `AWS_ENDPOINT_URL_S3`; an `endpoint` option must still win over it.
-    let (general, s3_only) = (AmazonS3ConfigKey::Endpoint, AmazonS3ConfigKey::S3Endpoint);
-    if keys.contains(&general) && !keys.contains(&s3_only) {
-        let endpoint = builder.get_config_value(&general).unwrap_or_default();
-        builder = builder.with_config(s3_only, endpoint);
-    }
+    let builder = with_options(env.with_url(format!("s3://{bucket}")), options)?;
     // The endpoint, from the options or the environment, tells two servers
     // with the same bucket name apart. The builder prefers the S3-only
     // endpoint, so the id does too. Keys and tokens stay out of the id.
@@ -134,6 +120,29 @@ fn s3(env: AmazonS3Builder, url: &Url, options: &[(String, String)]) -> Result<L
         prefix,
         id,
     })
+}
+
+/// `builder` with each of `options`; an unknown one is an error.
+#[cfg(feature = "s3")]
+fn with_options(
+    mut builder: AmazonS3Builder,
+    options: &[(String, String)],
+) -> Result<AmazonS3Builder, Error> {
+    let mut keys = Vec::new();
+    for (key, value) in options {
+        let key: AmazonS3ConfigKey = (key.to_ascii_lowercase().parse())
+            .map_err(|_| Error::Option(format!("unknown S3 storage option {key:?}")))?;
+        builder = builder.with_config(key, value);
+        keys.push(key);
+    }
+    // The builder prefers the S3-only endpoint, which can come from
+    // `AWS_ENDPOINT_URL_S3`; an `endpoint` option must still win over it.
+    let (general, s3_only) = (AmazonS3ConfigKey::Endpoint, AmazonS3ConfigKey::S3Endpoint);
+    if keys.contains(&general) && !keys.contains(&s3_only) {
+        let endpoint = builder.get_config_value(&general).unwrap_or_default();
+        builder = builder.with_config(s3_only, endpoint);
+    }
+    Ok(builder)
 }
 
 #[cfg(test)]
