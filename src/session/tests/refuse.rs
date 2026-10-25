@@ -39,18 +39,27 @@ async fn resume_refuses_states_outside_the_epoch() {
     let mut bad = good.clone();
     bad.lanes[0].doc = 1_000_000;
     assert!(range(one[0].resume(&bad)), "leftover past the cursor");
-    let mut bad = good.clone();
-    bad.epoch = MAX_EPOCH + 1;
-    assert!(range(one[0].resume(&bad)), "epoch too large");
-    // The checkpoint after the last step of `MAX_EPOCH - 1` stands here.
-    let mut last = good.clone();
-    last.epoch = MAX_EPOCH;
-    last.lanes.fill(LaneState::default());
-    one[0].resume(&last).unwrap();
-    let mut bad = good.clone();
-    bad.epoch = MAX_EPOCH + 1;
-    assert!(range(one[0].resume(&bad)), "epoch too large");
-    assert!(matches!(one[0].set_epoch(MAX_EPOCH), Err(Error::Config(_))));
+    // A leftover that starts earlier than the real one passes the check at
+    // `resume`, but can exceed the cap; the tokens show it at the first
+    // step, as an error, not a panic.
+    let mut out = vec![0; (4 * config().packing.seq_len) as usize];
+    let mut over_cap = false;
+    for doc in 0..good.lanes[0].doc {
+        let mut bad = good.clone();
+        bad.lanes[0] = LaneState {
+            doc,
+            offset: 0,
+            ..bad.lanes[0]
+        };
+        one[0].resume(&bad).unwrap();
+        match one[0].next(&mut out).await {
+            Err(Error::Checkpoint(checkpoint::Error::Range(why))) => {
+                over_cap |= why.contains("more than the cap");
+            }
+            other => panic!("doc {doc}: {other:?}"),
+        }
+    }
+    assert!(over_cap, "no earlier leftover start exceeded the cap");
     one[0].resume(&good).unwrap();
 }
 

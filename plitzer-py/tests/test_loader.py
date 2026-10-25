@@ -183,8 +183,7 @@ def test_bad_settings(make: MakeLoader, tmp_path: Path) -> None:
         make(world=-1)
     with pytest.raises(plitzer.ConfigError, match="epoch"):
         make().set_epoch(-1)
-    with pytest.raises(plitzer.ConfigError, match="epoch"):
-        make().set_epoch(2**62)
+
     with pytest.raises(plitzer.ConfigError, match="#"):
         plitzer.Loader(str(tmp_path.as_uri()) + "/data#2", **SETTINGS)
     blocker = tmp_path / "file"

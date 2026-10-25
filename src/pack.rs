@@ -103,10 +103,15 @@ impl Epoch {
     }
 
     /// Lane `lane`, resumed from `state`.
-    pub fn lane(self: &Arc<Self>, lane: u32, state: LaneState, tokens: &impl Tokens) -> Lane {
-        let cursor = self
-            .check(lane, state)
-            .unwrap_or_else(|why| panic!("{why}"));
+    /// Lane `lane` at `state`. A state that no run makes, such as one from a
+    /// checkpoint made by hand, is an error that names what is wrong.
+    pub fn lane(
+        self: &Arc<Self>,
+        lane: u32,
+        state: LaneState,
+        tokens: &impl Tokens,
+    ) -> Result<Lane, String> {
+        let cursor = self.check(lane, state)?;
         let mut l = Lane {
             epoch: self.clone(),
             lane,
@@ -115,8 +120,8 @@ impl Epoch {
             leftover: Leftover::new(state.doc),
         };
         l.take(tokens, cursor - state.doc);
-        l.start_at(state);
-        l
+        l.start_at(state)?;
+        Ok(l)
     }
 
     /// The documents lane `lane` takes in the whole epoch.
@@ -202,22 +207,21 @@ impl Lane {
 
     /// Skips the replayed leftover's first `state.offset` tokens and checks
     /// that the lane now stands exactly at `state`.
-    fn start_at(&mut self, state: LaneState) {
+    fn start_at(&mut self, state: LaneState) -> Result<(), String> {
         let first = self.leftover.lens.front().copied().unwrap_or(0);
-        assert!(
-            state.offset == 0 || state.offset < first,
-            "state {state:?} offset is past its document"
-        );
+        if state.offset != 0 && state.offset >= first {
+            return Err(format!("state {state:?} offset is past its document"));
+        }
         self.leftover.advance(state.offset as usize);
-        assert_eq!(
-            self.state(),
-            state,
-            "state does not start on a document with tokens left"
-        );
-        assert!(
-            self.leftover.tokens.len() <= self.epoch.packing.cap as usize,
-            "state {state:?} leaves more than the cap"
-        );
+        if self.state() != state {
+            return Err(format!(
+                "state {state:?} does not start on a document with tokens left"
+            ));
+        }
+        if self.leftover.tokens.len() > self.epoch.packing.cap as usize {
+            return Err(format!("state {state:?} leaves more than the cap"));
+        }
+        Ok(())
     }
 
     /// Adds the next `n` documents, or as many as are left, to the leftover.

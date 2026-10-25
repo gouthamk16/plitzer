@@ -172,8 +172,8 @@ impl Loader {
             let mut state = slf.state()?;
             state.exhausted = false;
             if state.session().ended() {
-                let next = state.session().epoch() + 1;
-                state.session().set_epoch(next).map_err(session_error)?;
+                let next = state.session().epoch().saturating_add(1);
+                state.session().set_epoch(next);
             }
             slf.save(&state);
         }
@@ -202,7 +202,7 @@ impl Loader {
         let epoch: u64 = int("epoch", epoch)?;
         let mut state = self.state()?;
         let at = state.session().epoch();
-        state.session().set_epoch(epoch).map_err(session_error)?;
+        state.session().set_epoch(epoch);
         // `epoch == at` after `StopIteration`: the session already stands at
         // the start of `epoch`, so the iterator opens for it.
         if epoch >= at {

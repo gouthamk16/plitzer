@@ -321,7 +321,8 @@ impl Epoch {
     pub fn packing(&self) -> Packing;
     pub fn steps(&self) -> u64;
     pub fn lane_docs(&self, lane: u32) -> u64;
-    pub fn lane(self: &Arc<Self>, lane: u32, state: LaneState, tokens: &impl Tokens) -> Lane;
+    pub fn lane(self: &Arc<Self>, lane: u32, state: LaneState, tokens: &impl Tokens)
+        -> Result<Lane, String>;   // Err for a state that no run makes
     pub fn check(&self, lane: u32, state: LaneState) -> Result<u64, String>;  // step and leftover in range; the cursor
 }
 impl Lane {
@@ -593,7 +594,7 @@ impl Loader {
     pub fn resident_bytes(&self) -> usize;
 }
 
-pub enum Error { Budget { needed, budget }, Read(read::Error), Join(..), Stopped }
+pub enum Error { Budget { needed, budget }, Read(read::Error), Join(..), Stopped, State(String) }
 ```
 
 The caller gives `lanes = gpu_lanes(B, world, rank)`. Thus the loader does not know world.
@@ -728,7 +729,7 @@ Each GPU gives a checkpoint part for its own lanes. `merge` puts the parts of al
 **Limits:**
 
 - The checksum finds damage, not changes by an attacker.
-- `from_bytes` does not make sure that each lane state is correct for the epoch. `Session::resume` refuses a step past the epoch, a leftover past the cursor and an epoch past 2⁶² (2⁶² itself is the checkpoint after the last step of the last epoch that `set_epoch` takes), through `Epoch::check`, which `Epoch::lane` also uses (D-64). `merge` reserves no memory from the B in the bytes. An offset past the end of its document can be found only with the data, so a checkpoint made by hand with such an offset still causes a panic in `Epoch::lane`.
+- `from_bytes` does not make sure that each lane state is correct for the epoch. `Session::resume` refuses a step past the epoch and a leftover past the cursor, through `Epoch::check` (D-64). The other states that no run makes, such as an offset past its document or a leftover past the cap, need the tokens. `Epoch::lane` then gives an error, which the session gives as `checkpoint::Error::Range` at the first step. No checkpoint causes a panic. `merge` reserves no memory from the B in the bytes.
 
 **Verification:**
 
@@ -754,7 +755,7 @@ Each GPU gives a checkpoint part for its own lanes. `merge` puts the parts of al
 impl Session {
     pub async fn open(store: Arc<dyn ObjectStore>, prefix: Path, cache: &std::path::Path,
                       config: Config, rank: u32, world: u32, budget: u64) -> Result<Session, Error>;
-    pub fn set_epoch(&mut self, epoch: u64) -> Result<(), Error>;   // Error::Config from MAX_EPOCH = 2⁶²
+    pub fn set_epoch(&mut self, epoch: u64);
     pub fn resume(&mut self, checkpoint: &Checkpoint) -> Result<(), Error>;
     pub async fn next(&mut self, out: &mut [u32]) -> Result<Option<Vec<u32>>, Error>;
     pub fn checkpoint(&self) -> Checkpoint;    // the part of this GPU
@@ -801,7 +802,7 @@ pub enum Error { Config(String), Index(index::Error), Read(read::Error),
 | `next_is_cancel_safe` | Unit | Over a store with 5 ms reads, calls of `next` that are dropped after one poll give the same batches as a run with no drops. |
 | `resume_refuses_other_runs` | Unit | A different L, a different seed and an added file each give `Mismatch` with the name of the field. |
 | `resume_needs_this_ranks_lanes` | Unit | A part resumes the rank that holds its lanes, and another rank refuses it. |
-| `resume_refuses_states_outside_the_epoch` | Unit | A step past the epoch, a leftover past the cursor and the epoch 2⁶² + 1 give `checkpoint::Error::Range`. The start of epoch 2⁶² resumes. `set_epoch(2⁶²)` gives `Error::Config`. |
+| `resume_refuses_states_outside_the_epoch` | Unit | A step past the epoch and a leftover past the cursor give `checkpoint::Error::Range` at `resume`. A leftover that starts earlier and goes past the cap gives `checkpoint::Error::Range` at the first step, not a panic. |
 | `open_refuses_bad_settings` | Unit | A world that does not divide B, a rank out of range, no GPUs, W = 0, D = 0, 2²⁵ lanes, L = 2³² − 1 and C = 2³² − 1 each give `Error::Config`. |
 | `next_retries_after_a_failed_read` | Unit | After a failed read and a repair of the file, the next calls give the same batches as a run with no failure. |
 
@@ -927,7 +928,7 @@ An Arrow consumer moves the structs out of the capsules and sets their `release`
 - Both DLPack ABIs: numpy 2 and current torch ask for the versioned ABI, and older consumers call `__dlpack__()` with no arguments (D-46).
 - int32: torch has little support for `uint32`, and vocabularies are much smaller than 2³¹. A pad token of 2³² − 1 shows as −1 (D-47).
 - `pad` has no default. Many tokenizers use 0 as a real token, so the user must choose (D-52). A negative `pad` from −2³¹ is the token with the same bits, so `pad=-1` and `pad=2**32 - 1` give the same batches.
-- `set_epoch(e)` opens the iterator for epoch `e` when the loader stands at the start of `e`, also just after `StopIteration`. Thus a trainer that calls `set_epoch` and then `next` for each epoch gets each epoch. `set_epoch` refuses epochs from 2⁶², so the epoch after the last one always exists.
+- `set_epoch(e)` opens the iterator for epoch `e` when the loader stands at the start of `e`, also just after `StopIteration`. Thus a trainer that calls `set_epoch` and then `next` for each epoch gets each epoch. The epoch after `u64::MAX` is `u64::MAX`: the count stops there and never wraps to 0.
 - The runtime has all its drivers. The S3 client needs the I/O driver, and the waits need the timer.
 - The PID check stops a forked child before it waits for runtime threads that it does not have (D-50).
 - The 100 ms slices let Ctrl-C work and cost one timer for each slice (D-51).
@@ -1047,7 +1048,7 @@ This component is not in the code yet. Its section will have the full set of par
 | D-55 | `__next__` keeps raising `StopIteration` after an epoch ends, and `__iter__` starts the next epoch. | Python iterators stay ended. A `zip` stops at the first ended loader, so `__iter__` must move the others on. | Start the next epoch at the next `__next__`. | #18 |
 | D-56 | In a forked child, a `Loader` leaks its session. | A drop stops runtime tasks, which can wait on a lock that no thread in the child will release. | Drop as usual and risk a hang at exit. | #18 |
 | D-57 | Before it reads the footers, `Index::open` makes a file in the cache folder. It changes no file. | A cache that cannot be written then fails at once, not after the full footer scan. Another process can have just written a good sidecar, so the check must not replace it. No file stays open during the build. | Write the cache after the build only, or keep the temporary file open during the build. | #18 |
-| D-64 | `Session::resume` checks the epoch and each lane's step and leftover against the epoch. | A checkpoint made by hand passes the checksum, and its states would stop the packer with a panic. | Trust each checksummed checkpoint. | #18 |
+| D-64 | `Epoch::lane` gives an error, not a panic, for a state that no run makes. `Session::resume` checks the cheap part at once. | A checkpoint made by hand passes the checksum, and its states would stop the packer with a panic. | Trust each checksummed checkpoint, or check only some states. | #18 |
 | D-58 | The default cache name is a hash of `store::Location::id`, which holds the endpoint but no credentials. | New credentials keep the cache. Two servers with the same bucket name do not share it. | A hash of all storage options. | #18 |
 | D-59 | A frozen `Loader` with a lock for the session and a checkpoint snapshot that other calls read. | A preemption signal handler or a background thread can save a checkpoint during a step. A second step from another thread gets an error, not a deadlock. | A borrow for each call, which refuses all calls during a step. A lock that each call takes, which deadlocks a signal handler. | #18 |
 | D-60 | The runtime has at most 8 worker threads and 32 blocking threads. | Each GPU process has its own runtime, and a loader has at most 16 reads in flight. | One worker for each CPU: hundreds of threads in each process on a large node. | #18 |

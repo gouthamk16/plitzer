@@ -41,7 +41,7 @@ type Out = (Vec<u32>, u32, LaneState);
 
 /// Runs `lane` from `state` to the end of the epoch.
 fn run(e: &Arc<Epoch>, c: &Corpus, lane: u32, state: LaneState) -> Vec<Out> {
-    let mut l = e.lane(lane, state, c);
+    let mut l = e.lane(lane, state, c).unwrap();
     let mut out = vec![0; e.packing.seq_len as usize];
     (state.step..e.steps())
         .map(|_| {
@@ -135,7 +135,7 @@ proptest! {
         let e = epoch(&rows, lanes, window, seed, p);
         let mut out = vec![0; p.seq_len as usize];
         for lane in 0..lanes {
-            let mut l = e.lane(lane, LaneState::default(), &c);
+            let mut l = e.lane(lane, LaneState::default(), &c).unwrap();
             for _ in 0..e.steps() {
                 let real = l.fill(&c, &mut out) as usize;
                 prop_assert!(out[real..].iter().all(|&t| t == PAD));
@@ -176,7 +176,7 @@ proptest! {
         for (world, to) in [(worlds[a], k), (worlds[b], e.steps())] {
             for rank in 0..world {
                 for lane in gpu_lanes(LANES, world, rank) {
-                    let mut l = e.lane(lane, states[lane as usize], &c);
+                    let mut l = e.lane(lane, states[lane as usize], &c).unwrap();
                     let mut out = vec![0; p.seq_len as usize];
                     for step in states[lane as usize].step..to {
                         l.fill(&c, &mut out);
@@ -272,7 +272,7 @@ fn fill_past_end_panics() {
         doc: 4,
         offset: 0,
     };
-    let mut l = e.lane(0, end, &c);
+    let mut l = e.lane(0, end, &c).unwrap();
     l.fill(&c, &mut [0; 4]);
 }
 
@@ -281,15 +281,16 @@ fn fill_past_end_panics() {
 fn wrong_out_len_panics() {
     let (c, rows) = small();
     let e = epoch(&rows, 1, 2, 7, P4);
-    e.lane(0, LaneState::default(), &c).fill(&c, &mut [0; 3]);
+    e.lane(0, LaneState::default(), &c)
+        .unwrap()
+        .fill(&c, &mut [0; 3]);
 }
 
 #[test]
-#[should_panic(expected = "past the cursor")]
-fn state_past_cursor_panics() {
+fn state_past_cursor_is_refused() {
     let (c, rows) = small();
     let e = epoch(&rows, 1, 2, 7, P4);
-    e.lane(
+    let got = e.lane(
         0,
         LaneState {
             step: 1,
@@ -298,14 +299,14 @@ fn state_past_cursor_panics() {
         },
         &c,
     );
+    assert!(got.is_err_and(|why| why.contains("past the cursor")));
 }
 
 #[test]
-#[should_panic(expected = "offset is past its document")]
-fn offset_past_doc_panics() {
+fn offset_past_doc_is_refused() {
     let (c, rows) = small();
     let e = epoch(&rows, 1, 2, 7, P4);
-    e.lane(
+    let got = e.lane(
         0,
         LaneState {
             step: 1,
@@ -314,6 +315,7 @@ fn offset_past_doc_panics() {
         },
         &c,
     );
+    assert!(got.is_err_and(|why| why.contains("offset is past its document")));
 }
 
 #[test]

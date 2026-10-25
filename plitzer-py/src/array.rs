@@ -1,5 +1,6 @@
 //! Batches, and their export to Python without a copy.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_array::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
@@ -44,31 +45,30 @@ impl Array {
                 Field::new(self.name, DataType::Int32, false),
                 Arc::new(values),
             )),
-            [_, cols] => {
-                let item = Arc::new(Field::new("item", DataType::Int32, false));
-                let size = i32::try_from(cols)
-                    .map_err(|_| PyValueError::new_err("row too long for Arrow"))?;
-                let list = FixedSizeListArray::new(item, size, Arc::new(values), None);
-                let metadata = [
-                    (
-                        "ARROW:extension:name".to_string(),
-                        "arrow.fixed_shape_tensor".to_string(),
-                    ),
-                    (
-                        "ARROW:extension:metadata".to_string(),
-                        format!("{{\"shape\":[{cols}]}}"),
-                    ),
-                ];
-                let field = Field::new(self.name, list.data_type().clone(), false).with_metadata(
-                    metadata
-                        .into_iter()
-                        .collect::<std::collections::HashMap<_, _>>(),
-                );
-                Ok((field, Arc::new(list)))
-            }
+            [_, cols] => tensor(self.name, values, cols),
             _ => unreachable!("arrays are 1-D or 2-D"),
         }
     }
+}
+
+/// Rows of `cols` values as a fixed-size list, typed
+/// `arrow.fixed_shape_tensor` with shape `[cols]`.
+fn tensor(name: &str, values: Int32Array, cols: usize) -> PyResult<(Field, ArrayRef)> {
+    let item = Arc::new(Field::new("item", DataType::Int32, false));
+    let size = i32::try_from(cols).map_err(|_| PyValueError::new_err("row too long for Arrow"))?;
+    let list = FixedSizeListArray::new(item, size, Arc::new(values), None);
+    let metadata = HashMap::from([
+        (
+            "ARROW:extension:name".to_string(),
+            "arrow.fixed_shape_tensor".to_string(),
+        ),
+        (
+            "ARROW:extension:metadata".to_string(),
+            format!("{{\"shape\":[{cols}]}}"),
+        ),
+    ]);
+    let field = Field::new(name, list.data_type().clone(), false).with_metadata(metadata);
+    Ok((field, Arc::new(list)))
 }
 
 #[pymethods]

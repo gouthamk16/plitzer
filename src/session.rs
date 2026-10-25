@@ -99,16 +99,10 @@ impl Session {
     /// start of each epoch, also the one they resumed into, and a checkpoint
     /// after an epoch's last step is already at the next epoch. Going back
     /// would repeat data with no error; open a new session to do that.
-    /// Epochs from `MAX_EPOCH` on are refused, so the next epoch always
-    /// exists.
-    pub fn set_epoch(&mut self, epoch: u64) -> Result<(), Error> {
-        if epoch >= MAX_EPOCH {
-            return Err(Error::Config(format!("epoch {epoch} is too large")));
-        }
+    pub fn set_epoch(&mut self, epoch: u64) {
         if epoch > self.epoch {
             self.start_epoch(epoch);
         }
-        Ok(())
     }
 
     fn start_epoch(&mut self, epoch: u64) {
@@ -144,7 +138,7 @@ impl Session {
         match loader.next(out).await {
             Ok(Some(real)) => Ok(Some(real)),
             Ok(None) => {
-                self.start_epoch(self.epoch + 1);
+                self.start_epoch(self.epoch.saturating_add(1));
                 Ok(None)
             }
             Err(e) => {
@@ -161,7 +155,10 @@ impl Session {
     /// the call of `next` that returns `None`, so the parts of all GPUs agree.
     pub fn checkpoint(&self) -> Checkpoint {
         let (epoch, lanes) = match &self.loader {
-            _ if self.ended() => (self.epoch + 1, vec![LaneState::default(); self.lanes.len()]),
+            _ if self.ended() => (
+                self.epoch.saturating_add(1),
+                vec![LaneState::default(); self.lanes.len()],
+            ),
             Some(l) => (self.epoch, l.states()),
             None => (self.epoch, self.start.clone()),
         };
@@ -188,18 +185,12 @@ impl Session {
         self.lanes.clone()
     }
 
-    /// `states` if each lies inside epoch `epoch`: no later than its last
-    /// step, with its leftover not past the documents it has taken. A
-    /// checksummed checkpoint from plitzer always passes; this refuses one
-    /// made by hand, which would stop the packer with a panic.
+    /// Whether each of `states` lies inside epoch `epoch`: no later than its
+    /// last step, with its leftover not past the documents it has taken. A
+    /// checkpoint from plitzer always passes. This refuses most hand-made
+    /// ones at `resume`; the rest, which need the tokens, are refused as
+    /// `checkpoint::Error::Range` at the first step.
     fn in_range(&self, epoch: u64, states: &[LaneState]) -> Result<(), checkpoint::Error> {
-        // `MAX_EPOCH` itself is allowed: a checkpoint after the last step of
-        // epoch `MAX_EPOCH - 1`, which `set_epoch` allows, stands there.
-        if epoch > MAX_EPOCH {
-            return Err(checkpoint::Error::Range(format!(
-                "epoch {epoch} is too large"
-            )));
-        }
         let plan = self.epoch_plan(epoch);
         for (lane, &state) in self.lanes.clone().zip(states) {
             let at = |why| format!("lane {lane} of epoch {epoch}: {why}");
@@ -224,15 +215,14 @@ impl Session {
     async fn load(&self) -> Result<Loader, Error> {
         let epoch = Arc::new(self.epoch_plan(self.epoch));
         let (reader, index) = (self.reader.clone(), self.index.clone());
-        Loader::new(epoch, reader, index, self.lanes(), &self.start, self.budget)
-            .await
-            .map_err(Error::Load)
+        let loader = Loader::new(epoch, reader, index, self.lanes(), &self.start, self.budget);
+        loader.await.map_err(|e| match e {
+            // Only a resumed checkpoint gives a state that no run makes.
+            load::Error::State(why) => Error::Checkpoint(checkpoint::Error::Range(why)),
+            e => Error::Load(e),
+        })
     }
 }
-
-/// The largest epoch: far past any run, and far from `u64::MAX`, so the
-/// epoch after it always exists.
-pub const MAX_EPOCH: u64 = 1 << 62;
 
 /// The most lanes: far past any real global batch. Each GPU keeps a state
 /// for each of its lanes, so a larger value could only exhaust memory.

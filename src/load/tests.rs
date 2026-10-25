@@ -109,7 +109,7 @@ async fn all(d: &Data) -> All {
 
 fn direct(d: &Data, all: &All) -> Vec<Vec<u32>> {
     let mut lanes: Vec<Lane> = (0..LANES)
-        .map(|l| d.epoch.lane(l, LaneState::default(), all))
+        .map(|l| d.epoch.lane(l, LaneState::default(), all).unwrap())
         .collect();
     let mut seq = vec![0; PACKING.seq_len as usize];
     (0..d.epoch.steps())

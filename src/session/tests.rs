@@ -173,7 +173,7 @@ async fn set_epoch_starts_that_epoch() {
     let mut two = sessions(&d, 2).await;
     run(&mut two, 3).await;
     for s in &mut two {
-        s.set_epoch(1).unwrap();
+        s.set_epoch(1);
     }
     assert_eq!(run(&mut two, end + 1).await, want[end + 1..2 * end + 2]);
 }
@@ -190,7 +190,7 @@ async fn set_epoch_never_goes_back() {
     let checkpoint = global(&one);
     let mut again = sessions(&d, 1).await;
     again[0].resume(&checkpoint).unwrap();
-    again[0].set_epoch(0).unwrap();
+    again[0].set_epoch(0);
     assert_eq!(run(&mut again, 2).await, want[end + 1..end + 3]);
 }
 
@@ -206,7 +206,7 @@ async fn set_epoch_keeps_a_resume_in_that_epoch() {
     let mut again = sessions(&d, 2).await;
     for s in &mut again {
         s.resume(&checkpoint).unwrap();
-        s.set_epoch(0).unwrap();
+        s.set_epoch(0);
     }
     assert_eq!(run(&mut again, 4).await, want[3..7]);
 }
