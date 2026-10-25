@@ -101,3 +101,38 @@ async fn index_and_read_over_s3() {
         .collect();
     assert_eq!(got, want);
 }
+
+// `store::open` reads the URL's bucket and prefix, and the options.
+#[tokio::test]
+async fn open_an_s3_url() {
+    let bucket = env("PLITZER_S3_BUCKET", "plitzer-test");
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let prefix = Path::from(format!("url-{nanos}"));
+    let location = prefix.clone().join("part-0.parquet");
+    let payload = PutPayload::from(parquet_bytes(0, 9));
+    store().put(&location, payload).await.unwrap();
+
+    let options: Vec<(String, String)> = [
+        ("endpoint", std::env::var("PLITZER_S3_ENDPOINT").unwrap()),
+        ("allow_http", "true".to_string()),
+        ("region", "us-east-1".to_string()),
+        ("access_key_id", env("PLITZER_S3_ACCESS_KEY", "test")),
+        (
+            "secret_access_key",
+            env("PLITZER_S3_SECRET_KEY", "testsecret"),
+        ),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v))
+    .collect();
+    let url = format!("s3://{bucket}/{prefix}");
+    let at = plitzer::store::open(&url, &options).unwrap();
+    assert_eq!(at.prefix, prefix);
+    let index = Index::build(&*at.store, &at.prefix, "tokens")
+        .await
+        .unwrap();
+    assert_eq!(index.rows(), [7, 2]);
+}

@@ -36,7 +36,7 @@ async fn plan_matches_lane_streams() {
         let all = all(&d).await;
         let k = d.epoch.steps() / 2;
         let mut lanes: Vec<Lane> = (0..LANES)
-            .map(|l| d.epoch.lane(l, LaneState::default(), &all))
+            .map(|l| d.epoch.lane(l, LaneState::default(), &all).unwrap())
             .collect();
         let mut seq = vec![0; PACKING.seq_len as usize];
         for _ in 0..k {
@@ -58,7 +58,7 @@ async fn plan_matches_lane_streams() {
                 all.log.borrow_mut().clear();
                 let mut lanes: Vec<Lane> = range
                     .zip(own)
-                    .map(|(l, &s)| d.epoch.lane(l, s, &all))
+                    .map(|(l, &s)| d.epoch.lane(l, s, &all).unwrap())
                     .collect();
                 for rg in all.log.take() {
                     assert!(at(k, rg), "replayed row group {rg} not planned at step {k}");

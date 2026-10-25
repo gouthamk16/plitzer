@@ -58,6 +58,8 @@ pub enum Error {
     },
     /// Parts that do not combine, or a part for other lanes.
     Parts(String),
+    /// A lane state or the epoch outside its range, which no run can make.
+    Range(String),
 }
 
 impl fmt::Display for Error {
@@ -75,7 +77,7 @@ impl fmt::Display for Error {
                     "the checkpoint has {field} = {saved}, but this run has {now}"
                 )
             }
-            Error::Parts(why) => write!(f, "{why}"),
+            Error::Parts(why) | Error::Range(why) => write!(f, "{why}"),
         }
     }
 }
@@ -156,7 +158,8 @@ impl Checkpoint {
             ));
         }
         parts.sort_by_key(|p| p.first_lane);
-        let mut lanes = Vec::with_capacity(config.lanes as usize);
+        // `config.lanes` comes from the bytes, so nothing is reserved from it.
+        let mut lanes = Vec::new();
         for p in parts {
             if p.first_lane as usize != lanes.len() {
                 let why = format!("lane {} is missing or held twice", lanes.len());

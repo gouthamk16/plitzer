@@ -1,4 +1,6 @@
 use super::*;
+
+mod edges;
 use crate::order::gpu_lanes;
 use proptest::prelude::*;
 
@@ -41,7 +43,7 @@ type Out = (Vec<u32>, u32, LaneState);
 
 /// Runs `lane` from `state` to the end of the epoch.
 fn run(e: &Arc<Epoch>, c: &Corpus, lane: u32, state: LaneState) -> Vec<Out> {
-    let mut l = e.lane(lane, state, c);
+    let mut l = e.lane(lane, state, c).unwrap();
     let mut out = vec![0; e.packing.seq_len as usize];
     (state.step..e.steps())
         .map(|_| {
@@ -135,7 +137,7 @@ proptest! {
         let e = epoch(&rows, lanes, window, seed, p);
         let mut out = vec![0; p.seq_len as usize];
         for lane in 0..lanes {
-            let mut l = e.lane(lane, LaneState::default(), &c);
+            let mut l = e.lane(lane, LaneState::default(), &c).unwrap();
             for _ in 0..e.steps() {
                 let real = l.fill(&c, &mut out) as usize;
                 prop_assert!(out[real..].iter().all(|&t| t == PAD));
@@ -176,7 +178,7 @@ proptest! {
         for (world, to) in [(worlds[a], k), (worlds[b], e.steps())] {
             for rank in 0..world {
                 for lane in gpu_lanes(LANES, world, rank) {
-                    let mut l = e.lane(lane, states[lane as usize], &c);
+                    let mut l = e.lane(lane, states[lane as usize], &c).unwrap();
                     let mut out = vec![0; p.seq_len as usize];
                     for step in states[lane as usize].step..to {
                         l.fill(&c, &mut out);
@@ -247,78 +249,4 @@ fn golden() {
             h.wrapping_mul(1_000_003).wrapping_add(t.into())
         });
     assert_eq!(hash, 4_952_267_354_457_612_743);
-}
-
-fn small() -> (Corpus, Vec<u32>) {
-    let c = Corpus::new(&[vec![3, 5, 2], vec![4]]);
-    let rows = c.rows();
-    (c, rows)
-}
-
-const P4: Packing = Packing {
-    seq_len: 4,
-    docs: 1,
-    cap: 8,
-    pad: PAD,
-};
-
-#[test]
-#[should_panic(expected = "epoch has ended")]
-fn fill_past_end_panics() {
-    let (c, rows) = small();
-    let e = epoch(&rows, 1, 2, 7, P4);
-    let end = LaneState {
-        step: e.steps(),
-        doc: 4,
-        offset: 0,
-    };
-    let mut l = e.lane(0, end, &c);
-    l.fill(&c, &mut [0; 4]);
-}
-
-#[test]
-#[should_panic(expected = "out must hold seq_len tokens")]
-fn wrong_out_len_panics() {
-    let (c, rows) = small();
-    let e = epoch(&rows, 1, 2, 7, P4);
-    e.lane(0, LaneState::default(), &c).fill(&c, &mut [0; 3]);
-}
-
-#[test]
-#[should_panic(expected = "past the cursor")]
-fn state_past_cursor_panics() {
-    let (c, rows) = small();
-    let e = epoch(&rows, 1, 2, 7, P4);
-    e.lane(
-        0,
-        LaneState {
-            step: 1,
-            doc: 2,
-            offset: 0,
-        },
-        &c,
-    );
-}
-
-#[test]
-#[should_panic(expected = "offset is past its document")]
-fn offset_past_doc_panics() {
-    let (c, rows) = small();
-    let e = epoch(&rows, 1, 2, 7, P4);
-    e.lane(
-        0,
-        LaneState {
-            step: 1,
-            doc: 0,
-            offset: 99,
-        },
-        &c,
-    );
-}
-
-#[test]
-#[should_panic(expected = "must be positive")]
-fn zero_seq_len_panics() {
-    let rows = [1];
-    epoch(&rows, 1, 1, 7, Packing { seq_len: 0, ..P4 });
 }

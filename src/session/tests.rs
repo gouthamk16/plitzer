@@ -1,5 +1,3 @@
-use std::time::Duration;
-
 use arrow_array::builder::{GenericListBuilder, Int32Builder};
 use arrow_array::{ArrayRef, RecordBatch};
 use object_store::local::LocalFileSystem;
@@ -8,6 +6,9 @@ use parquet::file::properties::WriterProperties;
 use tempfile::TempDir;
 
 use super::*;
+
+mod cancel;
+mod refuse;
 use crate::pack::Packing;
 
 fn config() -> Config {
@@ -123,7 +124,7 @@ async fn resume_on_another_world_matches_one_run() {
             let checkpoint = global(&first);
             let mut second = sessions(&d, b).await;
             for s in &mut second {
-                s.resume(&checkpoint).unwrap();
+                s.resume(&checkpoint).await.unwrap();
             }
             // A checkpoint after the last step of an epoch is already at the
             // next epoch, so the resumed run gives no `None` for the old one.
@@ -151,6 +152,7 @@ async fn epochs_roll_over() {
         |c: Checkpoint| c.epoch == 1 && c.lanes.iter().all(|&s| s == LaneState::default());
     let mut two = sessions(&d, 2).await;
     run(&mut two, end).await;
+    assert!(two[0].ended() && two[1].ended());
     assert!(
         next_epoch(two[0].checkpoint()),
         "before the call that gives None"
@@ -158,6 +160,7 @@ async fn epochs_roll_over() {
     let mut seq = vec![0; (2 * config().packing.seq_len) as usize];
     assert_eq!(two[0].next(&mut seq).await.unwrap(), None);
     assert_eq!((two[0].epoch(), two[1].epoch()), (1, 0));
+    assert!(!two[0].ended() && two[1].ended());
     // One rank saw `None` and one did not: their parts still agree.
     assert!(next_epoch(global(&two)));
 }
@@ -186,30 +189,9 @@ async fn set_epoch_never_goes_back() {
     run(&mut one, end).await;
     let checkpoint = global(&one);
     let mut again = sessions(&d, 1).await;
-    again[0].resume(&checkpoint).unwrap();
+    again[0].resume(&checkpoint).await.unwrap();
     again[0].set_epoch(0);
     assert_eq!(run(&mut again, 2).await, want[end + 1..end + 3]);
-}
-
-// A dropped `next` future, as from a timeout or Ctrl-C in Python, loses
-// no read: polling each call only once until it is ready gives the same
-// batches.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn next_is_cancel_safe() {
-    let d = data();
-    let want = reference(&d).await;
-    let mut one = sessions(&d, 1).await;
-    let mut seq = vec![0; (4 * config().packing.seq_len) as usize];
-    let mut got = Vec::new();
-    let mut cancelled = 0;
-    while got.len() < want.len() {
-        match tokio::time::timeout(Duration::ZERO, one[0].next(&mut seq)).await {
-            Ok(real) => got.push(real.unwrap().map(|_| seq.clone())),
-            Err(_) => cancelled += 1,
-        }
-    }
-    assert!(cancelled > 0, "no call was cancelled");
-    assert_eq!(got, want);
 }
 
 // Trainers call `set_epoch` at the start of each epoch, also the one they
@@ -223,66 +205,10 @@ async fn set_epoch_keeps_a_resume_in_that_epoch() {
     let checkpoint = global(&two);
     let mut again = sessions(&d, 2).await;
     for s in &mut again {
-        s.resume(&checkpoint).unwrap();
+        s.resume(&checkpoint).await.unwrap();
         s.set_epoch(0);
     }
     assert_eq!(run(&mut again, 4).await, want[3..7]);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn resume_refuses_other_runs() {
-    let d = data();
-    let mut one = sessions(&d, 1).await;
-    run(&mut one, 2).await;
-    let saved = one[0].checkpoint();
-    let field = |r: Result<(), Error>| match r {
-        Err(Error::Checkpoint(checkpoint::Error::Mismatch { field, .. })) => field,
-        other => panic!("{other:?}"),
-    };
-    let mut c = config();
-    c.packing.seq_len = 16;
-    let mut other = open(&d, c, 0, 1).await.unwrap();
-    assert_eq!(field(other.resume(&saved)), "seq_len");
-    let mut c = config();
-    c.seed = 12;
-    let mut other = open(&d, c, 0, 1).await.unwrap();
-    assert_eq!(field(other.resume(&saved)), "seed");
-    write_file(d.files.path(), 4);
-    let mut other = open(&d, config(), 0, 1).await.unwrap();
-    assert_eq!(field(other.resume(&saved)), "fingerprint");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn resume_needs_this_ranks_lanes() {
-    let d = data();
-    let mut two = sessions(&d, 2).await;
-    run(&mut two, 2).await;
-    let part = two[1].checkpoint();
-    let mut again = sessions(&d, 2).await;
-    again[1].resume(&part).unwrap();
-    let refused = again[0].resume(&part);
-    assert!(matches!(
-        refused,
-        Err(Error::Checkpoint(checkpoint::Error::Parts(_)))
-    ));
-}
-
-#[tokio::test]
-async fn open_refuses_bad_settings() {
-    let d = data();
-    let refused = |r: Result<Session, Error>| matches!(r, Err(Error::Config(_)));
-    assert!(
-        refused(open(&d, config(), 0, 3).await),
-        "3 does not divide 4"
-    );
-    assert!(refused(open(&d, config(), 2, 2).await), "rank past world");
-    assert!(refused(open(&d, config(), 0, 0).await), "no GPUs");
-    let mut c = config();
-    c.window = 0;
-    assert!(refused(open(&d, c, 0, 1).await));
-    let mut c = config();
-    c.packing.docs = 0;
-    assert!(refused(open(&d, c, 0, 1).await));
 }
 
 // A failed read leaves the session before the failed step, so the next call

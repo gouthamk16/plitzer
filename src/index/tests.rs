@@ -1,3 +1,5 @@
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
 
 use object_store::local::LocalFileSystem;
@@ -167,7 +169,7 @@ async fn open_rebuilds_on_change() {
         index
     );
 
-    std::fs::write(&cache, b"garbage").unwrap();
+    std::fs::write(&cache, [&sidecar::MAGIC[..], b"garbage"].concat()).unwrap();
     assert_eq!(open(&store, &prefix, &cache).await.unwrap(), index);
 }
 
@@ -239,4 +241,67 @@ async fn old_sidecar_rebuilds() {
         summary(&open(&store, &prefix, &cache).await.unwrap()),
         expected()
     );
+}
+
+// A cache folder that cannot be written fails before any footer is read: the
+// corrupt file below would give `Error::Footer` if the build came first.
+#[tokio::test]
+async fn unwritable_cache_fails_before_the_build() {
+    let (dir, store, prefix) = dataset();
+    std::fs::write(dir.path().join("data/z.parquet"), b"not parquet").unwrap();
+    let blocker = dir.path().join("file");
+    std::fs::write(&blocker, b"").unwrap();
+    let cache = blocker.join("index.bin");
+    let got = open(&store, &prefix, &cache).await;
+    assert!(matches!(got, Err(Error::Cache(_))), "{got:?}");
+    let got = open(&store, &prefix, dir.path()).await;
+    assert!(
+        matches!(got, Err(Error::Cache(_))),
+        "a folder as the cache: {got:?}"
+    );
+    let got = open(&store, &prefix, &dir.path().join("new/")).await;
+    assert!(
+        matches!(got, Err(Error::Cache(_))),
+        "a path that ends in a separator: {got:?}"
+    );
+    let got = open(&store, &prefix, std::path::Path::new("")).await;
+    assert!(
+        matches!(got, Err(Error::Cache(_))),
+        "an empty path: {got:?}"
+    );
+    // The check changes no file, also not a stale sidecar it then rebuilds.
+    let stale = dir.path().join("stale.bin");
+    let old = [&sidecar::MAGIC[..], b"stale"].concat();
+    std::fs::write(&stale, &old).unwrap();
+    let got = open(&store, &prefix, &stale).await;
+    assert!(matches!(got, Err(Error::Footer { .. })), "{got:?}");
+    assert_eq!(std::fs::read(&stale).unwrap(), old);
+    // A file that is not a sidecar, such as a dataset file given as the
+    // cache by mistake, is refused and kept.
+    let other = dir.path().join("data/b.parquet");
+    let before = std::fs::read(&other).unwrap();
+    let got = open(&store, &prefix, &other).await;
+    assert!(matches!(got, Err(Error::Cache(_))), "{got:?}");
+    assert_eq!(std::fs::read(&other).unwrap(), before);
+    // A missing cache folder is made.
+    std::fs::remove_file(dir.path().join("data/z.parquet")).unwrap();
+    let nested = dir.path().join("a/b/index.bin");
+    open(&store, &prefix, &nested).await.unwrap();
+    assert!(nested.exists());
+}
+
+// `write` renames over the old sidecar, which needs only the folder, so a
+// stale sidecar that is read-only is still replaced.
+#[cfg(unix)]
+#[tokio::test]
+async fn read_only_stale_sidecar_is_replaced() {
+    let (dir, store, prefix) = dataset();
+    let cache = dir.path().join("index.bin");
+    std::fs::write(&cache, [&sidecar::MAGIC[..], b"stale"].concat()).unwrap();
+    std::fs::set_permissions(&cache, PermissionsExt::from_mode(0o444)).unwrap();
+    open(&store, &prefix, &cache).await.unwrap();
+    assert!(!std::fs::read(&cache).unwrap().ends_with(b"stale"));
+    // Not the 0600 of a temp file: other users of a shared cache read it.
+    let mode = std::fs::metadata(&cache).unwrap().permissions().mode();
+    assert_eq!(mode & 0o044, 0o044, "{mode:o}");
 }

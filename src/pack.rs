@@ -102,18 +102,15 @@ impl Epoch {
         self.steps
     }
 
-    /// Lane `lane`, resumed from `state`.
-    pub fn lane(self: &Arc<Self>, lane: u32, state: LaneState, tokens: &impl Tokens) -> Lane {
-        assert!(
-            state.step <= self.steps,
-            "state {state:?} is past the epoch's {} steps",
-            self.steps
-        );
-        let cursor = self.cursor(lane, state.step);
-        assert!(
-            state.doc <= cursor,
-            "state {state:?} is past the cursor {cursor}"
-        );
+    /// Lane `lane`, resumed from `state`. A state that no run makes, such as one from a
+    /// checkpoint made by hand, is an error that names what is wrong.
+    pub fn lane(
+        self: &Arc<Self>,
+        lane: u32,
+        state: LaneState,
+        tokens: &impl Tokens,
+    ) -> Result<Lane, String> {
+        let cursor = self.check(lane, state)?;
         let mut l = Lane {
             epoch: self.clone(),
             lane,
@@ -122,8 +119,8 @@ impl Epoch {
             leftover: Leftover::new(state.doc),
         };
         l.take(tokens, cursor - state.doc);
-        l.start_at(state);
-        l
+        l.start_at(state)?;
+        Ok(l)
     }
 
     /// The documents lane `lane` takes in the whole epoch.
@@ -132,6 +129,34 @@ impl Epoch {
             .iter()
             .map(|w| self.order().lane_len(w, lane))
             .sum()
+    }
+
+    /// Whether `state` can stand in lane `lane` of this epoch: no later than
+    /// its last step, with its leftover not past the documents it has taken.
+    /// Gives the lane's cursor at that step. An offset past its document is
+    /// found only with the tokens, by `lane`.
+    pub fn check(&self, lane: u32, state: LaneState) -> Result<u64, String> {
+        if lane >= self.lanes {
+            return Err(format!("lane {lane} out of range for {} lanes", self.lanes));
+        }
+        if state.step > self.steps {
+            return Err(format!(
+                "state {state:?} is past the epoch's {} steps",
+                self.steps
+            ));
+        }
+        let cursor = self.cursor(lane, state.step);
+        if state.doc > cursor {
+            return Err(format!("state {state:?} is past the cursor {cursor}"));
+        }
+        // The flush steps empty every leftover, so a lane ends at
+        // `(cursor, 0)`; a leftover there would never be emitted.
+        if state.step == self.steps && (state.doc, state.offset) != (cursor, 0) {
+            return Err(format!(
+                "state {state:?} has a leftover after the last step"
+            ));
+        }
+        Ok(cursor)
     }
 
     /// The documents lane `lane` has taken before step `step`.
@@ -191,22 +216,21 @@ impl Lane {
 
     /// Skips the replayed leftover's first `state.offset` tokens and checks
     /// that the lane now stands exactly at `state`.
-    fn start_at(&mut self, state: LaneState) {
+    fn start_at(&mut self, state: LaneState) -> Result<(), String> {
         let first = self.leftover.lens.front().copied().unwrap_or(0);
-        assert!(
-            state.offset == 0 || state.offset < first,
-            "state {state:?} offset is past its document"
-        );
+        if state.offset != 0 && state.offset >= first {
+            return Err(format!("state {state:?} offset is past its document"));
+        }
         self.leftover.advance(state.offset as usize);
-        assert_eq!(
-            self.state(),
-            state,
-            "state does not start on a document with tokens left"
-        );
-        assert!(
-            self.leftover.tokens.len() <= self.epoch.packing.cap as usize,
-            "state {state:?} leaves more than the cap"
-        );
+        if self.state() != state {
+            return Err(format!(
+                "state {state:?} does not start on a document with tokens left"
+            ));
+        }
+        if self.leftover.tokens.len() > self.epoch.packing.cap as usize {
+            return Err(format!("state {state:?} leaves more than the cap"));
+        }
+        Ok(())
     }
 
     /// Adds the next `n` documents, or as many as are left, to the leftover.

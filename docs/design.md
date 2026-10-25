@@ -5,7 +5,7 @@
 | Field | Value |
 |---|---|
 | Status | Active. It changes with each feature PR. The code is pre-alpha. |
-| Last change | 2026-10-23, PR #16 |
+| Last change | 2026-10-23, PR #18 |
 | Language standard | ASD-STE100 (Simplified Technical English) |
 | Code | `src/` at the commit of this file |
 
@@ -83,6 +83,8 @@ Each term has only one definition in this document.
 | Global checkpoint | A checkpoint that holds all B lanes. It resumes on each GPU count. |
 | Column chunk | The bytes of one column in one row group. |
 | Codec | The compression method of a column chunk, such as Snappy or Zstd. |
+| DLPack | A C interface that lets one library use the tensor memory of another library without a copy. |
+| Capsule | A Python object that holds a C pointer. DLPack and Arrow give their structs to Python in capsules. |
 
 ## 3. Requirements
 
@@ -98,6 +100,8 @@ Each term has only one definition in this document.
 | REQ-8 | A start with an unchanged dataset reads no Parquet footers. | `index::open_uses_cache_without_footers`. | Met |
 | REQ-9 | The decoded tokens in memory stay at or below the budget, and a budget that the loader accepts never stops it. | `load::budget_is_checked_and_kept`. | Met |
 | REQ-10 | A resume with different settings or a different dataset stops with an error that names the field. | `checkpoint::check_names_the_field` and `session::resume_refuses_other_runs`. | Met |
+| REQ-11 | Python reads each batch without a copy, through DLPack and Arrow. | `test_dlpack_versioned_and_legacy`, `test_arrow_export` and `test_data_outlives_the_batch_and_the_loader`. | Met |
+| REQ-12 | Input from Python gives a Python exception, never a panic or a wait with no end. | `test_bad_settings`, `test_resume_refuses_other_runs` and `test_forked_child_makes_its_own_loader`. Manual tests: Ctrl-C during a stopped S3 read gives `KeyboardInterrupt` in 0.51 s. A SIGUSR1 handler that calls `checkpoint()` during a stopped S3 read saves a complete checkpoint. | Met |
 
 ## 4. System overview
 
@@ -124,7 +128,9 @@ flowchart LR
 | Loader | `src/load.rs` | Implemented | [5.7](#57-loader) |
 | Checkpoint | `src/checkpoint.rs` | Implemented | [5.8](#58-checkpoint) |
 | Session | `src/session.rs` | Implemented | [5.9](#59-session) |
-| Python bindings | — | Planned | [5.10](#510-planned-components) |
+| Store | `src/store.rs`, `src/store/s3.rs` | Implemented | [5.10](#510-store) |
+| Python bindings | `plitzer-py/` | Implemented | [5.11](#511-python-bindings) |
+| PyTorch dataset | — | Planned | [5.12](#512-planned-components) |
 
 ## 5. Component design
 
@@ -315,7 +321,9 @@ impl Epoch {
     pub fn packing(&self) -> Packing;
     pub fn steps(&self) -> u64;
     pub fn lane_docs(&self, lane: u32) -> u64;
-    pub fn lane(self: &Arc<Self>, lane: u32, state: LaneState, tokens: &impl Tokens) -> Lane;
+    pub fn lane(self: &Arc<Self>, lane: u32, state: LaneState, tokens: &impl Tokens)
+        -> Result<Lane, String>;   // Err for a state that no run makes
+    pub fn check(&self, lane: u32, state: LaneState) -> Result<u64, String>;  // lane, step and leftover in range, no leftover after the last step; the cursor
 }
 impl Lane {
     pub fn fill(&mut self, tokens: &impl Tokens, out: &mut [u32]) -> u32;
@@ -379,6 +387,8 @@ At step 0, the leftover has 9 tokens. The lane copies 4 tokens. Then it removes 
 | `cap_and_padding` | Property | Pad tokens occur only at the end. The leftover is never more than C. A short sequence occurs only with an empty leftover. At the end of the epoch, each lane state is `(lane_docs, 0)`. |
 | `golden` | Unit | The example above, and a hash over 60 row groups, is the same on each OS. |
 | `*_panics` | Unit | Each invalid input in the limits causes a panic. |
+| `leftover_after_the_last_step_is_refused` | Unit | A state at the last step with a leftover gives an error: its tokens would never be emitted. |
+| `lane_out_of_range_is_refused` | Unit | `check` and `lane` give an error, not a panic, for a lane that is not in the order. |
 
 The property tests use small inputs. Thus empty documents, empty lanes, C = 0, C < L and L = 1 occur frequently.
 
@@ -462,8 +472,9 @@ The fingerprint is the 64-bit FNV-1a hash of the same layout, with no ETags and 
 - The cache check compares the ETag, because a file can change and keep its size (D-20).
 - The fingerprint does not include the ETag. A local ETag holds the inode and the modification time, which are different on each copy (D-21).
 - The sidecar uses its own small format. It needs no `serde` dependency, and a golden test pins the bytes (D-22).
+- Before a build, `open` makes the cache folder and a file in it. It refuses a cache path that is a folder, has no file name or ends in a separator. It also refuses an existing file that does not start with the sidecar magic, such as a dataset file given as the cache by mistake: the write would replace it. The write renames over the old sidecar. On Unix this needs only the folder, so a stale sidecar that is read-only is still replaced. Windows refuses to rename over a read-only file, so on Windows `open` refuses a read-only sidecar before the build. The check changes no file, because another process can have just written a good sidecar. A cache that cannot be written then fails before the footer scan, which takes long on a large dataset (D-57). If the write after the build fails, such as on a full disk, `open` still returns the index: the next start builds it again.
 - If the sidecar does not exist or is corrupt, `open` builds the index again. This is not an error. The sidecar is only a cache (D-23).
-- The module writes the sidecar to a temporary file with a unique name and then renames it. Thus the processes of all GPUs on one node can write at the same time, and no process reads a half-written sidecar.
+- The module writes the sidecar to a temporary file with a unique name and then renames it. On Unix the file gets mode 0644 less the umask, as a plain new file, so other users of a shared cache folder can read it. Thus the processes of all GPUs on one node can write at the same time, and no process reads a half-written sidecar.
 - Windows does not replace a file while a different process has it open or replaces it. If the rename fails and the sidecar already has the same bytes, a different process wrote the same index, and the write is complete. If not, the module tries again up to five times.
 - The first request reads 4 MiB, because a FineWeb-Edu footer is approximately 3.1 MiB. Thus most files need one request, not two.
 - The module checks the footer length itself, because `parquet` 60 panics on a footer length that is larger than the file.
@@ -487,6 +498,8 @@ The fingerprint is the 64-bit FNV-1a hash of the same layout, with no ETags and 
 | `build_reads_row_groups` | Unit | The row groups of Parquet files in nested folders, in path order. Other files are not in the index. `locate` is correct at each file edge. |
 | `open_writes_and_reuses_cache` | Unit | `open` writes the sidecar, and a second `open` gives the same index. |
 | `open_uses_cache_without_footers` | Unit | A sidecar with false row counts that matches the list of files is used, so no footer is read. A different column or a stale ETag causes a new build. |
+| `unwritable_cache_fails_before_the_build` | Unit | A Parquet file given as the cache is refused and not changed. A cache below a file, a cache that is a folder, a path that ends in a separator and an empty cache path give `Error::Cache`, not the `Error::Footer` of a corrupt file in the dataset. The check does not change a stale sidecar. A missing cache folder is made. |
+| `read_only_stale_sidecar_is_replaced` | Unit | A stale sidecar with mode 0444 in a writable folder is replaced by the build (Unix). The new sidecar is readable by the group and others, not 0600 as a temporary file is. |
 | `open_rebuilds_on_change` | Unit | A changed file, a new file and a corrupt sidecar each cause a new build. |
 | `bad_footer_names_file` | Unit | A bad magic number, a file that is too short and a footer length larger than the file each give `Error::Footer` with the path. |
 | `no_files_is_an_error` | Unit | A prefix with no `.parquet` files gives `Error::NoFiles`. |
@@ -544,6 +557,7 @@ The page reader of `parquet` uses only the codec and the byte range of the chunk
 - The input of v1 is a column of token lists. Tokenization in the loader is a later item (D-26).
 - `object_store` does not cut a large range, and AWS advises requests of 8 to 16 MB at the same time. Each piece is a separate `get_ranges` call, so that `object_store` does not merge the pieces again (D-27).
 - A negative token, a null token or a token larger than `u32::MAX` gives `Error::BadToken`. A null token would otherwise become token 0.
+- A chunk that decodes to a different number of rows than its footer gives `Error::Decode`. The lanes use the row count of the footer, so a missing row would otherwise cause a panic.
 
 **Limits:**
 
@@ -562,6 +576,7 @@ The page reader of `parquet` uses only the codec and the byte range of the chunk
 | `odd_column_name_reads` | Unit | A column named `input ids` reads correctly. |
 | `schema_text_golden` | Unit | The schema text of a `list<uint32>` column is pinned, so a change of the `parquet` printer shows. |
 | `bad_tokens_are_errors` | Unit | A negative token and a null token each give `Error::BadToken`. |
+| `row_count_must_match_the_footer` | Unit | An index with 5 rows for a chunk of 3 rows gives `Error::Decode`. |
 | `fetch_splits_large_ranges`, `pieces_cover_range` | Unit | The pieces cover the range with no gap and no overlap, and each piece is 16 MiB or less. |
 | `index_and_read_over_s3` | Integration | The index, the sidecar and the reader work against versitygw in the `s3` CI job. |
 
@@ -583,7 +598,7 @@ impl Loader {
     pub fn resident_bytes(&self) -> usize;
 }
 
-pub enum Error { Budget { needed, budget }, Read(read::Error), Join(..), Stopped }
+pub enum Error { Budget { needed, budget }, Read(read::Error), Join(..), Stopped, State(String) }
 ```
 
 The caller gives `lanes = gpu_lanes(B, world, rank)`. Thus the loader does not know world.
@@ -650,6 +665,7 @@ The decoded row group keeps its permits. The loader releases the permits when it
 | `reads_only_own_row_groups` | Unit | The plans of all ranks cover all row groups. Ranks share only the row groups at the edges of their slices. |
 | `plan_matches_lane_streams` | Unit | Each document that a lane takes at step s, also at a resume, is in a row group that the plan needs at s. |
 | `lane_groups_match` | Property | `Order::lane_groups` gives the row groups that `Order::lane` uses. |
+| `next_is_cancel_safe` | Unit | Over a store with 20 ms reads, `next` futures dropped while a read is in flight lose no row group. The test counts these drops and needs at least one. |
 
 ### 5.8 Checkpoint
 
@@ -717,7 +733,7 @@ Each GPU gives a checkpoint part for its own lanes. `merge` puts the parts of al
 **Limits:**
 
 - The checksum finds damage, not changes by an attacker.
-- `from_bytes` does not make sure that each lane state is correct for the epoch. A state that the checksum accepts but the epoch does not accept causes a panic in `Epoch::lane`.
+- `from_bytes` does not make sure that each lane state is correct for the epoch. `Session::resume` refuses a step past the epoch, a leftover past the cursor and a leftover after the last step, through `Epoch::check` (D-64). The other states that no run makes, such as an offset past its document or a leftover past the cap, need the tokens. `Epoch::lane` then gives an error. `Session::resume` makes the loader at once, so it gives that error as `checkpoint::Error::Range`, and the session stays where it was. No checkpoint causes a panic. A state far behind its cursor can also need more than the budget: `resume` then gives the budget error. `merge` reserves no memory from the B in the bytes.
 
 **Verification:**
 
@@ -729,7 +745,7 @@ Each GPU gives a checkpoint part for its own lanes. `merge` puts the parts of al
 | `any_bytes_give_an_error_not_a_panic` | Property | Random bytes never cause a panic, also with a correct checksum. |
 | `truncation_is_refused` | Property | A checkpoint with bytes removed from its end gives an error. |
 | `merge_tiles_the_lanes` | Unit | Parts in any order give one global checkpoint. |
-| `merge_refuses_bad_parts` | Unit | No parts, a missing lane, a gap, an overlap and different steps, configs or epochs each give `Error::Parts`. |
+| `merge_refuses_bad_parts` | Unit | No parts, a missing lane, a gap, an overlap, different steps, configs or epochs, and B = 2³² − 1 in the bytes each give `Error::Parts`, with no large allocation. |
 | `states_of_a_part` | Unit | `states` gives lanes that the part holds, and refuses other lanes and lanes at different steps. |
 | `check_names_the_field` | Unit | `check` gives the name of the field that is different. |
 
@@ -744,9 +760,10 @@ impl Session {
     pub async fn open(store: Arc<dyn ObjectStore>, prefix: Path, cache: &std::path::Path,
                       config: Config, rank: u32, world: u32, budget: u64) -> Result<Session, Error>;
     pub fn set_epoch(&mut self, epoch: u64);
-    pub fn resume(&mut self, checkpoint: &Checkpoint) -> Result<(), Error>;
+    pub async fn resume(&mut self, checkpoint: &Checkpoint) -> Result<(), Error>;  // makes the loader
     pub async fn next(&mut self, out: &mut [u32]) -> Result<Option<Vec<u32>>, Error>;
     pub fn checkpoint(&self) -> Checkpoint;    // the part of this GPU
+    pub fn ended(&self) -> bool;               // the last step is taken; `next` gives `None` next
     pub fn epoch(&self) -> u64;
     pub fn lanes(&self) -> Range<u32>;
 }
@@ -758,7 +775,8 @@ pub enum Error { Config(String), Index(index::Error), Read(read::Error),
 **Design:**
 
 - `open` checks the config, opens the index with `Index::open`, and makes the reader. The lanes are `gpu_lanes(B, world, rank)`.
-- The session keeps the lane states to start from. `set_epoch` sets them to the start of a later epoch. It does nothing for the current epoch or an earlier one. `resume` takes them from a checkpoint after `check`.
+- `open` refuses more than 2²⁴ lanes, and more than 2³⁰ tokens in one step of one GPU or in its leftovers (lanes × C). These sizes are far past any real batch, and a larger value could only use all the memory (D-63).
+- The session keeps the lane states to start from. `set_epoch` sets them to the start of a later epoch. It does nothing for the current epoch or an earlier one. `resume` takes them from a checkpoint after `check`. It drops the old loader first and keeps its position, then makes the new loader, and changes the position only when that succeeds. An ended loader is not dropped: it holds no row groups, and it still gives the `None` that ends its epoch. Thus an error, or a `resume` future that is dropped, leaves the session where it was.
 - `next` makes the loader of the epoch at the first step. At the end of the epoch, `next` returns `None`, and the session goes to step 0 of the next epoch.
 - If `next` fails, the session keeps the lane states of the loader and drops the loader. The next call makes a new loader and tries the same step again.
 - `checkpoint` gives the lane states of the loader. Before the first step of an epoch, it gives the start states. After the last step of an epoch, it gives `(epoch + 1, step 0)`, also before the call of `next` that returns `None`.
@@ -773,7 +791,7 @@ pub enum Error { Config(String), Index(index::Error), Read(read::Error),
 
 **Limits:**
 
-- `resume` does not read data. A budget that is too small for the resume step gives its error at the next call of `next`.
+- `resume` makes the loader, so a budget that is too small for the resumed step gives its error at `resume`.
 - All GPUs must call `next` the same number of times, as in each data-parallel run.
 
 **Verification:**
@@ -781,21 +799,196 @@ pub enum Error { Config(String), Index(index::Error), Read(read::Error),
 | Test | Type | What it shows |
 |---|---|---|
 | `resume_on_another_world_matches_one_run` | Unit | Runs on world a stop at step k, also at and after the end of an epoch. Their merged checkpoint resumes on world b. The batches are the same as one run on world 1 with no stop. |
-| `epochs_roll_over` | Unit | After the last step, the checkpoint holds epoch 1 and the start states, before and after `None`. Parts from a GPU that received `None` and a GPU that did not merge. The batches of epoch 1 are not the same as epoch 0. |
+| `epochs_roll_over` | Unit | After the last step, `ended` is true, and the checkpoint holds epoch 1 and the start states, before and after `None`. Parts from a GPU that received `None` and a GPU that did not merge. The batches of epoch 1 are not the same as epoch 0. |
 | `set_epoch_starts_that_epoch` | Unit | `set_epoch(1)` after some steps gives the batches of epoch 1. |
 | `set_epoch_keeps_a_resume_in_that_epoch` | Unit | `set_epoch(0)` after a resume in epoch 0 keeps the resumed position. |
 | `set_epoch_never_goes_back` | Unit | `set_epoch(0)` after a resume from the end of epoch 0 gives the batches of epoch 1. |
-| `next_is_cancel_safe` | Unit | Calls of `next` that are dropped before they finish give the same batches as a run with no drops. |
+| `next_is_cancel_safe` | Unit | Over a store with 5 ms reads, calls of `next` that are dropped after one poll give the same batches as a run with no drops. |
+| `resume_is_cancel_safe` | Unit | Over a store with 20 ms reads, a `resume` future dropped after one poll leaves `checkpoint()` unchanged, and the next batches are the same as a run with no `resume`. |
 | `resume_refuses_other_runs` | Unit | A different L, a different seed and an added file each give `Mismatch` with the name of the field. |
+| `refused_resume_keeps_the_epoch_end` | Unit | After the last step, a `resume` that fails when it makes the loader leaves `ended` true, and the next `next` gives `None`. |
 | `resume_needs_this_ranks_lanes` | Unit | A part resumes the rank that holds its lanes, and another rank refuses it. |
-| `open_refuses_bad_settings` | Unit | A world that does not divide B, a rank out of range, no GPUs, W = 0 and D = 0 each give `Error::Config`. |
+| `resume_refuses_states_outside_the_epoch` | Unit | A step past the epoch, a leftover past the cursor, and a leftover that starts earlier and goes past the cap each give `checkpoint::Error::Range` at `resume`, not a panic. After a refused resume, `checkpoint()` is unchanged, also on a new session. |
+| `open_refuses_bad_settings` | Unit | A world that does not divide B, a rank out of range, no GPUs, W = 0, D = 0, 2²⁵ lanes, L = 2³² − 1 and C = 2³² − 1 each give `Error::Config`. |
 | `next_retries_after_a_failed_read` | Unit | After a failed read and a repair of the file, the next calls give the same batches as a run with no failure. |
 
-### 5.10 Planned components
+### 5.10 Store
 
-These components are not in the code yet. Their sections will have the full set of parts when they are implemented.
+**Function:** The store module changes a dataset location into an `object_store` store and a prefix.
 
-- **Python:** The bindings use PyO3 and maturin. Batches go to Python through DLPack and the Arrow PyCapsule interface. A PyTorch `IterableDataset` gives `state_dict()` and `load_state_dict()`. Users must set `num_workers=0`. The parallel work is in Rust, and a fork of a process with a tokio runtime is not safe.
+**Interface:**
+
+```rust
+pub struct Location { pub store: Arc<dyn ObjectStore>, pub prefix: Path, pub id: String }
+
+pub fn open(location: &str, options: &[(String, String)]) -> Result<Location, Error>;
+
+pub enum Error { Store(object_store::Error), Scheme(String), Option(String) }
+```
+
+**Design:**
+
+| Location | Store | Prefix | `id` |
+|---|---|---|---|
+| Text with no `://`, such as `data/`, `C:\data` or `runs:2024/data` | `LocalFileSystem::new_with_prefix(path)` | empty | The canonical folder, in `Debug` form, so names that are not UTF-8 stay apart |
+| `file:///data` | The same, for the path of the URL | empty | The same |
+| `s3://bucket/prefix` (`s3` feature) | `AmazonS3Builder::from_env()` with the URL, then each option | the path of the URL | The bucket, the prefix and the endpoint |
+| Other schemes | `Error::Scheme` | — | — |
+
+**Rationale:**
+
+- `object_store::parse_url_opts` does not read the `AWS_*` environment variables. `store` reads them as `from_env` does, and the options override them (D-49). An empty variable counts as unset, as in the AWS CLI. The builder prefers the S3-only endpoint, such as `AWS_ENDPOINT_URL_S3`, to the general one. Thus an `endpoint` option is also set as the S3-only endpoint, unless the options give that endpoint too.
+- An unknown option gives `Error::Option`. If the store ignored an option, a wrong endpoint or a wrong key name would fail later with an unclear error.
+- The S3 builder fails only on settings, such as a missing bucket. Thus its error is also `Error::Option`, and Python shows it as `ConfigError`.
+- A local folder takes no options, so an option for a local folder is an error. A location that is a file, not a folder, is also an error.
+- `open` refuses an S3 endpoint that is not an `http://` or `https://` URL, that has spaces, or that holds a user or a password. It also refuses a key, a token or a region with a control character, such as a newline at the end of a file. These values come from the options or the environment. `object_store` stops with a panic on the first request for the first ones, and it repeats the endpoint in its errors.
+- Only text with `://` is a URL. `C:\data` and `runs:2024/data` parse as URLs, but they are local paths.
+- A URL with `?` or `#`, and an `s3://` URL with a port or a user, give `Error::Option`. These characters can be part of a folder or key name, and the URL parser would drop what follows them, so another dataset would open (D-62). An error message never holds the user, the password, the query or the fragment of a URL, because they can hold keys.
+- `id` is the same for each spelling of one dataset, and different for two datasets. It holds no keys or tokens, so new credentials keep the same cache. It holds the endpoint from the options or the environment, the S3-only endpoint first as in the builder, so two servers with the same bucket name get different caches (D-58).
+
+**Limits:**
+
+- Only local disk and S3. Google Cloud Storage and Azure need their `object_store` features and a row in the table above.
+
+**Verification:**
+
+| Test | Type | What it shows |
+|---|---|---|
+| `opens_local_folders` | Unit | A path, the path with a separator at the end, and a `file://` URL open the same folder with the same `id` (the canonical path). Another folder has another `id`. |
+| `a_colon_in_a_path_is_not_a_scheme` | Unit | A folder named `runs:2024` opens as a folder (POSIX). |
+| `an_empty_variable_is_unset` | Unit | An empty `AWS_ENDPOINT_URL` is unset, and the location opens. |
+| `refuses_settings_that_would_panic` | Unit | An endpoint with no scheme, a space at the end, no text, another scheme or a password, also from the environment, and a token with a newline each give `Error::Option`, with no secret in the message. |
+| `s3_id_has_the_endpoint_and_no_keys` | Unit | Two secret keys give one `id`, and two endpoints give two. The `id` holds no key. An `endpoint` option wins over an S3-only endpoint from the environment. |
+| `refuses_what_it_cannot_open` | Unit | A missing folder, an unknown scheme, an option for a local folder, and URLs with `?` or `#` each give their error. No error repeats a password or a query. |
+| `refuses_unknown_s3_options` | Unit | An unknown S3 option and a URL with no bucket give `Error::Option`. |
+| `open_an_s3_url` | Integration | An `s3://` URL with options opens versitygw with the correct prefix. |
+
+### 5.11 Python bindings
+
+**Function:** The `plitzer` Python package runs one `Session` for each Python `Loader`. It gives each step to Python as int32 arrays without a copy, through DLPack and the Arrow PyCapsule interface.
+
+**Interface (`plitzer/_plitzer.pyi`):**
+
+```python
+class Loader:
+    def __init__(self, location: str | os.PathLike[str], *, seed: int, lanes: int, window: int,
+                 seq_len: int, docs: int, cap: int, pad: int, budget: int, rank: int | None = None, world: int | None = None,
+                 column: str = "tokens", cache: str | os.PathLike[str] | None = None,
+                 storage_options: Mapping[str, str | bool] | None = None) -> None: ...
+    def __iter__(self) -> Loader: ...           # the rest of the current epoch
+    def __next__(self) -> Batch: ...
+    def set_epoch(self, epoch: int) -> None: ...
+    def checkpoint(self) -> bytes: ...          # the part of this GPU
+    def resume(self, checkpoint: bytes | bytearray) -> None: ...
+    epoch: int; lanes: range                    # read-only properties
+class Batch:  tokens: Array                     # shape (lanes, seq_len)
+              lengths: Array                    # shape (lanes,): the real tokens of each row
+class Array:  shape; __dlpack__(...); __dlpack_device__(); __arrow_c_array__(...)
+def merge(parts: Sequence[bytes | bytearray]) -> bytes: ...
+class PlitzerError(Exception); ConfigError, CheckpointError, DataError (PlitzerError)
+```
+
+**Design:**
+
+- Each process has one multi-thread tokio runtime with at most 8 worker threads and 32 threads for blocking calls. A loader has at most 16 reads in flight, and each GPU has its own process, so one worker for each CPU would start hundreds of threads in each process (D-60). A forked child makes a new runtime, and it never drops the copy of the parent's runtime: that drop would wait for threads that the child does not have.
+- Each `Loader` records the PID of the process that made it. In a forked child, a copied `Loader` gives `RuntimeError` for each method and property: a parent thread can have held one of its locks at the fork. A new `Loader` in the child works.
+- The `Loader` is frozen. A lock holds its session for the whole of a step, and a snapshot holds the checkpoint before the next step. `checkpoint()`, `epoch` and `lanes` read only the snapshot, so a signal handler or another thread can read them during a step. A second call that needs the session during a step gets `RuntimeError`, never a deadlock (D-59). No call holds the snapshot lock while Python runs, because Python can release the GIL and `save` takes the lock while it holds the GIL.
+- `epoch` is the epoch of the next step, as in `checkpoint()`. After the last step of an epoch, it is the next epoch.
+- `__next__` releases the GIL and waits on the runtime for 100 ms at a time. Between these waits it checks for signals. Thus Ctrl-C gives `KeyboardInterrupt` in 100 ms or less, and it drops the `next` future. `Loader::next` is cancel safe (D-44), so the next call does the same step again.
+- At the end of an epoch, `__next__` raises `StopIteration`, and it raises it again at each later call, as a Python iterator must. `__iter__` starts the next epoch: a new `for` loop gives it. `__iter__` also moves on a loader whose last step is taken but which did not raise `StopIteration` yet, such as the second loader in a `zip` (D-55).
+- Each step writes into a new `Vec<u32>`. An arrow `Buffer` holds it, and each export holds a clone of that `Buffer`. Thus an exported array stays valid after the batch, the loader and the export call.
+- The default cache is `$PLITZER_CACHE_DIR`, else the user cache folder, then `plitzer/<hash>.idx`. The hash is of the `id` of the store (section 5.10) and the column, not of the location text. Thus `data` from two folders gets two files, and `data/` and `file:///…/data` share one (D-54). The index makes the cache folder if it does not exist. `HOME`, `XDG_CACHE_HOME` and `LOCALAPPDATA` count only when they hold an absolute path: a relative folder would differ for each working directory. `PLITZER_CACHE_DIR` is used as given. With no user cache folder, there is no default, and `Loader` gives `ConfigError` (D-61).
+- `rank` defaults to 0 and `world` to 1. A `world` above 1 with no `rank` gives `ConfigError`: rank 0 on each GPU would train all GPUs on the same lanes with no error.
+- Integer settings, also the epoch of `set_epoch`, come in as Python objects. Each takes an `int` or another object with `__index__`, such as `np.int64` (the stub types them as `SupportsIndex`). A value that is not an integer, such as `4.0` or `True`, or that does not fit, such as `world=-1`, gives `ConfigError`.
+- `resume` and `merge` take `bytes` or `bytearray`.
+- A storage option name is a `str`, and a value is a `str` or a `bool` (also `np.bool_`), which becomes `true` or `false`. Another type gives `ConfigError`.
+- A local path that is not UTF-8 becomes a `file://` URL, which percent-encodes its bytes.
+- If the runtime cannot start its threads, such as at a process limit, `Loader` gives `RuntimeError`. A call from a thread that runs a tokio runtime, such as a callback from another Rust extension, also gives `RuntimeError`, because tokio cannot block that thread.
+
+The errors map to Python exceptions as follows:
+
+| Rust error | Python exception |
+|---|---|
+| `session::Error::Config`, `load::Error::Budget`, `index::Error::Cache`, `store::Error::Scheme`, `store::Error::Option`, an integer setting that is not an integer or is out of range, no cache folder | `ConfigError` |
+| `checkpoint::Error`, `session::Error::Checkpoint` | `CheckpointError` |
+| `store::Error::Store`, index, read and other load errors | `DataError` |
+
+The DLPack export is as follows:
+
+| Item | Value |
+|---|---|
+| Device | CPU, `(1, 0)` |
+| Data type | int32 (code 0, 32 bits, 1 lane) |
+| Strides | Set, C order, in elements |
+| `max_version` ≥ (1, 0) | Capsule `dltensor_versioned`, `DLManagedTensorVersioned` 1.0 |
+| No `max_version` | Capsule `dltensor`, `DLManagedTensor` |
+| `copy=True` | A copy of the data, with the flag `IS_COPIED` |
+| `dl_device` not CPU | `BufferError` |
+
+A consumer takes a DLPack capsule when it changes the capsule name to `used_dltensor` or `used_dltensor_versioned`. It then calls the deleter of the tensor. The capsule destructor calls the deleter only if the name did not change (D-48).
+
+The Arrow export is as follows:
+
+| Array | Arrow type |
+|---|---|
+| `tokens` | `FixedSizeList<int32, L>`, with the extension `arrow.fixed_shape_tensor` and the metadata `{"shape":[L]}` |
+| `lengths` | `Int32Array` |
+
+An Arrow consumer moves the structs out of the capsules and sets their `release` to null. The capsule then frees only an empty struct.
+
+**Rationale:**
+
+- Both DLPack ABIs: numpy 2 and current torch ask for the versioned ABI, and older consumers call `__dlpack__()` with no arguments (D-46).
+- int32: torch has little support for `uint32`, and vocabularies are much smaller than 2³¹. A pad token of 2³² − 1 shows as −1 (D-47).
+- `pad` has no default. Many tokenizers use 0 as a real token, so the user must choose (D-52). A negative `pad` from −2³¹ is the token with the same bits, so `pad=-1` and `pad=2**32 - 1` give the same batches.
+- `set_epoch(e)` opens the iterator for epoch `e` when the loader stands at the start of `e`, also just after `StopIteration`. Thus a trainer that calls `set_epoch` and then `next` for each epoch gets each epoch. The epoch after `u64::MAX` is `u64::MAX`: the count stops there and never wraps to 0.
+- The runtime has all its drivers. The S3 client needs the I/O driver, and the waits need the timer.
+- The PID check stops a forked child before it waits for runtime threads that it does not have (D-50).
+- The 100 ms slices let Ctrl-C work and cost one timer for each slice (D-51).
+
+**Limits:**
+
+- One wheel for each platform covers CPython 3.11 and later (abi3). It does not cover the free-threaded build.
+- During a step, only `checkpoint()`, `epoch` and `lanes` work from another thread or a signal handler. `__next__`, `__iter__`, `set_epoch` and `resume` give `RuntimeError` until the step ends.
+- If a step stops with a panic, the `Loader` gives `RuntimeError` for each later step: its lanes can be part way through the step. `checkpoint()` still gives the last good state, so a new `Loader` can resume from it.
+- Each epoch has its own peak (section 5.7), and the loader of each epoch checks the budget when it starts. Thus a budget that fits epoch 0 can give `ConfigError` at the start of a later epoch. The error gives the bytes that are necessary. The budget is not part of a checkpoint, so a resume with a larger budget continues the run.
+- The data is writable. Two exports of one array share the same memory.
+- Signals are checked only on the main thread, as in Python.
+- A `KeyboardInterrupt` can come after `__next__` returns and before the caller gets the batch, as with each Python iterator. Then `checkpoint()` is already after that step, and a resume does not give its batch again. Save checkpoints between training steps, for example from a flag that a signal handler sets, not in an `except KeyboardInterrupt` block around the loop.
+- In a forked child, a `Loader` leaks its session when Python frees it. A drop would stop runtime tasks, and a lock that a parent thread held at the fork stays held (D-56).
+
+**Verification:**
+
+| Test | Type | What it shows |
+|---|---|---|
+| `test_ranks_split_the_global_batch` | pytest | Two loaders on world 2 give the batches of one loader on world 1. |
+| `test_iteration_ends_each_epoch` | pytest | A `for` loop ends at the end of each epoch, and the next loop gives the next epoch. |
+| `test_set_epoch_after_stop_iteration` | pytest | `set_epoch(e)` and `next` until `StopIteration`, for two epochs, give the batches of both epochs. |
+| `test_epoch_is_the_next_step` | pytest | After the last step of an epoch, `epoch` is 1 before and after `StopIteration`. |
+| `test_checkpoint_during_a_step` | pytest | Another thread reads `checkpoint()` and `epoch` during all the steps of an epoch with no error. Each checkpoint it reads is complete. |
+| `test_iterator_protocol` | pytest | After the end of an epoch, `next` raises `StopIteration` again. The next `for` loop gives the next epoch. |
+| `test_non_strict_zip_keeps_ranks_together` | pytest | Two epochs through `zip` (not strict) of two world-2 loaders give the batches of one world-1 loader. |
+| `test_batch_shapes_and_padding` | pytest | The shapes and the int32 type are correct. After the real tokens, each row holds the pad token. |
+| `test_negative_pad_is_the_same_token` | pytest | `pad=-1` gives the same batches as `pad=2**32 - 1`. |
+| `test_dlpack_versioned_and_legacy` | pytest | Both ABIs give the same data, with the correct capsule names. |
+| `test_unused_capsules_are_freed` | pytest | 300 000 capsules that nobody takes are freed: the peak memory grows less than 16 MiB (Linux). |
+| `test_no_default_cache_without_a_user_folder` | pytest | With no user cache folder and no `cache`, `Loader` gives `ConfigError`. |
+| `test_default_cache_is_made_and_shared` | pytest | With no `cache`, the index makes its cache folder. Three spellings of one folder use one cache file. |
+| `test_data_outlives_the_batch_and_the_loader` | pytest | DLPack and Arrow data stay correct after the batch and the loader are deleted. |
+| `test_copy_and_device` | pytest | `copy=True` gives separate memory. A device that is not the CPU gives `BufferError`. |
+| `test_arrow_export` | pytest | pyarrow reads `tokens` as a `FixedShapeTensorArray` and `lengths` as int32. |
+| `test_resume_on_another_world` | pytest | Parts from world 2, merged, resume on world 4 with the same tail as one run. |
+| `test_resume_refuses_other_runs` | pytest | A different L, bad bytes and an incomplete merge give `CheckpointError`. |
+| `test_resume_refuses_a_hand_made_checkpoint` | pytest | Checksummed bytes whose leftover starts at an earlier document give `CheckpointError` at `resume`, and `checkpoint()` is unchanged. |
+| `test_bad_settings` | pytest | Bad settings, `world=-1`, `seed=2**200`, `lanes=4.0`, `docs=True`, a URL with `#` and a cache below a file give `ConfigError`. A missing folder gives `DataError`. |
+| `test_forked_child_makes_its_own_loader` | pytest | In a child of `os.fork`, the copied loader gives `RuntimeError`. A new loader gives the same first batch as the parent. The child frees the copy with no wait. |
+| `test_s3_matches_local` | pytest | The same files on versitygw and on local disk give the same batches. |
+
+### 5.12 Planned components
+
+This component is not in the code yet. Its section will have the full set of parts when it is implemented.
+
+- **PyTorch dataset:** `plitzer.torch` gives an `IterableDataset` with `state_dict()` and `load_state_dict()`. The state is `{"plitzer": bytes}`, gathered from all ranks of the data-parallel group. Users must set `num_workers=0`. The parallel work is in Rust, and a fork of a process with a tokio runtime is not safe.
 
 ## 6. Read amplification
 
@@ -858,6 +1051,25 @@ These components are not in the code yet. Their sections will have the full set 
 | D-43 | `set_epoch` only goes to a later epoch. | Trainers call it after a resume, also with the epoch before a checkpoint at an epoch end. A reset would repeat steps with no error. | Always go to step 0, or do nothing only for the same epoch. | #16 |
 | D-44 | `Loader::next` is cancel safe. The read in progress stays in the loader. | Python drops the future at Ctrl-C, and a timeout drops it too. A lost read stops the loader with a panic. | Document that a dropped `next` breaks the loader. | #16 |
 | D-45 | `from_bytes` checks the checksum before the version. | A damaged version field gives `Checksum`, not a false `Version` error. | Check the version first. | #16 |
+| D-46 | Export both the versioned (1.0) and the legacy DLPack ABI. | numpy 2 and current torch ask for 1.0. Older consumers call `__dlpack__()` with no arguments. | Only one ABI. | #18 |
+| D-47 | Export tokens as int32. | torch has little `uint32` support, and vocabularies are much smaller than 2³¹. | `uint32`, or int64 with a copy. | #18 |
+| D-48 | The DLPack capsules use our own destructor through `PyCapsule_New`. | A consumer renames the capsule and deletes the tensor itself. PyO3 destructors cannot see the name, so they would free the tensor a second time. | `PyCapsule::new_with_value`, as for the Arrow capsules. | #18 |
+| D-49 | S3 uses `AmazonS3Builder::from_env` and the options, in our `store` module. | `parse_url_opts` does not read the `AWS_*` environment variables. | `object_store::parse_url_opts`. | #18 |
+| D-50 | One runtime for each process. A forked child makes its own, and a `Loader` copied into the child refuses to work. | A forked child has none of the parent's runtime threads, so a wait on the copied loader never ends. A new loader in the child must still work. | One runtime that refuses all work after a fork: the child can then never make a loader. | #18 |
+| D-51 | Python waits in slices of 100 ms and checks for signals between them. | Ctrl-C works, and `Loader::next` is cancel safe. | One wait with no signal check: Ctrl-C does nothing until the step ends. | #18 |
+| D-52 | `pad` has no default. | Many tokenizers use 0 as a real token. `lengths` gives the real tokens, but a silent default hides the choice. | A default of 0. | #18 |
+| D-53 | The bindings are the `plitzer-py` workspace crate, built by maturin as abi3 wheels for CPython 3.11 and later. | The core crate stays free of PyO3, and one wheel covers each platform. | PyO3 in the core crate behind a feature. | #18 |
+| D-54 | The default cache name is a hash of the resolved store and prefix. | The same text can name two datasets, and two texts can name one dataset. | A hash of the location text. | #18 |
+| D-55 | `__next__` keeps raising `StopIteration` after an epoch ends, and `__iter__` starts the next epoch. | Python iterators stay ended. A `zip` stops at the first ended loader, so `__iter__` must move the others on. | Start the next epoch at the next `__next__`. | #18 |
+| D-56 | In a forked child, a `Loader` leaks its session. | A drop stops runtime tasks, which can wait on a lock that no thread in the child will release. | Drop as usual and risk a hang at exit. | #18 |
+| D-57 | Before it reads the footers, `Index::open` makes a file in the cache folder. It changes no file. | A cache that cannot be written then fails at once, not after the full footer scan. Another process can have just written a good sidecar, so the check must not replace it. No file stays open during the build. | Write the cache after the build only, or keep the temporary file open during the build. | #18 |
+| D-58 | The default cache name is a hash of `store::Location::id`, which holds the endpoint but no credentials. | New credentials keep the cache. Two servers with the same bucket name do not share it. | A hash of all storage options. | #18 |
+| D-59 | A frozen `Loader` with a lock for the session and a checkpoint snapshot that other calls read. | A preemption signal handler or a background thread can save a checkpoint during a step. A second step from another thread gets an error, not a deadlock. | A borrow for each call, which refuses all calls during a step. A lock that each call takes, which deadlocks a signal handler. | #18 |
+| D-60 | The runtime has at most 8 worker threads and 32 blocking threads. | Each GPU process has its own runtime, and a loader has at most 16 reads in flight. | One worker for each CPU: hundreds of threads in each process on a large node. | #18 |
+| D-61 | No default cache without a user cache folder. | A shared temporary folder lets other users break or poison the index. | A shared folder in the temporary directory. | #18 |
+| D-62 | A URL with `?` or `#` is an error. | The parser drops what follows them, and they can be part of a real name, so another dataset would open with no error. | Drop the query and the fragment. | #18 |
+| D-63 | `Session::open` refuses more than 2²⁴ lanes, and more than 2³⁰ tokens in one step of one GPU or in its leftovers. | These sizes are far past any real batch. Larger values could only use all memory, which stops the process with no Python exception. | No bound. | #18 |
+| D-64 | `Epoch::lane` gives an error, not a panic, for a state that no run makes. `Session::resume` makes the loader at once and keeps the old position on an error. | A checkpoint made by hand passes the checksum, and its states would stop the packer with a panic. A resume that cannot go on must not replace a good position. | Trust each checksummed checkpoint, or check only some states, or make the loader at the next step. | #18 |
 | D-22 | The sidecar uses its own binary format and FNV-1a. | No new dependency, and the bytes are fixed by our code. | `serde` with `bincode`, or JSON. | #10 |
 | D-23 | A sidecar that does not exist or is corrupt causes a new build. | The sidecar is only a cache. | An error that the user must correct. | #10 |
 | D-24 | The index keeps the place of each token column chunk, and the reader reads no footer. | A window has row groups from approximately W files. A footer read for each row group costs approximately 1.5 times the data. | Read the footer of each file again, or keep footers in memory (9.4 GB for FineWeb-Edu). | #12 |
@@ -879,6 +1091,7 @@ These components are not in the code yet. Their sections will have the full set 
 | 2026-10-23 | #12 | Add the reader (`src/read.rs`) and the `s3` feature. Change the index to version 2, with the token column chunk of each row group. |
 | 2026-10-23 | #14 | Add the loader (`src/load.rs`) and `Order::lane_groups`. Change the index to version 3, with the value count. `Lane` holds an `Arc<Epoch>`. |
 | 2026-10-23 | #16 | Add the checkpoint (`src/checkpoint.rs`) and the session (`src/session.rs`). Add `Loader::ended`. Move the binary helpers to `src/codec.rs`. |
+| 2026-10-23 | #18 | Add the Python bindings (`plitzer-py/`), the store (`src/store.rs`, `src/store/s3.rs`) and `Session::ended`. Add a Python CI job on the three systems. The index makes the folder of its cache, and checks that it can write the cache before it reads the footers. |
 
 ## 10. Maintenance
 

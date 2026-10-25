@@ -31,6 +31,8 @@ pub enum Error {
     /// An earlier read failed. `states()` still holds the state before the
     /// failed step, so build a new loader from it.
     Stopped,
+    /// A lane state that no run makes, such as from a checkpoint made by hand.
+    State(String),
 }
 
 impl fmt::Display for Error {
@@ -43,6 +45,7 @@ impl fmt::Display for Error {
             Error::Read(e) => write!(f, "{e}"),
             Error::Join(e) => write!(f, "a read task failed: {e}"),
             Error::Stopped => write!(f, "an earlier read failed; resume from states()"),
+            Error::State(why) => write!(f, "{why}"),
         }
     }
 }
@@ -50,7 +53,7 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Error::Budget { .. } | Error::Stopped => None,
+            Error::Budget { .. } | Error::Stopped | Error::State(_) => None,
             Error::Read(e) => Some(e),
             Error::Join(e) => Some(e),
         }
@@ -151,12 +154,22 @@ impl Loader {
         // Resumed lanes replay their leftover now, so their row groups for
         // the resume step must be in memory first.
         loader.receive(step).await?;
-        let buffer = &loader.buffer;
-        loader.lanes = lanes
-            .zip(states)
-            .map(|(l, &s)| epoch.lane(l, s, buffer))
-            .collect();
+        loader.lanes = loader.resume_lanes(lanes, states)?;
         Ok(loader)
+    }
+
+    /// Each lane from its state, with its leftover replayed from the buffer.
+    fn resume_lanes(&self, lanes: Range<u32>, states: &[LaneState]) -> Result<Vec<Lane>, Error> {
+        let epoch = self.epoch.order().epoch;
+        let lane = |(l, &s): (u32, &LaneState)| {
+            let at = |why| format!("lane {l} of epoch {epoch}: {why}");
+            self.epoch.lane(l, s, &self.buffer).map_err(at)
+        };
+        lanes
+            .zip(states)
+            .map(lane)
+            .collect::<Result<_, _>>()
+            .map_err(Error::State)
     }
 
     /// The next step: one sequence of L tokens for each lane, in lane order,

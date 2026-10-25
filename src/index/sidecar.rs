@@ -8,12 +8,12 @@
 //!   codec u8
 //! ```
 
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 
 use super::{Codec, File, Index, RowGroup};
 use crate::codec::{Reader, len, put_str};
 
-const MAGIC: &[u8; 8] = b"PLTZIDX\0";
+pub(super) const MAGIC: &[u8; 8] = b"PLTZIDX\0";
 /// Version 1 held only row counts, version 2 no value counts. A sidecar of
 /// another version does not decode, so `Index::open` rebuilds it.
 const VERSION: u32 = 3;
@@ -97,12 +97,59 @@ fn file(r: &mut Reader) -> Option<File> {
     })
 }
 
+/// Checks, before the build, that `write` can later put a sidecar at
+/// `path`, so a cache that cannot be written fails before any footer is
+/// read. It refuses a folder, a path with no file name or one that ends in a
+/// separator (rename cannot put a file there), and makes a file
+/// in the folder: on Unix `write` renames over the old sidecar, which needs
+/// only the folder, so a read-only stale sidecar is still replaced. It changes
+/// no file, since another process may have just written a good sidecar.
+pub(super) fn check_writable(path: &std::path::Path) -> io::Result<()> {
+    let names_a_folder = path.to_string_lossy().ends_with(std::path::is_separator);
+    if path.is_dir() || path.file_name().is_none() || names_a_folder {
+        let why = format!("the index cache {:?} is not a file path", path);
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, why));
+    }
+    // The rename is atomic, so a sidecar always starts with the magic. Any
+    // other file is not ours, such as a Parquet file given as `cache` by
+    // mistake, and the write must not replace it.
+    let mut head = Vec::new();
+    if let Ok(file) = std::fs::File::open(path) {
+        io::Read::take(file, MAGIC.len() as u64).read_to_end(&mut head)?;
+    }
+    if !head.is_empty() && head != MAGIC {
+        let why = format!("the index cache {path:?} is another file; plitzer will not replace it");
+        return Err(io::Error::new(io::ErrorKind::AlreadyExists, why));
+    }
+    // Windows, unlike Unix, refuses to rename over a read-only file.
+    #[cfg(windows)]
+    if path.metadata().is_ok_and(|m| m.permissions().readonly()) {
+        let why = format!("the index cache {:?} is read-only", path);
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied, why));
+    }
+    tempfile::NamedTempFile::new_in(folder(path)?).map(drop)
+}
+
+/// The folder of `path`, made if it does not exist, as on a new machine.
+fn folder(path: &std::path::Path) -> io::Result<&std::path::Path> {
+    let dir = path.parent().filter(|d| !d.as_os_str().is_empty());
+    let dir = dir.unwrap_or(".".as_ref());
+    std::fs::create_dir_all(dir)?;
+    Ok(dir)
+}
+
 /// Writes `bytes` to a temporary file with a unique name next to `path`,
 /// then renames it. Processes that start together (one per GPU) can then
 /// write at once, and no reader sees a half-written sidecar.
 pub(super) fn write(path: &std::path::Path, bytes: &[u8]) -> io::Result<()> {
-    let dir = path.parent().filter(|d| !d.as_os_str().is_empty());
-    let mut tmp = tempfile::NamedTempFile::new_in(dir.unwrap_or(".".as_ref()))?;
+    // `mut` only for the mode, which only Unix sets.
+    #[cfg_attr(not(unix), allow(unused_mut))]
+    let mut tmp = tempfile::Builder::new();
+    // A temp file is 0600, which other users of a shared cache folder could
+    // not read; this mode, less the umask, is the mode of a plain new file.
+    #[cfg(unix)]
+    tmp.permissions(std::os::unix::fs::PermissionsExt::from_mode(0o644));
+    let mut tmp = tmp.tempfile_in(folder(path)?)?;
     tmp.write_all(bytes)?;
     for attempt in 0.. {
         let Err(e) = tmp.persist(path) else {

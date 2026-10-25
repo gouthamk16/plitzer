@@ -1,0 +1,24 @@
+[package]
+name = "plitzer-py"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Python bindings for plitzer"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/gouthamk16/plitzer"
+publish = false
+
+[lib]
+name = "_plitzer"
+crate-type = ["cdylib"]
+
+[dependencies]
+arrow-array = { version = "60.0.0", default-features = false, features = ["ffi"] }
+arrow-buffer = { version = "60.0.0", default-features = false }
+arrow-schema = { version = "60.0.0", default-features = false, features = ["ffi"] }
+object_store = { version = "0.14.2", default-features = false }
+plitzer = { path = "..", features = ["s3"] }
+# abi3: one wheel per platform for every CPython from 3.11.
+pyo3 = { version = "0.30.1", features = ["abi3-py311"] }
+tokio = { version = "1.52.1", features = ["rt-multi-thread", "time"] }
+url = "2.5"
