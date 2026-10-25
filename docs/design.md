@@ -773,7 +773,7 @@ pub enum Error { Config(String), Index(index::Error), Read(read::Error),
 
 - `open` checks the config, opens the index with `Index::open`, and makes the reader. The lanes are `gpu_lanes(B, world, rank)`.
 - `open` refuses more than 2²⁴ lanes, and more than 2³⁰ tokens in one step of one GPU or in its leftovers (lanes × C). These sizes are far past any real batch, and a larger value could only use all the memory (D-63).
-- The session keeps the lane states to start from. `set_epoch` sets them to the start of a later epoch. It does nothing for the current epoch or an earlier one. `resume` takes them from a checkpoint after `check`. It drops the old loader first and keeps its position, then makes the new loader, and changes the position only when that succeeds. Thus an error, or a `resume` future that is dropped, leaves the session where it was.
+- The session keeps the lane states to start from. `set_epoch` sets them to the start of a later epoch. It does nothing for the current epoch or an earlier one. `resume` takes them from a checkpoint after `check`. It drops the old loader first and keeps its position, then makes the new loader, and changes the position only when that succeeds. An ended loader is not dropped: it holds no row groups, and it still gives the `None` that ends its epoch. Thus an error, or a `resume` future that is dropped, leaves the session where it was.
 - `next` makes the loader of the epoch at the first step. At the end of the epoch, `next` returns `None`, and the session goes to step 0 of the next epoch.
 - If `next` fails, the session keeps the lane states of the loader and drops the loader. The next call makes a new loader and tries the same step again.
 - `checkpoint` gives the lane states of the loader. Before the first step of an epoch, it gives the start states. After the last step of an epoch, it gives `(epoch + 1, step 0)`, also before the call of `next` that returns `None`.
@@ -803,6 +803,7 @@ pub enum Error { Config(String), Index(index::Error), Read(read::Error),
 | `next_is_cancel_safe` | Unit | Over a store with 5 ms reads, calls of `next` that are dropped after one poll give the same batches as a run with no drops. |
 | `resume_is_cancel_safe` | Unit | Over a store with 20 ms reads, a `resume` future dropped after one poll leaves `checkpoint()` unchanged, and the next batches are the same as a run with no `resume`. |
 | `resume_refuses_other_runs` | Unit | A different L, a different seed and an added file each give `Mismatch` with the name of the field. |
+| `refused_resume_keeps_the_epoch_end` | Unit | After the last step, a `resume` that fails when it makes the loader leaves `ended` true, and the next `next` gives `None`. |
 | `resume_needs_this_ranks_lanes` | Unit | A part resumes the rank that holds its lanes, and another rank refuses it. |
 | `resume_refuses_states_outside_the_epoch` | Unit | A step past the epoch, a leftover past the cursor, and a leftover that starts earlier and goes past the cap each give `checkpoint::Error::Range` at `resume`, not a panic. After a refused resume, `checkpoint()` is unchanged, also on a new session. |
 | `open_refuses_bad_settings` | Unit | A world that does not divide B, a rank out of range, no GPUs, W = 0, D = 0, 2²⁵ lanes, L = 2³² − 1 and C = 2³² − 1 each give `Error::Config`. |

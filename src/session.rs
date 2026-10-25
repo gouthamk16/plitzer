@@ -117,24 +117,28 @@ impl Session {
     /// succeeds only if the run can go on from there; on an error the
     /// session stays where it was, and `checkpoint()` still gives that.
     pub async fn resume(&mut self, checkpoint: &Checkpoint) -> Result<(), Error> {
-        let states = (checkpoint.check(&self.config, self.fingerprint))
-            .and_then(|()| checkpoint.states(self.lanes.clone()))
-            .and_then(|states| self.in_range(checkpoint.epoch, &states).map(|()| states))
+        (checkpoint.check(&self.config, self.fingerprint)).map_err(Error::Checkpoint)?;
+        let plan = Arc::new(self.epoch_plan(checkpoint.epoch));
+        let states = (checkpoint.states(self.lanes.clone()))
+            .and_then(|states| self.in_range(&plan, &states).map(|()| states))
             .map_err(Error::Checkpoint)?;
         // Stop the old loader first, so two never hold the budget at once.
         // The session keeps its position, so an error or a dropped future
         // leaves it where it was: nothing below changes it before the end.
         self.park();
-        let loader = self.load(checkpoint.epoch, &states).await?;
+        let loader = self.load(plan, &states).await?;
         (self.epoch, self.start, self.loader) = (checkpoint.epoch, states, Some(loader));
         Ok(())
     }
 
-    /// Drops the loader and keeps its position in `epoch` and `start`, as
-    /// `checkpoint()` gives it: after the last step, the next epoch.
+    /// Drops the loader and keeps its position in `epoch` and `start`. An
+    /// ended loader stays: it holds no row groups, and it still owes the
+    /// `None` that ends its epoch.
     fn park(&mut self) {
-        let at = self.checkpoint();
-        (self.epoch, self.start, self.loader) = (at.epoch, at.lanes, None);
+        if !self.ended() {
+            let at = self.checkpoint();
+            (self.epoch, self.start, self.loader) = (at.epoch, at.lanes, None);
+        }
     }
 
     /// The next step: one sequence of L tokens for each of this GPU's lanes,
@@ -145,9 +149,10 @@ impl Session {
     pub async fn next(&mut self, out: &mut [u32]) -> Result<Option<Vec<u32>>, Error> {
         let loader = match &mut self.loader {
             Some(loader) => loader,
-            None => self
-                .loader
-                .insert(self.load(self.epoch, &self.start).await?),
+            None => {
+                let plan = Arc::new(self.epoch_plan(self.epoch));
+                self.loader.insert(self.load(plan, &self.start).await?)
+            }
         };
         match loader.next(out).await {
             Ok(Some(real)) => Ok(Some(real)),
@@ -199,13 +204,12 @@ impl Session {
         self.lanes.clone()
     }
 
-    /// Whether each of `states` lies inside epoch `epoch`: no later than its
-    /// last step, with its leftover not past the documents it has taken. A
-    /// checkpoint from plitzer always passes. This refuses most hand-made
-    /// ones at `resume`; the rest, which need the tokens, are refused as
-    /// `checkpoint::Error::Range` at the first step.
-    fn in_range(&self, epoch: u64, states: &[LaneState]) -> Result<(), checkpoint::Error> {
-        let plan = self.epoch_plan(epoch);
+    /// Whether each of `states` lies inside the epoch of `plan`: no later
+    /// than its last step, with its leftover not past the documents it has
+    /// taken. A checkpoint from plitzer always passes. The states that this
+    /// cannot refuse need the tokens; `load` refuses them.
+    fn in_range(&self, plan: &Epoch, states: &[LaneState]) -> Result<(), checkpoint::Error> {
+        let epoch = plan.order().epoch;
         for (lane, &state) in self.lanes.clone().zip(states) {
             let at = |why| format!("lane {lane} of epoch {epoch}: {why}");
             plan.check(lane, state)
@@ -226,8 +230,7 @@ impl Session {
         Epoch::new(order, c.packing)
     }
 
-    async fn load(&self, epoch: u64, start: &[LaneState]) -> Result<Loader, Error> {
-        let epoch = Arc::new(self.epoch_plan(epoch));
+    async fn load(&self, epoch: Arc<Epoch>, start: &[LaneState]) -> Result<Loader, Error> {
         let (reader, index) = (self.reader.clone(), self.index.clone());
         let loader = Loader::new(epoch, reader, index, self.lanes(), start, self.budget);
         loader.await.map_err(|e| match e {

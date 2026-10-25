@@ -77,6 +77,33 @@ async fn resume_refuses_states_outside_the_epoch() {
     one[0].resume(&good).await.unwrap();
 }
 
+// A refused resume after the last step keeps the `None` that ends the epoch,
+// so this rank does not run into the next epoch ahead of the others.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refused_resume_keeps_the_epoch_end() {
+    let d = data();
+    let end = reference(&d)
+        .await
+        .iter()
+        .position(Option::is_none)
+        .unwrap();
+    let mut one = sessions(&d, 1).await;
+    run(&mut one, 2).await;
+    let mut bad = one[0].checkpoint();
+    bad.lanes[0] = LaneState {
+        doc: 0,
+        offset: 0,
+        ..bad.lanes[0]
+    };
+    run(&mut one, end - 2).await;
+    assert!(one[0].ended());
+    let before = one[0].checkpoint();
+    let refused = one[0].resume(&bad).await;
+    assert!(matches!(refused, Err(Error::Checkpoint(_))), "{refused:?}");
+    assert!(one[0].ended() && one[0].checkpoint() == before);
+    assert_eq!(run(&mut one, 1).await, [None]);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn resume_needs_this_ranks_lanes() {
     let d = data();
