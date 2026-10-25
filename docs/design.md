@@ -322,7 +322,7 @@ impl Epoch {
     pub fn steps(&self) -> u64;
     pub fn lane_docs(&self, lane: u32) -> u64;
     pub fn lane(self: &Arc<Self>, lane: u32, state: LaneState, tokens: &impl Tokens) -> Lane;
-    pub fn check(&self, lane: u32, state: LaneState) -> Result<(), String>;  // step and leftover in range
+    pub fn check(&self, lane: u32, state: LaneState) -> Result<u64, String>;  // step and leftover in range; the cursor
 }
 impl Lane {
     pub fn fill(&mut self, tokens: &impl Tokens, out: &mut [u32]) -> u32;
@@ -469,7 +469,7 @@ The fingerprint is the 64-bit FNV-1a hash of the same layout, with no ETags and 
 - The cache check compares the ETag, because a file can change and keep its size (D-20).
 - The fingerprint does not include the ETag. A local ETag holds the inode and the modification time, which are different on each copy (D-21).
 - The sidecar uses its own small format. It needs no `serde` dependency, and a golden test pins the bytes (D-22).
-- Before a build, `open` makes the cache folder and a file in it, and it opens an existing sidecar for writing. It refuses a cache path that is a folder or has no file name. It changes no file, because another process can have just written a good sidecar. A cache that cannot be written then fails before the footer scan, which takes long on a large dataset (D-57). If the write after the build fails, such as on a full disk, `open` still returns the index: the next start builds it again.
+- Before a build, `open` makes the cache folder and a file in it. It refuses a cache path that is a folder or has no file name. The write renames over the old sidecar, which needs only the folder, so a stale sidecar that is read-only is still replaced. The check changes no file, because another process can have just written a good sidecar. A cache that cannot be written then fails before the footer scan, which takes long on a large dataset (D-57). If the write after the build fails, such as on a full disk, `open` still returns the index: the next start builds it again.
 - If the sidecar does not exist or is corrupt, `open` builds the index again. This is not an error. The sidecar is only a cache (D-23).
 - The module writes the sidecar to a temporary file with a unique name and then renames it. Thus the processes of all GPUs on one node can write at the same time, and no process reads a half-written sidecar.
 - Windows does not replace a file while a different process has it open or replaces it. If the rename fails and the sidecar already has the same bytes, a different process wrote the same index, and the write is complete. If not, the module tries again up to five times.
@@ -496,6 +496,7 @@ The fingerprint is the 64-bit FNV-1a hash of the same layout, with no ETags and 
 | `open_writes_and_reuses_cache` | Unit | `open` writes the sidecar, and a second `open` gives the same index. |
 | `open_uses_cache_without_footers` | Unit | A sidecar with false row counts that matches the list of files is used, so no footer is read. A different column or a stale ETag causes a new build. |
 | `unwritable_cache_fails_before_the_build` | Unit | A cache below a file, a cache that is a folder and an empty cache path give `Error::Cache`, not the `Error::Footer` of a corrupt file in the dataset. The check does not change a stale sidecar. A missing cache folder is made. |
+| `read_only_stale_sidecar_is_replaced` | Unit | A stale sidecar with mode 0444 in a writable folder is replaced by the build (Unix). |
 | `open_rebuilds_on_change` | Unit | A changed file, a new file and a corrupt sidecar each cause a new build. |
 | `bad_footer_names_file` | Unit | A bad magic number, a file that is too short and a footer length larger than the file each give `Error::Footer` with the path. |
 | `no_files_is_an_error` | Unit | A prefix with no `.parquet` files gives `Error::NoFiles`. |
@@ -727,7 +728,7 @@ Each GPU gives a checkpoint part for its own lanes. `merge` puts the parts of al
 **Limits:**
 
 - The checksum finds damage, not changes by an attacker.
-- `from_bytes` does not make sure that each lane state is correct for the epoch. `Session::resume` refuses a step past the epoch, a leftover past the cursor and an epoch from 2⁶², through `Epoch::check`, which `Epoch::lane` also uses (D-64). `merge` reserves no memory from the B in the bytes. An offset past the end of its document can be found only with the data, so a checkpoint made by hand with such an offset still causes a panic in `Epoch::lane`.
+- `from_bytes` does not make sure that each lane state is correct for the epoch. `Session::resume` refuses a step past the epoch, a leftover past the cursor and an epoch past 2⁶² (2⁶² itself is the checkpoint after the last step of the last epoch that `set_epoch` takes), through `Epoch::check`, which `Epoch::lane` also uses (D-64). `merge` reserves no memory from the B in the bytes. An offset past the end of its document can be found only with the data, so a checkpoint made by hand with such an offset still causes a panic in `Epoch::lane`.
 
 **Verification:**
 
@@ -800,7 +801,7 @@ pub enum Error { Config(String), Index(index::Error), Read(read::Error),
 | `next_is_cancel_safe` | Unit | Over a store with 5 ms reads, calls of `next` that are dropped after one poll give the same batches as a run with no drops. |
 | `resume_refuses_other_runs` | Unit | A different L, a different seed and an added file each give `Mismatch` with the name of the field. |
 | `resume_needs_this_ranks_lanes` | Unit | A part resumes the rank that holds its lanes, and another rank refuses it. |
-| `resume_refuses_states_outside_the_epoch` | Unit | A step past the epoch, a leftover past the cursor and the epoch 2⁶² give `checkpoint::Error::Range`. `set_epoch(2⁶²)` gives `Error::Config`. |
+| `resume_refuses_states_outside_the_epoch` | Unit | A step past the epoch, a leftover past the cursor and the epoch 2⁶² + 1 give `checkpoint::Error::Range`. The start of epoch 2⁶² resumes. `set_epoch(2⁶²)` gives `Error::Config`. |
 | `open_refuses_bad_settings` | Unit | A world that does not divide B, a rank out of range, no GPUs, W = 0, D = 0, 2²⁵ lanes, L = 2³² − 1 and C = 2³² − 1 each give `Error::Config`. |
 | `next_retries_after_a_failed_read` | Unit | After a failed read and a repair of the file, the next calls give the same batches as a run with no failure. |
 
@@ -1045,7 +1046,7 @@ This component is not in the code yet. Its section will have the full set of par
 | D-54 | The default cache name is a hash of the resolved store and prefix. | The same text can name two datasets, and two texts can name one dataset. | A hash of the location text. | #18 |
 | D-55 | `__next__` keeps raising `StopIteration` after an epoch ends, and `__iter__` starts the next epoch. | Python iterators stay ended. A `zip` stops at the first ended loader, so `__iter__` must move the others on. | Start the next epoch at the next `__next__`. | #18 |
 | D-56 | In a forked child, a `Loader` leaks its session. | A drop stops runtime tasks, which can wait on a lock that no thread in the child will release. | Drop as usual and risk a hang at exit. | #18 |
-| D-57 | Before it reads the footers, `Index::open` makes a file in the cache folder and opens an existing sidecar for writing. It changes no file. | A cache that cannot be written then fails at once, not after the full footer scan. Another process can have just written a good sidecar, so the check must not replace it. No file stays open during the build. | Write the cache after the build only, or keep the temporary file open during the build. | #18 |
+| D-57 | Before it reads the footers, `Index::open` makes a file in the cache folder. It changes no file. | A cache that cannot be written then fails at once, not after the full footer scan. Another process can have just written a good sidecar, so the check must not replace it. No file stays open during the build. | Write the cache after the build only, or keep the temporary file open during the build. | #18 |
 | D-64 | `Session::resume` checks the epoch and each lane's step and leftover against the epoch. | A checkpoint made by hand passes the checksum, and its states would stop the packer with a panic. | Trust each checksummed checkpoint. | #18 |
 | D-58 | The default cache name is a hash of `store::Location::id`, which holds the endpoint but no credentials. | New credentials keep the cache. Two servers with the same bucket name do not share it. | A hash of all storage options. | #18 |
 | D-59 | A frozen `Loader` with a lock for the session and a checkpoint snapshot that other calls read. | A preemption signal handler or a background thread can save a checkpoint during a step. A second step from another thread gets an error, not a deadlock. | A borrow for each call, which refuses all calls during a step. A lock that each call takes, which deadlocks a signal handler. | #18 |

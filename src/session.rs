@@ -123,7 +123,7 @@ impl Session {
     pub fn resume(&mut self, checkpoint: &Checkpoint) -> Result<(), Error> {
         let states = (checkpoint.check(&self.config, self.fingerprint))
             .and_then(|()| checkpoint.states(self.lanes.clone()))
-            .and_then(|states| self.in_range(checkpoint.epoch, states))
+            .and_then(|states| self.in_range(checkpoint.epoch, &states).map(|()| states))
             .map_err(Error::Checkpoint)?;
         self.epoch = checkpoint.epoch;
         self.start = states;
@@ -192,23 +192,21 @@ impl Session {
     /// step, with its leftover not past the documents it has taken. A
     /// checksummed checkpoint from plitzer always passes; this refuses one
     /// made by hand, which would stop the packer with a panic.
-    fn in_range(
-        &self,
-        epoch: u64,
-        states: Vec<LaneState>,
-    ) -> Result<Vec<LaneState>, checkpoint::Error> {
-        if epoch >= MAX_EPOCH {
+    fn in_range(&self, epoch: u64, states: &[LaneState]) -> Result<(), checkpoint::Error> {
+        // `MAX_EPOCH` itself is allowed: a checkpoint after the last step of
+        // epoch `MAX_EPOCH - 1`, which `set_epoch` allows, stands there.
+        if epoch > MAX_EPOCH {
             return Err(checkpoint::Error::Range(format!(
                 "epoch {epoch} is too large"
             )));
         }
         let plan = self.epoch_plan(epoch);
-        for (lane, &state) in self.lanes.clone().zip(&states) {
+        for (lane, &state) in self.lanes.clone().zip(states) {
             let at = |why| format!("lane {lane} of epoch {epoch}: {why}");
             plan.check(lane, state)
                 .map_err(|why| checkpoint::Error::Range(at(why)))?;
         }
-        Ok(states)
+        Ok(())
     }
 
     fn epoch_plan(&self, epoch: u64) -> Epoch {

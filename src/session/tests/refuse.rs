@@ -40,7 +40,15 @@ async fn resume_refuses_states_outside_the_epoch() {
     bad.lanes[0].doc = 1_000_000;
     assert!(range(one[0].resume(&bad)), "leftover past the cursor");
     let mut bad = good.clone();
-    bad.epoch = MAX_EPOCH;
+    bad.epoch = MAX_EPOCH + 1;
+    assert!(range(one[0].resume(&bad)), "epoch too large");
+    // The checkpoint after the last step of `MAX_EPOCH - 1` stands here.
+    let mut last = good.clone();
+    last.epoch = MAX_EPOCH;
+    last.lanes.fill(LaneState::default());
+    one[0].resume(&last).unwrap();
+    let mut bad = good.clone();
+    bad.epoch = MAX_EPOCH + 1;
     assert!(range(one[0].resume(&bad)), "epoch too large");
     assert!(matches!(one[0].set_epoch(MAX_EPOCH), Err(Error::Config(_))));
     one[0].resume(&good).unwrap();

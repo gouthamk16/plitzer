@@ -95,9 +95,10 @@ impl Array {
             return Err(PyBufferError::new_err("plitzer arrays are on the CPU only"));
         }
         let copied = copy == Some(true);
-        let data = match copied {
-            true => Buffer::from(self.data.as_slice()),
-            false => self.data.clone(),
+        let data = if copied {
+            Buffer::from(self.data.as_slice())
+        } else {
+            self.data.clone()
         };
         let versioned = max_version.is_some_and(|(major, _)| major >= 1);
         dlpack::capsule(py, data, &self.shape, versioned, copied)

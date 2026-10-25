@@ -52,9 +52,10 @@ pub fn config(column: String, i: Ints) -> PyResult<Config> {
 /// The pad token as a `u32`. Batches reach Python as int32, so a negative
 /// pad, such as -1, means the token with the same bits.
 fn pad(value: i128) -> PyResult<u32> {
-    match value < 0 {
-        true => int::<i32>("pad", value).map(|p| p as u32),
-        false => int("pad", value),
+    if value < 0 {
+        int::<i32>("pad", value).map(|p| p as u32)
+    } else {
+        int("pad", value)
     }
 }
 

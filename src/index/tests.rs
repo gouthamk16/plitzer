@@ -274,3 +274,18 @@ async fn unwritable_cache_fails_before_the_build() {
     open(&store, &prefix, &nested).await.unwrap();
     assert!(nested.exists());
 }
+
+// `write` renames over the old sidecar, which needs only the folder, so a
+// stale sidecar that is read-only is still replaced.
+#[cfg(unix)]
+#[tokio::test]
+async fn read_only_stale_sidecar_is_replaced() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (dir, store, prefix) = dataset();
+    let cache = dir.path().join("index.bin");
+    std::fs::write(&cache, b"stale").unwrap();
+    std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o444)).unwrap();
+    open(&store, &prefix, &cache).await.unwrap();
+    assert_ne!(std::fs::read(&cache).unwrap(), b"stale");
+}

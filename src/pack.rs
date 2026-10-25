@@ -104,10 +104,9 @@ impl Epoch {
 
     /// Lane `lane`, resumed from `state`.
     pub fn lane(self: &Arc<Self>, lane: u32, state: LaneState, tokens: &impl Tokens) -> Lane {
-        if let Err(why) = self.check(lane, state) {
-            panic!("{why}");
-        }
-        let cursor = self.cursor(lane, state.step);
+        let cursor = self
+            .check(lane, state)
+            .unwrap_or_else(|why| panic!("{why}"));
         let mut l = Lane {
             epoch: self.clone(),
             lane,
@@ -128,11 +127,11 @@ impl Epoch {
             .sum()
     }
 
-    /// The documents lane `lane` has taken before step `step`.
     /// Whether `state` can stand in lane `lane` of this epoch: no later than
     /// its last step, with its leftover not past the documents it has taken.
-    /// An offset past its document is found only with the tokens, by `lane`.
-    pub fn check(&self, lane: u32, state: LaneState) -> Result<(), String> {
+    /// Gives the lane's cursor at that step. An offset past its document is
+    /// found only with the tokens, by `lane`.
+    pub fn check(&self, lane: u32, state: LaneState) -> Result<u64, String> {
         if state.step > self.steps {
             return Err(format!(
                 "state {state:?} is past the epoch's {} steps",
@@ -143,9 +142,10 @@ impl Epoch {
         if state.doc > cursor {
             return Err(format!("state {state:?} is past the cursor {cursor}"));
         }
-        Ok(())
+        Ok(cursor)
     }
 
+    /// The documents lane `lane` has taken before step `step`.
     fn cursor(&self, lane: u32, step: u64) -> u64 {
         assert!(
             lane < self.lanes,

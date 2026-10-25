@@ -99,19 +99,16 @@ fn file(r: &mut Reader) -> Option<File> {
 
 /// Checks, before the build, that `write` can later put a sidecar at
 /// `path`, so a cache that cannot be written fails before any footer is
-/// read. It refuses a folder or a path with no file name, makes a file in
-/// the folder, and opens an existing sidecar for writing. It changes no
-/// file: another process may have just written a good sidecar there.
+/// read. It refuses a folder or a path with no file name, and makes a file
+/// in the folder: `write` renames over the old sidecar, which needs only
+/// the folder, so a read-only stale sidecar is still replaced. It changes
+/// no file, since another process may have just written a good sidecar.
 pub(super) fn check_writable(path: &std::path::Path) -> io::Result<()> {
     if path.is_dir() || path.file_name().is_none() {
         let why = format!("the index cache {:?} is not a file path", path);
         return Err(io::Error::new(io::ErrorKind::InvalidInput, why));
     }
-    tempfile::NamedTempFile::new_in(folder(path)?)?;
-    if path.exists() {
-        std::fs::OpenOptions::new().write(true).open(path)?;
-    }
-    Ok(())
+    tempfile::NamedTempFile::new_in(folder(path)?).map(drop)
 }
 
 /// The folder of `path`, made if it does not exist, as on a new machine.
