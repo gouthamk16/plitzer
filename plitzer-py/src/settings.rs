@@ -46,16 +46,29 @@ pub struct Placement {
     pub budget: u64,
 }
 
-/// `rank`, `world` and `budget`, with the defaults of a single GPU.
+/// `rank`, `world` and `budget`, with the defaults of a single GPU. A
+/// `world` above 1 needs a `rank`: with rank 0 on each GPU, all GPUs would
+/// train on the same lanes with no error.
 pub fn placement(
     rank: Option<&Bound<'_, PyAny>>,
     world: Option<&Bound<'_, PyAny>>,
     budget: &Bound<'_, PyAny>,
 ) -> PyResult<Placement> {
+    let world = world.map_or(Ok(1), |w| int("world", w))?;
+    let rank = match rank {
+        Some(rank) => int("rank", rank)?,
+        None if world <= 1 => 0,
+        None => {
+            return Err(ConfigError::new_err(format!(
+                "world = {world} needs a rank"
+            )));
+        }
+    };
+    let budget = int("budget", budget)?;
     Ok(Placement {
-        rank: rank.map_or(Ok(0), |r| int("rank", r))?,
-        world: world.map_or(Ok(1), |w| int("world", w))?,
-        budget: int("budget", budget)?,
+        rank,
+        world,
+        budget,
     })
 }
 

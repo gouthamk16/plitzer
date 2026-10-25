@@ -211,9 +211,11 @@ def test_resume_refuses_a_hand_made_checkpoint(make: MakeLoader) -> None:
 
 def test_bad_settings(make: MakeLoader, tmp_path: Path) -> None:
     with pytest.raises(plitzer.ConfigError, match="divide"):
-        make(world=3)
+        make(rank=0, world=3)
     with pytest.raises(plitzer.ConfigError, match="world"):
-        make(world=-1)
+        make(rank=0, world=-1)
+    with pytest.raises(plitzer.ConfigError, match="needs a rank"):
+        plitzer.Loader(tmp_path, **SETTINGS, world=2)
     with pytest.raises(plitzer.ConfigError, match="seed"):
         make(seed=2**200)
     with pytest.raises(plitzer.ConfigError, match="epoch"):

@@ -71,8 +71,8 @@ class Loader:
         cap: SupportsIndex,
         pad: SupportsIndex,
         budget: SupportsIndex,
-        rank: SupportsIndex = 0,
-        world: SupportsIndex = 1,
+        rank: SupportsIndex | None = None,
+        world: SupportsIndex | None = None,
         column: str = "tokens",
         cache: str | os.PathLike[str] | None = None,
         storage_options: dict[str, str] | None = None,
@@ -87,7 +87,10 @@ class Loader:
         """This GPU's part of a checkpoint: the state before the next step.
 
         It works during a step too, such as from a signal handler or another
-        thread. `merge` joins the parts of all GPUs.
+        thread. `merge` joins the parts of all GPUs. A `KeyboardInterrupt`
+        can drop a batch that this already counts as taken, as with any
+        iterator: save between training steps, not in an `except` around
+        the loop.
         """
     def resume(self, checkpoint: bytes | bytearray) -> None: ...
     @property

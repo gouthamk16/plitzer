@@ -868,7 +868,7 @@ pub enum Error { Store(object_store::Error), Scheme(String), Option(String) }
 ```python
 class Loader:
     def __init__(self, location: str | os.PathLike[str], *, seed: int, lanes: int, window: int,
-                 seq_len: int, docs: int, cap: int, pad: int, budget: int, rank: int = 0, world: int = 1,
+                 seq_len: int, docs: int, cap: int, pad: int, budget: int, rank: int | None = None, world: int | None = None,
                  column: str = "tokens", cache: str | os.PathLike[str] | None = None,
                  storage_options: dict[str, str] | None = None) -> None: ...
     def __iter__(self) -> Loader: ...           # the rest of the current epoch
@@ -894,6 +894,7 @@ class PlitzerError(Exception); ConfigError, CheckpointError, DataError (PlitzerE
 - At the end of an epoch, `__next__` raises `StopIteration`, and it raises it again at each later call, as a Python iterator must. `__iter__` starts the next epoch: a new `for` loop gives it. `__iter__` also moves on a loader whose last step is taken but which did not raise `StopIteration` yet, such as the second loader in a `zip` (D-55).
 - Each step writes into a new `Vec<u32>`. An arrow `Buffer` holds it, and each export holds a clone of that `Buffer`. Thus an exported array stays valid after the batch, the loader and the export call.
 - The default cache is `$PLITZER_CACHE_DIR`, else the user cache folder, then `plitzer/<hash>.idx`. The hash is of the `id` of the store (section 5.10) and the column, not of the location text. Thus `data` from two folders gets two files, and `data/` and `file:///…/data` share one (D-54). The index makes the cache folder if it does not exist. `HOME`, `XDG_CACHE_HOME` and `LOCALAPPDATA` count only when they hold an absolute path: a relative folder would differ for each working directory. `PLITZER_CACHE_DIR` is used as given. With no user cache folder, there is no default, and `Loader` gives `ConfigError` (D-61).
+- `rank` defaults to 0 and `world` to 1. A `world` above 1 with no `rank` gives `ConfigError`: rank 0 on each GPU would train all GPUs on the same lanes with no error.
 - Integer settings, also the epoch of `set_epoch`, come in as Python objects. Each takes an `int` or another object with `__index__`, such as `np.int64` (the stub types them as `SupportsIndex`). A value that is not an integer, such as `4.0` or `True`, or that does not fit, such as `world=-1`, gives `ConfigError`.
 - `resume` and `merge` take `bytes` or `bytearray`.
 - If the runtime cannot start its threads, such as at a process limit, `Loader` gives `RuntimeError`. A call from a thread that runs a tokio runtime, such as a callback from another Rust extension, also gives `RuntimeError`, because tokio cannot block that thread.
@@ -947,6 +948,7 @@ An Arrow consumer moves the structs out of the capsules and sets their `release`
 - Each epoch has its own peak (section 5.7), and the loader of each epoch checks the budget when it starts. Thus a budget that fits epoch 0 can give `ConfigError` at the start of a later epoch. The error gives the bytes that are necessary. The budget is not part of a checkpoint, so a resume with a larger budget continues the run.
 - The data is writable. Two exports of one array share the same memory.
 - Signals are checked only on the main thread, as in Python.
+- A `KeyboardInterrupt` can come after `__next__` returns and before the caller gets the batch, as with each Python iterator. Then `checkpoint()` is already after that step, and a resume does not give its batch again. Save checkpoints between training steps, for example from a flag that a signal handler sets, not in an `except KeyboardInterrupt` block around the loop.
 - In a forked child, a `Loader` leaks its session when Python frees it. A drop would stop runtime tasks, and a lock that a parent thread held at the fork stays held (D-56).
 
 **Verification:**
