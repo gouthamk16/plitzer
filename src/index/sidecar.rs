@@ -142,6 +142,8 @@ fn folder(path: &std::path::Path) -> io::Result<&std::path::Path> {
 /// then renames it. Processes that start together (one per GPU) can then
 /// write at once, and no reader sees a half-written sidecar.
 pub(super) fn write(path: &std::path::Path, bytes: &[u8]) -> io::Result<()> {
+    // `mut` only for the mode, which only Unix sets.
+    #[cfg_attr(not(unix), allow(unused_mut))]
     let mut tmp = tempfile::Builder::new();
     // A temp file is 0600, which other users of a shared cache folder could
     // not read; this mode, less the umask, is the mode of a plain new file.
