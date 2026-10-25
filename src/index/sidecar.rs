@@ -8,12 +8,12 @@
 //!   codec u8
 //! ```
 
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 
 use super::{Codec, File, Index, RowGroup};
 use crate::codec::{Reader, len, put_str};
 
-const MAGIC: &[u8; 8] = b"PLTZIDX\0";
+pub(super) const MAGIC: &[u8; 8] = b"PLTZIDX\0";
 /// Version 1 held only row counts, version 2 no value counts. A sidecar of
 /// another version does not decode, so `Index::open` rebuilds it.
 const VERSION: u32 = 3;
@@ -109,6 +109,17 @@ pub(super) fn check_writable(path: &std::path::Path) -> io::Result<()> {
     if path.is_dir() || path.file_name().is_none() || names_a_folder {
         let why = format!("the index cache {:?} is not a file path", path);
         return Err(io::Error::new(io::ErrorKind::InvalidInput, why));
+    }
+    // The rename is atomic, so a sidecar always starts with the magic. Any
+    // other file is not ours, such as a Parquet file given as `cache` by
+    // mistake, and the write must not replace it.
+    let mut head = Vec::new();
+    if let Ok(file) = std::fs::File::open(path) {
+        io::Read::take(file, MAGIC.len() as u64).read_to_end(&mut head)?;
+    }
+    if !head.is_empty() && head != MAGIC {
+        let why = format!("the index cache {path:?} is another file; plitzer will not replace it");
+        return Err(io::Error::new(io::ErrorKind::AlreadyExists, why));
     }
     // Windows, unlike Unix, refuses to rename over a read-only file.
     #[cfg(windows)]

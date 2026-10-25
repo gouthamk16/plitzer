@@ -169,7 +169,7 @@ async fn open_rebuilds_on_change() {
         index
     );
 
-    std::fs::write(&cache, b"garbage").unwrap();
+    std::fs::write(&cache, [&sidecar::MAGIC[..], b"garbage"].concat()).unwrap();
     assert_eq!(open(&store, &prefix, &cache).await.unwrap(), index);
 }
 
@@ -271,10 +271,18 @@ async fn unwritable_cache_fails_before_the_build() {
     );
     // The check changes no file, also not a stale sidecar it then rebuilds.
     let stale = dir.path().join("stale.bin");
-    std::fs::write(&stale, b"stale").unwrap();
+    let old = [&sidecar::MAGIC[..], b"stale"].concat();
+    std::fs::write(&stale, &old).unwrap();
     let got = open(&store, &prefix, &stale).await;
     assert!(matches!(got, Err(Error::Footer { .. })), "{got:?}");
-    assert_eq!(std::fs::read(&stale).unwrap(), b"stale");
+    assert_eq!(std::fs::read(&stale).unwrap(), old);
+    // A file that is not a sidecar, such as a dataset file given as the
+    // cache by mistake, is refused and kept.
+    let other = dir.path().join("data/b.parquet");
+    let before = std::fs::read(&other).unwrap();
+    let got = open(&store, &prefix, &other).await;
+    assert!(matches!(got, Err(Error::Cache(_))), "{got:?}");
+    assert_eq!(std::fs::read(&other).unwrap(), before);
     // A missing cache folder is made.
     std::fs::remove_file(dir.path().join("data/z.parquet")).unwrap();
     let nested = dir.path().join("a/b/index.bin");
@@ -289,10 +297,10 @@ async fn unwritable_cache_fails_before_the_build() {
 async fn read_only_stale_sidecar_is_replaced() {
     let (dir, store, prefix) = dataset();
     let cache = dir.path().join("index.bin");
-    std::fs::write(&cache, b"stale").unwrap();
+    std::fs::write(&cache, [&sidecar::MAGIC[..], b"stale"].concat()).unwrap();
     std::fs::set_permissions(&cache, PermissionsExt::from_mode(0o444)).unwrap();
     open(&store, &prefix, &cache).await.unwrap();
-    assert_ne!(std::fs::read(&cache).unwrap(), b"stale");
+    assert!(!std::fs::read(&cache).unwrap().ends_with(b"stale"));
     // Not the 0600 of a temp file: other users of a shared cache read it.
     let mode = std::fs::metadata(&cache).unwrap().permissions().mode();
     assert_eq!(mode & 0o044, 0o044, "{mode:o}");

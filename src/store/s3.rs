@@ -71,24 +71,26 @@ pub(super) fn open(
 /// and an endpoint with a user or password, which its errors would repeat.
 /// The values can come from the options or the environment.
 fn check(builder: &AmazonS3Builder, endpoint: Option<&str>) -> Result<(), Error> {
-    if let Some(endpoint) = endpoint {
-        // `Url::parse` drops spaces at the ends, but the request would not.
-        let odd = endpoint
-            .chars()
-            .any(|c| c.is_whitespace() || c.is_control());
-        let url = Url::parse(endpoint).ok().filter(|u| u.has_host() && !odd);
-        let why = match url {
-            Some(u) if !matches!(u.scheme(), "http" | "https") => "must be http:// or https://",
-            Some(u) if !u.username().is_empty() || u.password().is_some() => {
-                "must not hold a user or password"
-            }
-            Some(_) => "",
-            None => "must be a URL such as http://host:9000, with no spaces",
-        };
-        if !why.is_empty() {
-            return Err(Error::Option(format!("the S3 endpoint {why}")));
+    endpoint.map_or(Ok(()), check_endpoint)?;
+    check_headers(builder)
+}
+
+fn check_endpoint(endpoint: &str) -> Result<(), Error> {
+    // `Url::parse` drops spaces at the ends, but the request would not.
+    let odd = (endpoint.chars()).any(|c| c.is_whitespace() || c.is_control());
+    let url = Url::parse(endpoint).ok().filter(|u| u.has_host() && !odd);
+    let why = match url {
+        Some(u) if !matches!(u.scheme(), "http" | "https") => "must be http:// or https://",
+        Some(u) if !u.username().is_empty() || u.password().is_some() => {
+            "must not hold a user or password"
         }
-    }
+        Some(_) => return Ok(()),
+        None => "must be a URL such as http://host:9000, with no spaces",
+    };
+    Err(Error::Option(format!("the S3 endpoint {why}")))
+}
+
+fn check_headers(builder: &AmazonS3Builder) -> Result<(), Error> {
     // object_store puts these in request headers and unwraps the result.
     let headers = [
         AmazonS3ConfigKey::AccessKeyId,
