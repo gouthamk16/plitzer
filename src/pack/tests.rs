@@ -324,3 +324,13 @@ fn zero_seq_len_panics() {
     let rows = [1];
     epoch(&rows, 1, 1, 7, Packing { seq_len: 0, ..P4 });
 }
+
+#[test]
+fn lane_out_of_range_is_refused() {
+    let (_, rows) = small();
+    let e = epoch(&rows, 1, 2, 7, P4);
+    assert!(
+        e.check(2, LaneState::default())
+            .is_err_and(|why| why.contains("out of range"))
+    );
+}

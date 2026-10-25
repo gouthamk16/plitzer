@@ -42,3 +42,37 @@ async fn next_is_cancel_safe() {
     assert!(cancelled > 0, "no call was cancelled");
     assert_eq!(got, want);
 }
+
+// A `resume` dropped while it reads leaves the session where it was: its
+// checkpoint and its next batches are those of a run with no resume.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resume_is_cancel_safe() {
+    let d = data();
+    let want = reference(&d).await;
+    let throttle = ThrottleConfig {
+        wait_get_per_call: Duration::from_millis(20),
+        ..ThrottleConfig::default()
+    };
+    let local = LocalFileSystem::new_with_prefix(d.files.path()).unwrap();
+    let store = Arc::new(ThrottledStore::new(local, throttle));
+    let cache = d.cache.path().join("index");
+    let mut one = Session::open(store, Path::from(""), &cache, config(), 0, 1, PLENTY)
+        .await
+        .unwrap();
+    let mut seq = vec![0; (4 * config().packing.seq_len) as usize];
+    let mut got = Vec::new();
+    for _ in 0..3 {
+        got.push(one.next(&mut seq).await.unwrap().map(|_| seq.clone()));
+    }
+    let before = one.checkpoint();
+    let mut elsewhere = before.clone();
+    elsewhere.epoch = 1;
+    elsewhere.lanes.fill(LaneState::default());
+    // Its reads take 20 ms, so one poll never finishes the resume.
+    assert!(one.resume(&elsewhere).now_or_never().is_none());
+    assert_eq!(one.checkpoint(), before);
+    while got.len() < want.len() {
+        got.push(one.next(&mut seq).await.unwrap().map(|_| seq.clone()));
+    }
+    assert_eq!(got, want);
+}

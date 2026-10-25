@@ -100,13 +100,19 @@ fn file(r: &mut Reader) -> Option<File> {
 /// Checks, before the build, that `write` can later put a sidecar at
 /// `path`, so a cache that cannot be written fails before any footer is
 /// read. It refuses a folder or a path with no file name, and makes a file
-/// in the folder: `write` renames over the old sidecar, which needs only
-/// the folder, so a read-only stale sidecar is still replaced. It changes
+/// in the folder: on Unix `write` renames over the old sidecar, which needs
+/// only the folder, so a read-only stale sidecar is still replaced. It changes
 /// no file, since another process may have just written a good sidecar.
 pub(super) fn check_writable(path: &std::path::Path) -> io::Result<()> {
     if path.is_dir() || path.file_name().is_none() {
         let why = format!("the index cache {:?} is not a file path", path);
         return Err(io::Error::new(io::ErrorKind::InvalidInput, why));
+    }
+    // Windows, unlike Unix, refuses to rename over a read-only file.
+    #[cfg(windows)]
+    if path.metadata().is_ok_and(|m| m.permissions().readonly()) {
+        let why = format!("the index cache {:?} is read-only", path);
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied, why));
     }
     tempfile::NamedTempFile::new_in(folder(path)?).map(drop)
 }

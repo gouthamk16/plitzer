@@ -8,12 +8,13 @@ use plitzer::checkpoint::Checkpoint;
 use plitzer::session::Session;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
+use pyo3::pybacked::PyBackedBytes;
 use pyo3::types::{PyBytes, PyRange};
 
 use crate::array::Batch;
 use crate::errors::{checkpoint_error, session_error};
 use crate::runtime::block_on;
-use crate::settings::{Ints, config, int, locate};
+use crate::settings::{Ints, config, int, locate, placement};
 
 /// The lanes of GPU `rank` of `world`, from one epoch to the next. Iterate
 /// it for the rest of the current epoch; the next iteration gives the next.
@@ -160,17 +161,8 @@ impl Loader {
             pad,
         };
         let config = config(column, ints)?;
-        let rank = rank.map_or(Ok(0), |r| int("rank", r))?;
-        let world = world.map_or(Ok(1), |w| int("world", w))?;
-        let open = Session::open(
-            store,
-            prefix,
-            &cache,
-            config,
-            rank,
-            world,
-            int("budget", budget)?,
-        );
+        let (rank, world, budget) = placement(rank, world, budget)?;
+        let open = Session::open(store, prefix, &cache, config, rank, world, budget);
         let session = block_on(py, open)?.map_err(session_error)?;
         Ok(Loader::from_session(session))
     }
@@ -235,9 +227,9 @@ impl Loader {
 
     /// Stands where `checkpoint` was taken, and reads what the next step
     /// needs. On an error nothing changes, also not `checkpoint()`.
-    fn resume(&self, py: Python<'_>, checkpoint: &[u8]) -> PyResult<()> {
+    fn resume(&self, py: Python<'_>, checkpoint: PyBackedBytes) -> PyResult<()> {
         let mut state = self.state()?;
-        let checkpoint = Checkpoint::from_bytes(checkpoint).map_err(checkpoint_error)?;
+        let checkpoint = Checkpoint::from_bytes(&checkpoint).map_err(checkpoint_error)?;
         block_on(py, state.session().resume(&checkpoint))?.map_err(session_error)?;
         state.exhausted = false;
         self.save(&state);

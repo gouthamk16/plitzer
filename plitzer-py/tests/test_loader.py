@@ -156,7 +156,8 @@ def test_resume_on_another_world(make: MakeLoader) -> None:
     for k in [0, 1, len(want) // 2]:
         two = [make(rank=r, world=2) for r in range(2)]
         head = [global_batch([next(rank) for rank in two]) for _ in range(k)]
-        checkpoint = plitzer.merge([rank.checkpoint() for rank in reversed(two)])
+        parts = [bytearray(rank.checkpoint()) for rank in reversed(two)]
+        checkpoint = bytearray(plitzer.merge(parts))  # a buffer works too
         four = [make(rank=r, world=4) for r in range(4)]
         for rank in four:
             rank.resume(checkpoint)
@@ -217,6 +218,11 @@ def test_bad_settings(make: MakeLoader, tmp_path: Path) -> None:
         make(seed=2**200)
     with pytest.raises(plitzer.ConfigError, match="epoch"):
         make().set_epoch(-1)
+    with pytest.raises(plitzer.ConfigError, match="lanes must be an int, not float"):
+        make(lanes=4.0)  # type: ignore[arg-type]
+    with pytest.raises(plitzer.ConfigError, match="docs must be an int, not bool"):
+        make(docs=True)
+    make().set_epoch(np.int64(1))  # type: ignore[arg-type]  # has __index__
 
     with pytest.raises(plitzer.ConfigError, match="#"):
         plitzer.Loader(str(tmp_path.as_uri()) + "/data#2", **SETTINGS)

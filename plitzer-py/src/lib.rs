@@ -9,12 +9,13 @@ mod settings;
 
 use plitzer::checkpoint::Checkpoint;
 use pyo3::prelude::*;
+use pyo3::pybacked::PyBackedBytes;
 use pyo3::types::PyBytes;
 
 /// One global checkpoint from the parts of all GPUs, in any order.
 #[pyfunction]
-fn merge<'py>(py: Python<'py>, parts: Vec<Bound<'py, PyBytes>>) -> PyResult<Bound<'py, PyBytes>> {
-    let parts = (parts.iter().map(|p| Checkpoint::from_bytes(p.as_bytes())))
+fn merge<'py>(py: Python<'py>, parts: Vec<PyBackedBytes>) -> PyResult<Bound<'py, PyBytes>> {
+    let parts = (parts.iter().map(|p| Checkpoint::from_bytes(p)))
         .collect::<Result<Vec<_>, _>>()
         .map_err(errors::checkpoint_error)?;
     let merged = Checkpoint::merge(parts).map_err(errors::checkpoint_error)?;

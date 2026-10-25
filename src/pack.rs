@@ -102,8 +102,7 @@ impl Epoch {
         self.steps
     }
 
-    /// Lane `lane`, resumed from `state`.
-    /// Lane `lane` at `state`. A state that no run makes, such as one from a
+    /// Lane `lane`, resumed from `state`. A state that no run makes, such as one from a
     /// checkpoint made by hand, is an error that names what is wrong.
     pub fn lane(
         self: &Arc<Self>,
@@ -137,6 +136,9 @@ impl Epoch {
     /// Gives the lane's cursor at that step. An offset past its document is
     /// found only with the tokens, by `lane`.
     pub fn check(&self, lane: u32, state: LaneState) -> Result<u64, String> {
+        if lane >= self.lanes {
+            return Err(format!("lane {lane} out of range for {} lanes", self.lanes));
+        }
         if state.step > self.steps {
             return Err(format!(
                 "state {state:?} is past the epoch's {} steps",

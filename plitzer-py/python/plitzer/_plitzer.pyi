@@ -88,12 +88,12 @@ class Loader:
         It works during a step too, such as from a signal handler or another
         thread. `merge` joins the parts of all GPUs.
         """
-    def resume(self, checkpoint: bytes) -> None: ...
+    def resume(self, checkpoint: bytes | bytearray) -> None: ...
     @property
     def epoch(self) -> int:
         """The epoch of the next step, as in `checkpoint()`."""
     @property
     def lanes(self) -> range: ...
 
-def merge(parts: Sequence[bytes]) -> bytes:
+def merge(parts: Sequence[bytes | bytearray]) -> bytes:
     """One global checkpoint from the parts of all GPUs, in any order."""

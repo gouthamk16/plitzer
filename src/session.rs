@@ -121,18 +121,20 @@ impl Session {
             .and_then(|()| checkpoint.states(self.lanes.clone()))
             .and_then(|states| self.in_range(checkpoint.epoch, &states).map(|()| states))
             .map_err(Error::Checkpoint)?;
-        let epoch = std::mem::replace(&mut self.epoch, checkpoint.epoch);
-        let start = std::mem::replace(&mut self.start, states);
-        match self.load().await {
-            Ok(loader) => {
-                self.loader = Some(loader);
-                Ok(())
-            }
-            Err(e) => {
-                (self.epoch, self.start) = (epoch, start);
-                Err(e)
-            }
-        }
+        // Stop the old loader first, so two never hold the budget at once.
+        // The session keeps its position, so an error or a dropped future
+        // leaves it where it was: nothing below changes it before the end.
+        self.park();
+        let loader = self.load(checkpoint.epoch, &states).await?;
+        (self.epoch, self.start, self.loader) = (checkpoint.epoch, states, Some(loader));
+        Ok(())
+    }
+
+    /// Drops the loader and keeps its position in `epoch` and `start`, as
+    /// `checkpoint()` gives it: after the last step, the next epoch.
+    fn park(&mut self) {
+        let at = self.checkpoint();
+        (self.epoch, self.start, self.loader) = (at.epoch, at.lanes, None);
     }
 
     /// The next step: one sequence of L tokens for each of this GPU's lanes,
@@ -143,7 +145,9 @@ impl Session {
     pub async fn next(&mut self, out: &mut [u32]) -> Result<Option<Vec<u32>>, Error> {
         let loader = match &mut self.loader {
             Some(loader) => loader,
-            None => self.loader.insert(self.load().await?),
+            None => self
+                .loader
+                .insert(self.load(self.epoch, &self.start).await?),
         };
         match loader.next(out).await {
             Ok(Some(real)) => Ok(Some(real)),
@@ -222,10 +226,10 @@ impl Session {
         Epoch::new(order, c.packing)
     }
 
-    async fn load(&self) -> Result<Loader, Error> {
-        let epoch = Arc::new(self.epoch_plan(self.epoch));
+    async fn load(&self, epoch: u64, start: &[LaneState]) -> Result<Loader, Error> {
+        let epoch = Arc::new(self.epoch_plan(epoch));
         let (reader, index) = (self.reader.clone(), self.index.clone());
-        let loader = Loader::new(epoch, reader, index, self.lanes(), &self.start, self.budget);
+        let loader = Loader::new(epoch, reader, index, self.lanes(), start, self.budget);
         loader.await.map_err(|e| match e {
             // Only a resumed checkpoint gives a state that no run makes.
             load::Error::State(why) => Error::Checkpoint(checkpoint::Error::Range(why)),

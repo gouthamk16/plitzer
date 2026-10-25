@@ -323,7 +323,7 @@ impl Epoch {
     pub fn lane_docs(&self, lane: u32) -> u64;
     pub fn lane(self: &Arc<Self>, lane: u32, state: LaneState, tokens: &impl Tokens)
         -> Result<Lane, String>;   // Err for a state that no run makes
-    pub fn check(&self, lane: u32, state: LaneState) -> Result<u64, String>;  // step and leftover in range; the cursor
+    pub fn check(&self, lane: u32, state: LaneState) -> Result<u64, String>;  // lane, step and leftover in range; the cursor
 }
 impl Lane {
     pub fn fill(&mut self, tokens: &impl Tokens, out: &mut [u32]) -> u32;
@@ -387,6 +387,7 @@ At step 0, the leftover has 9 tokens. The lane copies 4 tokens. Then it removes 
 | `cap_and_padding` | Property | Pad tokens occur only at the end. The leftover is never more than C. A short sequence occurs only with an empty leftover. At the end of the epoch, each lane state is `(lane_docs, 0)`. |
 | `golden` | Unit | The example above, and a hash over 60 row groups, is the same on each OS. |
 | `*_panics` | Unit | Each invalid input in the limits causes a panic. |
+| `lane_out_of_range_is_refused` | Unit | `check` and `lane` give an error, not a panic, for a lane that is not in the order. |
 
 The property tests use small inputs. Thus empty documents, empty lanes, C = 0, C < L and L = 1 occur frequently.
 
@@ -470,7 +471,7 @@ The fingerprint is the 64-bit FNV-1a hash of the same layout, with no ETags and 
 - The cache check compares the ETag, because a file can change and keep its size (D-20).
 - The fingerprint does not include the ETag. A local ETag holds the inode and the modification time, which are different on each copy (D-21).
 - The sidecar uses its own small format. It needs no `serde` dependency, and a golden test pins the bytes (D-22).
-- Before a build, `open` makes the cache folder and a file in it. It refuses a cache path that is a folder or has no file name. The write renames over the old sidecar, which needs only the folder, so a stale sidecar that is read-only is still replaced. The check changes no file, because another process can have just written a good sidecar. A cache that cannot be written then fails before the footer scan, which takes long on a large dataset (D-57). If the write after the build fails, such as on a full disk, `open` still returns the index: the next start builds it again.
+- Before a build, `open` makes the cache folder and a file in it. It refuses a cache path that is a folder or has no file name. The write renames over the old sidecar. On Unix this needs only the folder, so a stale sidecar that is read-only is still replaced. Windows refuses to rename over a read-only file, so on Windows `open` refuses a read-only sidecar before the build. The check changes no file, because another process can have just written a good sidecar. A cache that cannot be written then fails before the footer scan, which takes long on a large dataset (D-57). If the write after the build fails, such as on a full disk, `open` still returns the index: the next start builds it again.
 - If the sidecar does not exist or is corrupt, `open` builds the index again. This is not an error. The sidecar is only a cache (D-23).
 - The module writes the sidecar to a temporary file with a unique name and then renames it. Thus the processes of all GPUs on one node can write at the same time, and no process reads a half-written sidecar.
 - Windows does not replace a file while a different process has it open or replaces it. If the rename fails and the sidecar already has the same bytes, a different process wrote the same index, and the write is complete. If not, the module tries again up to five times.
@@ -772,7 +773,7 @@ pub enum Error { Config(String), Index(index::Error), Read(read::Error),
 
 - `open` checks the config, opens the index with `Index::open`, and makes the reader. The lanes are `gpu_lanes(B, world, rank)`.
 - `open` refuses more than 2²⁴ lanes, and more than 2³⁰ tokens in one step of one GPU or in its leftovers (lanes × C). These sizes are far past any real batch, and a larger value could only use all the memory (D-63).
-- The session keeps the lane states to start from. `set_epoch` sets them to the start of a later epoch. It does nothing for the current epoch or an earlier one. `resume` takes them from a checkpoint after `check`.
+- The session keeps the lane states to start from. `set_epoch` sets them to the start of a later epoch. It does nothing for the current epoch or an earlier one. `resume` takes them from a checkpoint after `check`. It drops the old loader first and keeps its position, then makes the new loader, and changes the position only when that succeeds. Thus an error, or a `resume` future that is dropped, leaves the session where it was.
 - `next` makes the loader of the epoch at the first step. At the end of the epoch, `next` returns `None`, and the session goes to step 0 of the next epoch.
 - If `next` fails, the session keeps the lane states of the loader and drops the loader. The next call makes a new loader and tries the same step again.
 - `checkpoint` gives the lane states of the loader. Before the first step of an epoch, it gives the start states. After the last step of an epoch, it gives `(epoch + 1, step 0)`, also before the call of `next` that returns `None`.
@@ -787,7 +788,7 @@ pub enum Error { Config(String), Index(index::Error), Read(read::Error),
 
 **Limits:**
 
-- `resume` does not read data. A budget that is too small for the resume step gives its error at the next call of `next`.
+- `resume` makes the loader, so a budget that is too small for the resumed step gives its error at `resume`.
 - All GPUs must call `next` the same number of times, as in each data-parallel run.
 
 **Verification:**
@@ -800,6 +801,7 @@ pub enum Error { Config(String), Index(index::Error), Read(read::Error),
 | `set_epoch_keeps_a_resume_in_that_epoch` | Unit | `set_epoch(0)` after a resume in epoch 0 keeps the resumed position. |
 | `set_epoch_never_goes_back` | Unit | `set_epoch(0)` after a resume from the end of epoch 0 gives the batches of epoch 1. |
 | `next_is_cancel_safe` | Unit | Over a store with 5 ms reads, calls of `next` that are dropped after one poll give the same batches as a run with no drops. |
+| `resume_is_cancel_safe` | Unit | Over a store with 20 ms reads, a `resume` future dropped after one poll leaves `checkpoint()` unchanged, and the next batches are the same as a run with no `resume`. |
 | `resume_refuses_other_runs` | Unit | A different L, a different seed and an added file each give `Mismatch` with the name of the field. |
 | `resume_needs_this_ranks_lanes` | Unit | A part resumes the rank that holds its lanes, and another rank refuses it. |
 | `resume_refuses_states_outside_the_epoch` | Unit | A step past the epoch, a leftover past the cursor, and a leftover that starts earlier and goes past the cap each give `checkpoint::Error::Range` at `resume`, not a panic. After a refused resume, `checkpoint()` is unchanged, also on a new session. |
@@ -870,12 +872,12 @@ class Loader:
     def __next__(self) -> Batch: ...
     def set_epoch(self, epoch: int) -> None: ...
     def checkpoint(self) -> bytes: ...          # the part of this GPU
-    def resume(self, checkpoint: bytes) -> None: ...
+    def resume(self, checkpoint: bytes | bytearray) -> None: ...
     epoch: int; lanes: range                    # read-only properties
 class Batch:  tokens: Array                     # shape (lanes, seq_len)
               lengths: Array                    # shape (lanes,): the real tokens of each row
 class Array:  shape; __dlpack__(...); __dlpack_device__(); __arrow_c_array__(...)
-def merge(parts: Sequence[bytes]) -> bytes: ...
+def merge(parts: Sequence[bytes | bytearray]) -> bytes: ...
 class PlitzerError(Exception); ConfigError, CheckpointError, DataError (PlitzerError)
 ```
 
@@ -889,14 +891,15 @@ class PlitzerError(Exception); ConfigError, CheckpointError, DataError (PlitzerE
 - At the end of an epoch, `__next__` raises `StopIteration`, and it raises it again at each later call, as a Python iterator must. `__iter__` starts the next epoch: a new `for` loop gives it. `__iter__` also moves on a loader whose last step is taken but which did not raise `StopIteration` yet, such as the second loader in a `zip` (D-55).
 - Each step writes into a new `Vec<u32>`. An arrow `Buffer` holds it, and each export holds a clone of that `Buffer`. Thus an exported array stays valid after the batch, the loader and the export call.
 - The default cache is `$PLITZER_CACHE_DIR`, else the user cache folder, then `plitzer/<hash>.idx`. The hash is of the `id` of the store (section 5.10) and the column, not of the location text. Thus `data` from two folders gets two files, and `data/` and `file:///…/data` share one (D-54). The index makes the cache folder if it does not exist. `HOME`, `XDG_CACHE_HOME` and `LOCALAPPDATA` count only when they hold an absolute path: a relative folder would differ for each working directory. `PLITZER_CACHE_DIR` is used as given. With no user cache folder, there is no default, and `Loader` gives `ConfigError` (D-61).
-- Integer settings, also the epoch of `set_epoch`, come in as Python objects. A value that does not fit, such as `world=-1`, gives `ConfigError`.
+- Integer settings, also the epoch of `set_epoch`, come in as Python objects. A value that is not an integer, such as `4.0` or `True`, or that does not fit, such as `world=-1`, gives `ConfigError`.
+- `resume` and `merge` take `bytes` or `bytearray`.
 - If the runtime cannot start its threads, such as at a process limit, `Loader` gives `RuntimeError`. A call from a thread that runs a tokio runtime, such as a callback from another Rust extension, also gives `RuntimeError`, because tokio cannot block that thread.
 
 The errors map to Python exceptions as follows:
 
 | Rust error | Python exception |
 |---|---|
-| `session::Error::Config`, `load::Error::Budget`, `index::Error::Cache`, `store::Error::Scheme`, `store::Error::Option`, an integer out of range, no cache folder | `ConfigError` |
+| `session::Error::Config`, `load::Error::Budget`, `index::Error::Cache`, `store::Error::Scheme`, `store::Error::Option`, an integer setting that is not an integer or is out of range, no cache folder | `ConfigError` |
 | `checkpoint::Error`, `session::Error::Checkpoint` | `CheckpointError` |
 | `store::Error::Store`, index, read and other load errors | `DataError` |
 
@@ -966,7 +969,7 @@ An Arrow consumer moves the structs out of the capsules and sets their `release`
 | `test_resume_on_another_world` | pytest | Parts from world 2, merged, resume on world 4 with the same tail as one run. |
 | `test_resume_refuses_other_runs` | pytest | A different L, bad bytes and an incomplete merge give `CheckpointError`. |
 | `test_resume_refuses_a_hand_made_checkpoint` | pytest | Checksummed bytes whose leftover starts at an earlier document give `CheckpointError` at `resume`, and `checkpoint()` is unchanged. |
-| `test_bad_settings` | pytest | Bad settings, `world=-1`, `seed=2**200`, a URL with `#` and a cache below a file give `ConfigError`. A missing folder gives `DataError`. |
+| `test_bad_settings` | pytest | Bad settings, `world=-1`, `seed=2**200`, `lanes=4.0`, `docs=True`, a URL with `#` and a cache below a file give `ConfigError`. A missing folder gives `DataError`. |
 | `test_forked_child_makes_its_own_loader` | pytest | In a child of `os.fork`, the copied loader gives `RuntimeError`. A new loader gives the same first batch as the parent. The child frees the copy with no wait. |
 | `test_s3_matches_local` | pytest | The same files on versitygw and on local disk give the same batches. |
 

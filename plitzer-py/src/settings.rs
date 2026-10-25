@@ -11,15 +11,35 @@ use plitzer::checkpoint::Config;
 use plitzer::pack::Packing;
 use pyo3::conversion::FromPyObjectOwned;
 use pyo3::prelude::*;
+use pyo3::types::PyBool;
 
 use crate::errors::{ConfigError, store_error};
 
-/// `value` as setting `name`, or `ConfigError` if it is not an integer that
-/// fits, such as a negative `world` or `2**200`.
+/// `value` as setting `name`, or `ConfigError`: for a value that is not an
+/// integer, such as `4.0` or `True`, or one that does not fit, such as a
+/// negative `world` or `2**200`. An integer is anything with `__index__`,
+/// such as `np.int64`, except a `bool`.
 pub fn int<'py, T: FromPyObjectOwned<'py>>(name: &str, value: &Bound<'py, PyAny>) -> PyResult<T> {
+    if value.is_instance_of::<PyBool>() || !value.hasattr("__index__")? {
+        let kind = value.get_type().name()?;
+        return Err(ConfigError::new_err(format!(
+            "{name} must be an int, not {kind}"
+        )));
+    }
     value
         .extract()
         .map_err(|_| ConfigError::new_err(format!("{name} = {value} is out of range")))
+}
+
+/// `rank`, `world` and `budget`, with the defaults of a single GPU.
+pub fn placement(
+    rank: Option<&Bound<'_, PyAny>>,
+    world: Option<&Bound<'_, PyAny>>,
+    budget: &Bound<'_, PyAny>,
+) -> PyResult<(u32, u32, u64)> {
+    let rank = rank.map_or(Ok(0), |r| int("rank", r))?;
+    let world = world.map_or(Ok(1), |w| int("world", w))?;
+    Ok((rank, world, int("budget", budget)?))
 }
 
 /// The integer settings of a `Loader`, as Python gave them. Named fields,
@@ -77,7 +97,7 @@ pub fn locate(
         Some(cache) => cache,
         None => default_cache((&at.id, column)).ok_or_else(|| {
             ConfigError::new_err(
-                "no cache folder: set HOME, XDG_CACHE_HOME or PLITZER_CACHE_DIR, or pass cache=",
+                "no cache folder: set HOME, XDG_CACHE_HOME or PLITZER_CACHE_DIR, or pass cache= with the path of the index file",
             )
         })?,
     };
