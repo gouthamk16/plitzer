@@ -117,11 +117,11 @@ impl Session {
     /// succeeds only if the run can go on from there; on an error the
     /// session stays where it was, and `checkpoint()` still gives that.
     pub async fn resume(&mut self, checkpoint: &Checkpoint) -> Result<(), Error> {
-        (checkpoint.check(&self.config, self.fingerprint)).map_err(Error::Checkpoint)?;
-        let plan = Arc::new(self.epoch_plan(checkpoint.epoch));
-        let states = (checkpoint.states(self.lanes.clone()))
-            .and_then(|states| self.in_range(&plan, &states).map(|()| states))
+        let states = (checkpoint.check(&self.config, self.fingerprint))
+            .and_then(|()| checkpoint.states(self.lanes.clone()))
             .map_err(Error::Checkpoint)?;
+        let plan = Arc::new(self.epoch_plan(checkpoint.epoch));
+        self.in_range(&plan, &states).map_err(Error::Checkpoint)?;
         // Stop the old loader first, so two never hold the budget at once.
         // The session keeps its position, so an error or a dropped future
         // leaves it where it was: nothing below changes it before the end.
@@ -135,9 +135,8 @@ impl Session {
     /// ended loader stays: it holds no row groups, and it still owes the
     /// `None` that ends its epoch.
     fn park(&mut self) {
-        if !self.ended() {
-            let at = self.checkpoint();
-            (self.epoch, self.start, self.loader) = (at.epoch, at.lanes, None);
+        if let Some(loader) = self.loader.take_if(|l| !l.ended()) {
+            self.start = loader.states();
         }
     }
 

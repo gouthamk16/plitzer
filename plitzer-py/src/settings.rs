@@ -10,6 +10,7 @@ use object_store::path::Path;
 use plitzer::checkpoint::Config;
 use plitzer::pack::Packing;
 use pyo3::conversion::FromPyObjectOwned;
+use pyo3::exceptions::PyOverflowError;
 use pyo3::prelude::*;
 use pyo3::types::PyBool;
 
@@ -26,9 +27,16 @@ pub fn int<'py, T: FromPyObjectOwned<'py>>(name: &str, value: &Bound<'py, PyAny>
             "{name} must be an int, not {kind}"
         )));
     }
-    value
-        .extract()
-        .map_err(|_| ConfigError::new_err(format!("{name} = {value} is out of range")))
+    // Only an overflow means the value does not fit; any other error comes
+    // from the object's own `__index__`, so it goes to the caller as it is.
+    value.extract::<T>().map_err(|e| {
+        let e: PyErr = e.into();
+        if e.is_instance_of::<PyOverflowError>(value.py()) {
+            ConfigError::new_err(format!("{name} = {value} is out of range"))
+        } else {
+            e
+        }
+    })
 }
 
 /// `rank`, `world` and `budget`, with the defaults of a single GPU.

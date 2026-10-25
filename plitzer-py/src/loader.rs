@@ -12,7 +12,7 @@ use pyo3::pybacked::PyBackedBytes;
 use pyo3::types::{PyBytes, PyRange};
 
 use crate::array::Batch;
-use crate::errors::{checkpoint_error, session_error};
+use crate::errors::{ConfigError, checkpoint_error, session_error};
 use crate::runtime::block_on;
 use crate::settings::{Ints, config, int, locate, placement};
 
@@ -135,7 +135,7 @@ impl Loader {
     #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
-        location: &str,
+        location: PathBuf,
         seed: &Bound<'_, PyAny>,
         lanes: &Bound<'_, PyAny>,
         window: &Bound<'_, PyAny>,
@@ -150,6 +150,8 @@ impl Loader {
         cache: Option<PathBuf>,
         storage_options: Option<HashMap<String, String>>,
     ) -> PyResult<Self> {
+        let location = (location.to_str())
+            .ok_or_else(|| ConfigError::new_err(format!("{location:?} is not UTF-8")))?;
         let (store, prefix, cache) = locate(location, storage_options, &column, cache)?;
         let ints = Ints {
             seed,

@@ -1,6 +1,7 @@
 import os
 import sys
 from collections.abc import Sequence
+from typing import SupportsIndex
 
 if sys.version_info >= (3, 13):
     from types import CapsuleType
@@ -60,18 +61,18 @@ class Loader:
 
     def __init__(
         self,
-        location: str,
+        location: str | os.PathLike[str],
         *,
-        seed: int,
-        lanes: int,
-        window: int,
-        seq_len: int,
-        docs: int,
-        cap: int,
-        pad: int,
-        budget: int,
-        rank: int = 0,
-        world: int = 1,
+        seed: SupportsIndex,
+        lanes: SupportsIndex,
+        window: SupportsIndex,
+        seq_len: SupportsIndex,
+        docs: SupportsIndex,
+        cap: SupportsIndex,
+        pad: SupportsIndex,
+        budget: SupportsIndex,
+        rank: SupportsIndex = 0,
+        world: SupportsIndex = 1,
         column: str = "tokens",
         cache: str | os.PathLike[str] | None = None,
         storage_options: dict[str, str] | None = None,
@@ -80,7 +81,7 @@ class Loader:
         """The rest of the current epoch, or the next epoch if it has ended."""
     def __next__(self) -> Batch:
         """The next step; `StopIteration` from the end of the epoch on."""
-    def set_epoch(self, epoch: int) -> None:
+    def set_epoch(self, epoch: SupportsIndex) -> None:
         """Go to the start of `epoch` if it is later than the current one."""
     def checkpoint(self) -> bytes:
         """This GPU's part of a checkpoint: the state before the next step.

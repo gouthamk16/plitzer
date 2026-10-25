@@ -74,7 +74,7 @@ pub fn open(location: &str, options: &[(String, String)]) -> Result<Location, Er
             local(&path, options)
         }
         #[cfg(feature = "s3")]
-        "s3" => s3(&url, options),
+        "s3" => s3(AmazonS3Builder::from_env(), &url, options),
         scheme => Err(Error::Scheme(scheme.to_string())),
     }
 }
@@ -94,19 +94,30 @@ fn local(dir: &std::path::Path, options: &[(String, String)]) -> Result<Location
     Ok(Location { store, prefix, id })
 }
 
+/// `env` is the builder with the environment's settings, which `options`
+/// override.
 #[cfg(feature = "s3")]
-fn s3(url: &Url, options: &[(String, String)]) -> Result<Location, Error> {
+fn s3(env: AmazonS3Builder, url: &Url, options: &[(String, String)]) -> Result<Location, Error> {
     // Only the bucket is read from the host; a port or user would be lost.
     if url.port().is_some() || !url.username().is_empty() || url.password().is_some() {
         let why = format!("{url} has a port or user; pass them as storage options");
         return Err(Error::Option(why));
     }
     let bucket = url.host_str().unwrap_or_default();
-    let mut builder = AmazonS3Builder::from_env().with_url(format!("s3://{bucket}"));
+    let mut builder = env.with_url(format!("s3://{bucket}"));
+    let mut keys = Vec::new();
     for (key, value) in options {
         let key: AmazonS3ConfigKey = (key.to_ascii_lowercase().parse())
             .map_err(|_| Error::Option(format!("unknown S3 storage option {key:?}")))?;
         builder = builder.with_config(key, value);
+        keys.push(key);
+    }
+    // The builder prefers the S3-only endpoint, which can come from
+    // `AWS_ENDPOINT_URL_S3`; an `endpoint` option must still win over it.
+    let (general, s3_only) = (AmazonS3ConfigKey::Endpoint, AmazonS3ConfigKey::S3Endpoint);
+    if keys.contains(&general) && !keys.contains(&s3_only) {
+        let endpoint = builder.get_config_value(&general).unwrap_or_default();
+        builder = builder.with_config(s3_only, endpoint);
     }
     // The endpoint, from the options or the environment, tells two servers
     // with the same bucket name apart. The builder prefers the S3-only
@@ -220,6 +231,12 @@ mod tests {
             "http://three:7070".to_string(),
         )];
         assert!(open("s3://b/p", &s3_only).unwrap().id.contains("three"));
+        // An `endpoint` option wins over `AWS_ENDPOINT_URL_S3`.
+        let env = AmazonS3Builder::new().with_config(AmazonS3ConfigKey::S3Endpoint, "http://env");
+        let url = Url::parse("s3://b/p").unwrap();
+        let option = [("endpoint".to_string(), "http://four:7070".to_string())];
+        let at = s3(env, &url, &option).unwrap();
+        assert!(at.id.ends_with("at http://four:7070"), "{}", at.id);
         for odd in ["s3://b:9000/p", "s3://user@b/p", "s3://user:secret@b/p"] {
             assert!(matches!(open(odd, &[]), Err(Error::Option(_))), "{odd}");
         }

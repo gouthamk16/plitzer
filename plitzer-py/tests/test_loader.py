@@ -222,7 +222,14 @@ def test_bad_settings(make: MakeLoader, tmp_path: Path) -> None:
         make(lanes=4.0)  # type: ignore[arg-type]
     with pytest.raises(plitzer.ConfigError, match="docs must be an int, not bool"):
         make(docs=True)
-    make().set_epoch(np.int64(1))  # type: ignore[arg-type]  # has __index__
+    make().set_epoch(np.int64(1))  # has __index__
+
+    class Broken:
+        def __index__(self) -> int:
+            raise ZeroDivisionError("from __index__")
+
+    with pytest.raises(ZeroDivisionError):  # not hidden as "out of range"
+        make().set_epoch(Broken())
 
     with pytest.raises(plitzer.ConfigError, match="#"):
         plitzer.Loader(str(tmp_path.as_uri()) + "/data#2", **SETTINGS)
@@ -234,9 +241,8 @@ def test_bad_settings(make: MakeLoader, tmp_path: Path) -> None:
         make(storage_options={"region": "x"})
     with pytest.raises(plitzer.ConfigError, match="budget"):
         next(make(budget=1))
-    missing = str(tmp_path / "missing")
     with pytest.raises(plitzer.DataError):
-        plitzer.Loader(missing, **SETTINGS)
+        plitzer.Loader(tmp_path / "missing", **SETTINGS)
     assert issubclass(plitzer.ConfigError, plitzer.PlitzerError)
 
 

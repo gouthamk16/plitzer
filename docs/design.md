@@ -834,7 +834,7 @@ pub enum Error { Store(object_store::Error), Scheme(String), Option(String) }
 
 **Rationale:**
 
-- `object_store::parse_url_opts` does not read the `AWS_*` environment variables. `from_env` reads them, and the options override them (D-49).
+- `object_store::parse_url_opts` does not read the `AWS_*` environment variables. `from_env` reads them, and the options override them (D-49). The builder prefers the S3-only endpoint, such as `AWS_ENDPOINT_URL_S3`, to the general one. Thus an `endpoint` option is also set as the S3-only endpoint, unless the options give that endpoint too.
 - An unknown option gives `Error::Option`. If the store ignored an option, a wrong endpoint or a wrong key name would fail later with an unclear error.
 - The S3 builder fails only on settings, such as a missing bucket. Thus its error is also `Error::Option`, and Python shows it as `ConfigError`.
 - A local folder takes no options, so an option for a local folder is an error.
@@ -852,7 +852,7 @@ pub enum Error { Store(object_store::Error), Scheme(String), Option(String) }
 |---|---|---|
 | `opens_local_folders` | Unit | A path, the path with a separator at the end, and a `file://` URL open the same folder with the same `id` (the canonical path). Another folder has another `id`. |
 | `a_colon_in_a_path_is_not_a_scheme` | Unit | A folder named `runs:2024` opens as a folder (POSIX). |
-| `s3_id_has_the_endpoint_and_no_keys` | Unit | Two secret keys give one `id`, and two endpoints give two. The `id` holds no key. |
+| `s3_id_has_the_endpoint_and_no_keys` | Unit | Two secret keys give one `id`, and two endpoints give two. The `id` holds no key. An `endpoint` option wins over an S3-only endpoint from the environment. |
 | `refuses_what_it_cannot_open` | Unit | A missing folder, an unknown scheme, an option for a local folder, and URLs with `?` or `#` each give their error. |
 | `refuses_unknown_s3_options` | Unit | An unknown S3 option and a URL with no bucket give `Error::Option`. |
 | `open_an_s3_url` | Integration | An `s3://` URL with options opens versitygw with the correct prefix. |
@@ -865,8 +865,8 @@ pub enum Error { Store(object_store::Error), Scheme(String), Option(String) }
 
 ```python
 class Loader:
-    def __init__(self, location: str, *, seed: int, lanes: int, window: int, seq_len: int,
-                 docs: int, cap: int, pad: int, budget: int, rank: int = 0, world: int = 1,
+    def __init__(self, location: str | os.PathLike[str], *, seed: int, lanes: int, window: int,
+                 seq_len: int, docs: int, cap: int, pad: int, budget: int, rank: int = 0, world: int = 1,
                  column: str = "tokens", cache: str | os.PathLike[str] | None = None,
                  storage_options: dict[str, str] | None = None) -> None: ...
     def __iter__(self) -> Loader: ...           # the rest of the current epoch
@@ -892,7 +892,7 @@ class PlitzerError(Exception); ConfigError, CheckpointError, DataError (PlitzerE
 - At the end of an epoch, `__next__` raises `StopIteration`, and it raises it again at each later call, as a Python iterator must. `__iter__` starts the next epoch: a new `for` loop gives it. `__iter__` also moves on a loader whose last step is taken but which did not raise `StopIteration` yet, such as the second loader in a `zip` (D-55).
 - Each step writes into a new `Vec<u32>`. An arrow `Buffer` holds it, and each export holds a clone of that `Buffer`. Thus an exported array stays valid after the batch, the loader and the export call.
 - The default cache is `$PLITZER_CACHE_DIR`, else the user cache folder, then `plitzer/<hash>.idx`. The hash is of the `id` of the store (section 5.10) and the column, not of the location text. Thus `data` from two folders gets two files, and `data/` and `file:///…/data` share one (D-54). The index makes the cache folder if it does not exist. `HOME`, `XDG_CACHE_HOME` and `LOCALAPPDATA` count only when they hold an absolute path: a relative folder would differ for each working directory. `PLITZER_CACHE_DIR` is used as given. With no user cache folder, there is no default, and `Loader` gives `ConfigError` (D-61).
-- Integer settings, also the epoch of `set_epoch`, come in as Python objects. A value that is not an integer, such as `4.0` or `True`, or that does not fit, such as `world=-1`, gives `ConfigError`.
+- Integer settings, also the epoch of `set_epoch`, come in as Python objects. Each takes an `int` or another object with `__index__`, such as `np.int64` (the stub types them as `SupportsIndex`). A value that is not an integer, such as `4.0` or `True`, or that does not fit, such as `world=-1`, gives `ConfigError`.
 - `resume` and `merge` take `bytes` or `bytearray`.
 - If the runtime cannot start its threads, such as at a process limit, `Loader` gives `RuntimeError`. A call from a thread that runs a tokio runtime, such as a callback from another Rust extension, also gives `RuntimeError`, because tokio cannot block that thread.
 
