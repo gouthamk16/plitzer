@@ -176,11 +176,45 @@ def test_resume_refuses_other_runs(make: MakeLoader) -> None:
         plitzer.merge([make(rank=1, world=2).checkpoint()])
 
 
+def fnv1a(data: bytes) -> int:
+    h = 0xCBF29CE484222325
+    for b in data:
+        h = ((h ^ b) * 0x100000001B3) % 2**64
+    return h
+
+
+def test_resume_refuses_a_hand_made_checkpoint(make: MakeLoader) -> None:
+    """Checksummed bytes with lane states that no run makes are refused at
+    resume, with nothing changed, never a panic."""
+    loader = make()
+    for _ in range(3):
+        next(loader)
+    good = loader.checkpoint()
+    # The last lane state is 20 bytes (step u64, doc u64, offset u32) before
+    # the 8-byte checksum; move its leftover start back to doc 0.
+    at = len(good) - 8 - 20
+    doc = int.from_bytes(good[at + 8 : at + 16], "little")
+    refused = 0
+    for start in range(doc):
+        body = bytearray(good[:-8])
+        body[at + 8 : at + 20] = start.to_bytes(8, "little") + bytes(4)
+        bad = bytes(body) + fnv1a(bytes(body)).to_bytes(8, "little")
+        try:
+            loader.resume(bad)
+        except plitzer.CheckpointError:
+            refused += 1
+            assert loader.checkpoint() == good, "a refused resume changes nothing"
+        loader.resume(good)
+    assert refused > 0
+
+
 def test_bad_settings(make: MakeLoader, tmp_path: Path) -> None:
     with pytest.raises(plitzer.ConfigError, match="divide"):
         make(world=3)
     with pytest.raises(plitzer.ConfigError, match="world"):
         make(world=-1)
+    with pytest.raises(plitzer.ConfigError, match="seed"):
+        make(seed=2**200)
     with pytest.raises(plitzer.ConfigError, match="epoch"):
         make().set_epoch(-1)
 

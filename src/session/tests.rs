@@ -124,7 +124,7 @@ async fn resume_on_another_world_matches_one_run() {
             let checkpoint = global(&first);
             let mut second = sessions(&d, b).await;
             for s in &mut second {
-                s.resume(&checkpoint).unwrap();
+                s.resume(&checkpoint).await.unwrap();
             }
             // A checkpoint after the last step of an epoch is already at the
             // next epoch, so the resumed run gives no `None` for the old one.
@@ -189,7 +189,7 @@ async fn set_epoch_never_goes_back() {
     run(&mut one, end).await;
     let checkpoint = global(&one);
     let mut again = sessions(&d, 1).await;
-    again[0].resume(&checkpoint).unwrap();
+    again[0].resume(&checkpoint).await.unwrap();
     again[0].set_epoch(0);
     assert_eq!(run(&mut again, 2).await, want[end + 1..end + 3]);
 }
@@ -205,7 +205,7 @@ async fn set_epoch_keeps_a_resume_in_that_epoch() {
     let checkpoint = global(&two);
     let mut again = sessions(&d, 2).await;
     for s in &mut again {
-        s.resume(&checkpoint).unwrap();
+        s.resume(&checkpoint).await.unwrap();
         s.set_epoch(0);
     }
     assert_eq!(run(&mut again, 4).await, want[3..7]);

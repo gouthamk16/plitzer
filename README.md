@@ -23,7 +23,8 @@ loader = plitzer.Loader(
     "s3://bucket/fineweb-edu",          # or a local folder
     seed=0, lanes=512, window=64,        # B lanes, W row groups per window
     seq_len=2048, docs=4, cap=4096, pad=0,
-    budget=8 << 30,                      # bytes of decoded tokens kept in memory
+    budget=8 << 30,                      # bytes of decoded row groups kept in memory
+                                         # (4 per token + 8 per document)
     rank=0, world=8,                     # this GPU, of 8
 )
 while loader.epoch < 3:                  # also right after loader.resume(state)

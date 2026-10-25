@@ -9,31 +9,33 @@ use object_store::ObjectStore;
 use object_store::path::Path;
 use plitzer::checkpoint::Config;
 use plitzer::pack::Packing;
+use pyo3::conversion::FromPyObjectOwned;
 use pyo3::prelude::*;
 
 use crate::errors::{ConfigError, store_error};
 
-/// `value` as setting `name`, or `ConfigError` if it does not fit, such as
-/// a negative `world`.
-pub fn int<T: TryFrom<i128>>(name: &str, value: i128) -> PyResult<T> {
-    T::try_from(value)
+/// `value` as setting `name`, or `ConfigError` if it is not an integer that
+/// fits, such as a negative `world` or `2**200`.
+pub fn int<'py, T: FromPyObjectOwned<'py>>(name: &str, value: &Bound<'py, PyAny>) -> PyResult<T> {
+    value
+        .extract()
         .map_err(|_| ConfigError::new_err(format!("{name} = {value} is out of range")))
 }
 
 /// The integer settings of a `Loader`, as Python gave them. Named fields,
 /// so a call cannot swap two of them.
-pub struct Ints {
-    pub seed: i128,
-    pub lanes: i128,
-    pub window: i128,
-    pub seq_len: i128,
-    pub docs: i128,
-    pub cap: i128,
-    pub pad: i128,
+pub struct Ints<'a, 'py> {
+    pub seed: &'a Bound<'py, PyAny>,
+    pub lanes: &'a Bound<'py, PyAny>,
+    pub window: &'a Bound<'py, PyAny>,
+    pub seq_len: &'a Bound<'py, PyAny>,
+    pub docs: &'a Bound<'py, PyAny>,
+    pub cap: &'a Bound<'py, PyAny>,
+    pub pad: &'a Bound<'py, PyAny>,
 }
 
 /// The config from Python integers, each checked to fit.
-pub fn config(column: String, i: Ints) -> PyResult<Config> {
+pub fn config(column: String, i: Ints<'_, '_>) -> PyResult<Config> {
     let packing = Packing {
         seq_len: int("seq_len", i.seq_len)?,
         docs: int("docs", i.docs)?,
@@ -51,11 +53,10 @@ pub fn config(column: String, i: Ints) -> PyResult<Config> {
 
 /// The pad token as a `u32`. Batches reach Python as int32, so a negative
 /// pad, such as -1, means the token with the same bits.
-fn pad(value: i128) -> PyResult<u32> {
-    if value < 0 {
-        int::<i32>("pad", value).map(|p| p as u32)
-    } else {
-        int("pad", value)
+fn pad(value: &Bound<'_, PyAny>) -> PyResult<u32> {
+    match value.extract::<i32>() {
+        Ok(negative) if negative < 0 => Ok(negative as u32),
+        _ => int("pad", value),
     }
 }
 

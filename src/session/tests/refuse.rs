@@ -13,14 +13,14 @@ async fn resume_refuses_other_runs() {
     let mut c = config();
     c.packing.seq_len = 16;
     let mut other = open(&d, c, 0, 1).await.unwrap();
-    assert_eq!(field(other.resume(&saved)), "seq_len");
+    assert_eq!(field(other.resume(&saved).await), "seq_len");
     let mut c = config();
     c.seed = 12;
     let mut other = open(&d, c, 0, 1).await.unwrap();
-    assert_eq!(field(other.resume(&saved)), "seed");
+    assert_eq!(field(other.resume(&saved).await), "seed");
     write_file(d.files.path(), 4);
     let mut other = open(&d, config(), 0, 1).await.unwrap();
-    assert_eq!(field(other.resume(&saved)), "fingerprint");
+    assert_eq!(field(other.resume(&saved).await), "fingerprint");
 }
 
 // Checksummed bytes can still be made by hand. States that no run makes are
@@ -35,14 +35,13 @@ async fn resume_refuses_states_outside_the_epoch() {
         |r: Result<(), Error>| matches!(r, Err(Error::Checkpoint(checkpoint::Error::Range(_))));
     let mut bad = good.clone();
     bad.lanes.iter_mut().for_each(|s| s.step = 1_000_000);
-    assert!(range(one[0].resume(&bad)), "step past the epoch");
+    assert!(range(one[0].resume(&bad).await), "step past the epoch");
     let mut bad = good.clone();
     bad.lanes[0].doc = 1_000_000;
-    assert!(range(one[0].resume(&bad)), "leftover past the cursor");
-    // A leftover that starts earlier than the real one passes the check at
-    // `resume`, but can exceed the cap; the tokens show it at the first
-    // step, as an error, not a panic.
-    let mut out = vec![0; (4 * config().packing.seq_len) as usize];
+    assert!(range(one[0].resume(&bad).await), "leftover past the cursor");
+    // A leftover that starts earlier than the real one passes the cheap
+    // check, but can exceed the cap; `resume` finds it when it makes the
+    // loader, as an error, not a panic, and the session stays at `good`.
     let mut over_cap = false;
     for doc in 0..good.lanes[0].doc {
         let mut bad = good.clone();
@@ -51,16 +50,31 @@ async fn resume_refuses_states_outside_the_epoch() {
             offset: 0,
             ..bad.lanes[0]
         };
-        one[0].resume(&bad).unwrap();
-        match one[0].next(&mut out).await {
+        match one[0].resume(&bad).await {
             Err(Error::Checkpoint(checkpoint::Error::Range(why))) => {
                 over_cap |= why.contains("more than the cap");
             }
             other => panic!("doc {doc}: {other:?}"),
         }
+        assert_eq!(
+            one[0].checkpoint(),
+            good,
+            "a refused resume changes nothing"
+        );
     }
     assert!(over_cap, "no earlier leftover start exceeded the cap");
-    one[0].resume(&good).unwrap();
+    // Also a session with no loader yet keeps its position.
+    let mut fresh = sessions(&d, 1).await;
+    let before = fresh[0].checkpoint();
+    let mut bad = good.clone();
+    bad.lanes[0] = LaneState {
+        doc: 0,
+        offset: 0,
+        ..bad.lanes[0]
+    };
+    assert!(range(fresh[0].resume(&bad).await));
+    assert_eq!(fresh[0].checkpoint(), before);
+    one[0].resume(&good).await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -70,8 +84,8 @@ async fn resume_needs_this_ranks_lanes() {
     run(&mut two, 2).await;
     let part = two[1].checkpoint();
     let mut again = sessions(&d, 2).await;
-    again[1].resume(&part).unwrap();
-    let refused = again[0].resume(&part);
+    again[1].resume(&part).await.unwrap();
+    let refused = again[0].resume(&part).await;
     assert!(matches!(
         refused,
         Err(Error::Checkpoint(checkpoint::Error::Parts(_)))

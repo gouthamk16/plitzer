@@ -113,16 +113,26 @@ impl Session {
 
     /// Stands where `checkpoint` was taken. It must come from the same
     /// config and dataset, and hold this GPU's lanes: a global checkpoint
-    /// works on any number of GPUs.
-    pub fn resume(&mut self, checkpoint: &Checkpoint) -> Result<(), Error> {
+    /// works on any number of GPUs. It makes the loader at once, so it
+    /// succeeds only if the run can go on from there; on an error the
+    /// session stays where it was, and `checkpoint()` still gives that.
+    pub async fn resume(&mut self, checkpoint: &Checkpoint) -> Result<(), Error> {
         let states = (checkpoint.check(&self.config, self.fingerprint))
             .and_then(|()| checkpoint.states(self.lanes.clone()))
             .and_then(|states| self.in_range(checkpoint.epoch, &states).map(|()| states))
             .map_err(Error::Checkpoint)?;
-        self.epoch = checkpoint.epoch;
-        self.start = states;
-        self.loader = None;
-        Ok(())
+        let epoch = std::mem::replace(&mut self.epoch, checkpoint.epoch);
+        let start = std::mem::replace(&mut self.start, states);
+        match self.load().await {
+            Ok(loader) => {
+                self.loader = Some(loader);
+                Ok(())
+            }
+            Err(e) => {
+                (self.epoch, self.start) = (epoch, start);
+                Err(e)
+            }
+        }
     }
 
     /// The next step: one sequence of L tokens for each of this GPU's lanes,

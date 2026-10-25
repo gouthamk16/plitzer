@@ -52,6 +52,20 @@ impl State {
 }
 
 impl Loader {
+    fn from_session(session: Session) -> Self {
+        let seq_len = session.checkpoint().config.packing.seq_len as usize;
+        let state = State {
+            session: Some(session),
+            exhausted: false,
+        };
+        Loader {
+            snapshot: Mutex::new(state.checkpoint()),
+            state: Mutex::new(state),
+            seq_len,
+            pid: std::process::id(),
+        }
+    }
+
     /// The session, if no other call is using it. A step holds it while it
     /// waits, so a second caller gets an error here, never a deadlock.
     fn state(&self) -> PyResult<MutexGuard<'_, State>> {
@@ -112,24 +126,25 @@ impl Loader {
     #[new]
     #[pyo3(signature = (
         location, *, seed, lanes, window, seq_len, docs, cap, pad, budget,
-        rank=0, world=1, column="tokens".to_string(), cache=None, storage_options=None,
+        rank=None, world=None, column="tokens".to_string(), cache=None, storage_options=None,
     ))]
     // Python callers pass these as keywords, so a struct would only add a
-    // step. Integers come as i128, so a negative one is a `ConfigError`.
+    // step. Integers come as Python objects, so any value that does not fit,
+    // also one past i128, is a `ConfigError`.
     #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
         location: &str,
-        seed: i128,
-        lanes: i128,
-        window: i128,
-        seq_len: i128,
-        docs: i128,
-        cap: i128,
-        pad: i128,
-        budget: i128,
-        rank: i128,
-        world: i128,
+        seed: &Bound<'_, PyAny>,
+        lanes: &Bound<'_, PyAny>,
+        window: &Bound<'_, PyAny>,
+        seq_len: &Bound<'_, PyAny>,
+        docs: &Bound<'_, PyAny>,
+        cap: &Bound<'_, PyAny>,
+        pad: &Bound<'_, PyAny>,
+        budget: &Bound<'_, PyAny>,
+        rank: Option<&Bound<'_, PyAny>>,
+        world: Option<&Bound<'_, PyAny>>,
         column: String,
         cache: Option<PathBuf>,
         storage_options: Option<HashMap<String, String>>,
@@ -145,24 +160,19 @@ impl Loader {
             pad,
         };
         let config = config(column, ints)?;
-        let seq_len = config.packing.seq_len as usize;
-        let (rank, world, budget) = (
-            int("rank", rank)?,
-            int("world", world)?,
+        let rank = rank.map_or(Ok(0), |r| int("rank", r))?;
+        let world = world.map_or(Ok(1), |w| int("world", w))?;
+        let open = Session::open(
+            store,
+            prefix,
+            &cache,
+            config,
+            rank,
+            world,
             int("budget", budget)?,
         );
-        let open = Session::open(store, prefix, &cache, config, rank, world, budget);
         let session = block_on(py, open)?.map_err(session_error)?;
-        let state = State {
-            session: Some(session),
-            exhausted: false,
-        };
-        Ok(Loader {
-            snapshot: Mutex::new(state.checkpoint()),
-            state: Mutex::new(state),
-            seq_len,
-            pid: std::process::id(),
-        })
+        Ok(Loader::from_session(session))
     }
 
     /// The rest of the current epoch. A loader whose last step is taken, but
@@ -198,7 +208,7 @@ impl Loader {
 
     /// Goes to the start of `epoch` if it is later than the current one. An
     /// ended iterator stays ended when the call changes nothing.
-    fn set_epoch(&self, epoch: i128) -> PyResult<()> {
+    fn set_epoch(&self, epoch: &Bound<'_, PyAny>) -> PyResult<()> {
         let epoch: u64 = int("epoch", epoch)?;
         let mut state = self.state()?;
         let at = state.session().epoch();
@@ -223,10 +233,12 @@ impl Loader {
         Ok(PyBytes::new(py, &bytes))
     }
 
-    fn resume(&self, checkpoint: &[u8]) -> PyResult<()> {
+    /// Stands where `checkpoint` was taken, and reads what the next step
+    /// needs. On an error nothing changes, also not `checkpoint()`.
+    fn resume(&self, py: Python<'_>, checkpoint: &[u8]) -> PyResult<()> {
         let mut state = self.state()?;
         let checkpoint = Checkpoint::from_bytes(checkpoint).map_err(checkpoint_error)?;
-        state.session().resume(&checkpoint).map_err(session_error)?;
+        block_on(py, state.session().resume(&checkpoint))?.map_err(session_error)?;
         state.exhausted = false;
         self.save(&state);
         Ok(())

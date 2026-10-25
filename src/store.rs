@@ -96,6 +96,11 @@ fn local(dir: &std::path::Path, options: &[(String, String)]) -> Result<Location
 
 #[cfg(feature = "s3")]
 fn s3(url: &Url, options: &[(String, String)]) -> Result<Location, Error> {
+    // Only the bucket is read from the host; a port or user would be lost.
+    if url.port().is_some() || !url.username().is_empty() || url.password().is_some() {
+        let why = format!("{url} has a port or user; pass them as storage options");
+        return Err(Error::Option(why));
+    }
     let bucket = url.host_str().unwrap_or_default();
     let mut builder = AmazonS3Builder::from_env().with_url(format!("s3://{bucket}"));
     for (key, value) in options {
@@ -104,8 +109,10 @@ fn s3(url: &Url, options: &[(String, String)]) -> Result<Location, Error> {
         builder = builder.with_config(key, value);
     }
     // The endpoint, from the options or the environment, tells two servers
-    // with the same bucket name apart. Keys and tokens stay out of the id.
-    let endpoint = builder.get_config_value(&AmazonS3ConfigKey::Endpoint);
+    // with the same bucket name apart. The builder prefers the S3-only
+    // endpoint, so the id does too. Keys and tokens stay out of the id.
+    let endpoint = (builder.get_config_value(&AmazonS3ConfigKey::S3Endpoint))
+        .or_else(|| builder.get_config_value(&AmazonS3ConfigKey::Endpoint));
     // The builder fails only on settings, such as a missing bucket.
     let store = (builder.build()).map_err(|e| Error::Option(format!("bad S3 settings: {e}")))?;
     let prefix = Path::from_url_path(url.path())
@@ -207,5 +214,14 @@ mod tests {
         assert_eq!(a, id("http://one:7070", "s3cret-2"));
         assert_ne!(a, id("http://two:7070", "s3cret-1"));
         assert!(!a.contains("s3cret") && !a.contains("AKIDEXAMPLE"), "{a}");
+        // The S3-only endpoint wins in the builder, so it names the id too.
+        let s3_only = [(
+            "aws_endpoint_url_s3".to_string(),
+            "http://three:7070".to_string(),
+        )];
+        assert!(open("s3://b/p", &s3_only).unwrap().id.contains("three"));
+        for odd in ["s3://b:9000/p", "s3://user@b/p", "s3://user:secret@b/p"] {
+            assert!(matches!(open(odd, &[]), Err(Error::Option(_))), "{odd}");
+        }
     }
 }
