@@ -471,7 +471,7 @@ The fingerprint is the 64-bit FNV-1a hash of the same layout, with no ETags and 
 - The cache check compares the ETag, because a file can change and keep its size (D-20).
 - The fingerprint does not include the ETag. A local ETag holds the inode and the modification time, which are different on each copy (D-21).
 - The sidecar uses its own small format. It needs no `serde` dependency, and a golden test pins the bytes (D-22).
-- Before a build, `open` makes the cache folder and a file in it. It refuses a cache path that is a folder or has no file name. The write renames over the old sidecar. On Unix this needs only the folder, so a stale sidecar that is read-only is still replaced. Windows refuses to rename over a read-only file, so on Windows `open` refuses a read-only sidecar before the build. The check changes no file, because another process can have just written a good sidecar. A cache that cannot be written then fails before the footer scan, which takes long on a large dataset (D-57). If the write after the build fails, such as on a full disk, `open` still returns the index: the next start builds it again.
+- Before a build, `open` makes the cache folder and a file in it. It refuses a cache path that is a folder, has no file name or ends in a separator. The write renames over the old sidecar. On Unix this needs only the folder, so a stale sidecar that is read-only is still replaced. Windows refuses to rename over a read-only file, so on Windows `open` refuses a read-only sidecar before the build. The check changes no file, because another process can have just written a good sidecar. A cache that cannot be written then fails before the footer scan, which takes long on a large dataset (D-57). If the write after the build fails, such as on a full disk, `open` still returns the index: the next start builds it again.
 - If the sidecar does not exist or is corrupt, `open` builds the index again. This is not an error. The sidecar is only a cache (D-23).
 - The module writes the sidecar to a temporary file with a unique name and then renames it. Thus the processes of all GPUs on one node can write at the same time, and no process reads a half-written sidecar.
 - Windows does not replace a file while a different process has it open or replaces it. If the rename fails and the sidecar already has the same bytes, a different process wrote the same index, and the write is complete. If not, the module tries again up to five times.
@@ -497,7 +497,7 @@ The fingerprint is the 64-bit FNV-1a hash of the same layout, with no ETags and 
 | `build_reads_row_groups` | Unit | The row groups of Parquet files in nested folders, in path order. Other files are not in the index. `locate` is correct at each file edge. |
 | `open_writes_and_reuses_cache` | Unit | `open` writes the sidecar, and a second `open` gives the same index. |
 | `open_uses_cache_without_footers` | Unit | A sidecar with false row counts that matches the list of files is used, so no footer is read. A different column or a stale ETag causes a new build. |
-| `unwritable_cache_fails_before_the_build` | Unit | A cache below a file, a cache that is a folder and an empty cache path give `Error::Cache`, not the `Error::Footer` of a corrupt file in the dataset. The check does not change a stale sidecar. A missing cache folder is made. |
+| `unwritable_cache_fails_before_the_build` | Unit | A cache below a file, a cache that is a folder, a path that ends in a separator and an empty cache path give `Error::Cache`, not the `Error::Footer` of a corrupt file in the dataset. The check does not change a stale sidecar. A missing cache folder is made. |
 | `read_only_stale_sidecar_is_replaced` | Unit | A stale sidecar with mode 0444 in a writable folder is replaced by the build (Unix). |
 | `open_rebuilds_on_change` | Unit | A changed file, a new file and a corrupt sidecar each cause a new build. |
 | `bad_footer_names_file` | Unit | A bad magic number, a file that is too short and a footer length larger than the file each give `Error::Footer` with the path. |
@@ -556,6 +556,7 @@ The page reader of `parquet` uses only the codec and the byte range of the chunk
 - The input of v1 is a column of token lists. Tokenization in the loader is a later item (D-26).
 - `object_store` does not cut a large range, and AWS advises requests of 8 to 16 MB at the same time. Each piece is a separate `get_ranges` call, so that `object_store` does not merge the pieces again (D-27).
 - A negative token, a null token or a token larger than `u32::MAX` gives `Error::BadToken`. A null token would otherwise become token 0.
+- A chunk that decodes to a different number of rows than its footer gives `Error::Decode`. The lanes use the row count of the footer, so a missing row would otherwise cause a panic.
 
 **Limits:**
 
@@ -574,6 +575,7 @@ The page reader of `parquet` uses only the codec and the byte range of the chunk
 | `odd_column_name_reads` | Unit | A column named `input ids` reads correctly. |
 | `schema_text_golden` | Unit | The schema text of a `list<uint32>` column is pinned, so a change of the `parquet` printer shows. |
 | `bad_tokens_are_errors` | Unit | A negative token and a null token each give `Error::BadToken`. |
+| `row_count_must_match_the_footer` | Unit | An index with 5 rows for a chunk of 3 rows gives `Error::Decode`. |
 | `fetch_splits_large_ranges`, `pieces_cover_range` | Unit | The pieces cover the range with no gap and no overlap, and each piece is 16 MiB or less. |
 | `index_and_read_over_s3` | Integration | The index, the sidecar and the reader work against versitygw in the `s3` CI job. |
 
@@ -839,7 +841,7 @@ pub enum Error { Store(object_store::Error), Scheme(String), Option(String) }
 - The S3 builder fails only on settings, such as a missing bucket. Thus its error is also `Error::Option`, and Python shows it as `ConfigError`.
 - A local folder takes no options, so an option for a local folder is an error.
 - Only text with `://` is a URL. `C:\data` and `runs:2024/data` parse as URLs, but they are local paths.
-- A URL with `?` or `#`, and an `s3://` URL with a port or a user, give `Error::Option`. These characters can be part of a folder or key name, and the URL parser would drop what follows them, so another dataset would open (D-62).
+- A URL with `?` or `#`, and an `s3://` URL with a port or a user, give `Error::Option`. These characters can be part of a folder or key name, and the URL parser would drop what follows them, so another dataset would open (D-62). An error message never holds the user, the password, the query or the fragment of a URL, because they can hold keys.
 - `id` is the same for each spelling of one dataset, and different for two datasets. It holds no keys or tokens, so new credentials keep the same cache. It holds the endpoint from the options or the environment, the S3-only endpoint first as in the builder, so two servers with the same bucket name get different caches (D-58).
 
 **Limits:**
@@ -853,7 +855,7 @@ pub enum Error { Store(object_store::Error), Scheme(String), Option(String) }
 | `opens_local_folders` | Unit | A path, the path with a separator at the end, and a `file://` URL open the same folder with the same `id` (the canonical path). Another folder has another `id`. |
 | `a_colon_in_a_path_is_not_a_scheme` | Unit | A folder named `runs:2024` opens as a folder (POSIX). |
 | `s3_id_has_the_endpoint_and_no_keys` | Unit | Two secret keys give one `id`, and two endpoints give two. The `id` holds no key. An `endpoint` option wins over an S3-only endpoint from the environment. |
-| `refuses_what_it_cannot_open` | Unit | A missing folder, an unknown scheme, an option for a local folder, and URLs with `?` or `#` each give their error. |
+| `refuses_what_it_cannot_open` | Unit | A missing folder, an unknown scheme, an option for a local folder, and URLs with `?` or `#` each give their error. No error repeats a password or a query. |
 | `refuses_unknown_s3_options` | Unit | An unknown S3 option and a URL with no bucket give `Error::Option`. |
 | `open_an_s3_url` | Integration | An `s3://` URL with options opens versitygw with the correct prefix. |
 

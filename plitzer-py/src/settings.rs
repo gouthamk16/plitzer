@@ -39,15 +39,24 @@ pub fn int<'py, T: FromPyObjectOwned<'py>>(name: &str, value: &Bound<'py, PyAny>
     })
 }
 
+/// Where a `Loader` runs, and its byte budget.
+pub struct Placement {
+    pub rank: u32,
+    pub world: u32,
+    pub budget: u64,
+}
+
 /// `rank`, `world` and `budget`, with the defaults of a single GPU.
 pub fn placement(
     rank: Option<&Bound<'_, PyAny>>,
     world: Option<&Bound<'_, PyAny>>,
     budget: &Bound<'_, PyAny>,
-) -> PyResult<(u32, u32, u64)> {
-    let rank = rank.map_or(Ok(0), |r| int("rank", r))?;
-    let world = world.map_or(Ok(1), |w| int("world", w))?;
-    Ok((rank, world, int("budget", budget)?))
+) -> PyResult<Placement> {
+    Ok(Placement {
+        rank: rank.map_or(Ok(0), |r| int("rank", r))?,
+        world: world.map_or(Ok(1), |w| int("world", w))?,
+        budget: int("budget", budget)?,
+    })
 }
 
 /// The integer settings of a `Loader`, as Python gave them. Named fields,

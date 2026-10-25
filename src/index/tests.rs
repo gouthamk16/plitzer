@@ -259,6 +259,11 @@ async fn unwritable_cache_fails_before_the_build() {
         matches!(got, Err(Error::Cache(_))),
         "a folder as the cache: {got:?}"
     );
+    let got = open(&store, &prefix, &dir.path().join("new/")).await;
+    assert!(
+        matches!(got, Err(Error::Cache(_))),
+        "a path that ends in a separator: {got:?}"
+    );
     let got = open(&store, &prefix, std::path::Path::new("")).await;
     assert!(
         matches!(got, Err(Error::Cache(_))),

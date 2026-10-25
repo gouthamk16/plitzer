@@ -60,23 +60,38 @@ pub fn open(location: &str, options: &[(String, String)]) -> Result<Location, Er
     if !location.contains("://") {
         return local(std::path::Path::new(location), options);
     }
-    let url = Url::parse(location).map_err(|e| Error::Option(format!("{location:?}: {e}")))?;
+    // The text can hold a password, so the error does not repeat it.
+    let url = Url::parse(location).map_err(|e| Error::Option(format!("a bad URL: {e}")))?;
     // `?` and `#` may be part of a real folder or key name; dropping what
     // follows them would open another dataset.
     if url.query().is_some() || url.fragment().is_some() {
-        let why = format!("{location:?} has a `?` or `#`; percent-encode it as %3F or %23");
+        let why = format!(
+            "{} has a `?` or `#`; percent-encode it as %3F or %23",
+            redact(&url)
+        );
         return Err(Error::Option(why));
     }
     match url.scheme() {
         "file" => {
             let path = (url.to_file_path())
-                .map_err(|()| Error::Option(format!("{location:?} is not a local path")))?;
+                .map_err(|()| Error::Option(format!("{} is not a local path", redact(&url))))?;
             local(&path, options)
         }
         #[cfg(feature = "s3")]
         "s3" => s3(AmazonS3Builder::from_env(), &url, options),
         scheme => Err(Error::Scheme(scheme.to_string())),
     }
+}
+
+/// `url` for an error message: without the user, the password, the query
+/// and the fragment, which can hold keys or tokens.
+fn redact(url: &Url) -> String {
+    let mut url = url.clone();
+    // These fail only for a URL that cannot have a user, which has none.
+    let _ = (url.set_username(""), url.set_password(None));
+    url.set_query(None);
+    url.set_fragment(None);
+    url.to_string()
 }
 
 fn local(dir: &std::path::Path, options: &[(String, String)]) -> Result<Location, Error> {
@@ -100,7 +115,10 @@ fn local(dir: &std::path::Path, options: &[(String, String)]) -> Result<Location
 fn s3(env: AmazonS3Builder, url: &Url, options: &[(String, String)]) -> Result<Location, Error> {
     // Only the bucket is read from the host; a port or user would be lost.
     if url.port().is_some() || !url.username().is_empty() || url.password().is_some() {
-        let why = format!("{url} has a port or user; pass them as storage options");
+        let why = format!(
+            "{} has a port or user; pass them as storage options",
+            redact(url)
+        );
         return Err(Error::Option(why));
     }
     let bucket = url.host_str().unwrap_or_default();
@@ -198,6 +216,17 @@ mod tests {
         for odd in ["file:///data/runs#2", "file:///data?x=1", "s3://b/runs#2"] {
             assert!(matches!(open(odd, &[]), Err(Error::Option(_))), "{odd}");
         }
+        // An error never repeats a password or a query.
+        for secret in [
+            "file:///data?token=s3cret",
+            "file://u:s3cret@host/data#x",
+            "s3://u:s3cret@[/p",
+        ] {
+            match open(secret, &[]) {
+                Err(Error::Option(why)) => assert!(!why.contains("s3cret"), "{why}"),
+                other => panic!("{secret}: {:?}", other.err()),
+            }
+        }
         let options = [("region".to_string(), "x".to_string())];
         let here = dir.path().to_str().unwrap();
         assert!(matches!(open(here, &options), Err(Error::Option(_))));
@@ -246,8 +275,11 @@ mod tests {
         let option = [("endpoint".to_string(), "http://four:7070".to_string())];
         let at = s3(env, &url, &option).unwrap();
         assert!(at.id.ends_with("at http://four:7070"), "{}", at.id);
-        for odd in ["s3://b:9000/p", "s3://user@b/p", "s3://user:secret@b/p"] {
-            assert!(matches!(open(odd, &[]), Err(Error::Option(_))), "{odd}");
+        for odd in ["s3://b:9000/p", "s3://user@b/p", "s3://user:s3cret@b/p"] {
+            match open(odd, &[]) {
+                Err(Error::Option(why)) => assert!(!why.contains("s3cret"), "{why}"),
+                _ => panic!("{odd}"),
+            }
         }
     }
 }

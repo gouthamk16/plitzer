@@ -99,12 +99,14 @@ fn file(r: &mut Reader) -> Option<File> {
 
 /// Checks, before the build, that `write` can later put a sidecar at
 /// `path`, so a cache that cannot be written fails before any footer is
-/// read. It refuses a folder or a path with no file name, and makes a file
+/// read. It refuses a folder, a path with no file name or one that ends in a
+/// separator (rename cannot put a file there), and makes a file
 /// in the folder: on Unix `write` renames over the old sidecar, which needs
 /// only the folder, so a read-only stale sidecar is still replaced. It changes
 /// no file, since another process may have just written a good sidecar.
 pub(super) fn check_writable(path: &std::path::Path) -> io::Result<()> {
-    if path.is_dir() || path.file_name().is_none() {
+    let names_a_folder = path.to_string_lossy().ends_with(std::path::is_separator);
+    if path.is_dir() || path.file_name().is_none() || names_a_folder {
         let why = format!("the index cache {:?} is not a file path", path);
         return Err(io::Error::new(io::ErrorKind::InvalidInput, why));
     }

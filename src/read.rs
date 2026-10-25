@@ -174,6 +174,14 @@ fn decode(
         .build()?;
     decoder.push_range(range, data)?;
     match decoder.try_decode()? {
+        // The lanes index rows by the footer's count, so fewer would panic.
+        DecodeResult::Data(batch) if batch.num_rows() != rg.rows as usize => {
+            Err(ParquetError::General(format!(
+                "the chunk has {} rows, but its footer says {}",
+                batch.num_rows(),
+                rg.rows
+            )))
+        }
         DecodeResult::Data(batch) => Ok(batch.column(0).clone()),
         // The index records the whole chunk, so this means a bad record.
         DecodeResult::NeedsData(_) | DecodeResult::Finished => Err(ParquetError::General(

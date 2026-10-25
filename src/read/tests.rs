@@ -298,6 +298,24 @@ async fn bad_tokens_are_errors() {
     }
 }
 
+// A footer that counts more rows than its chunk holds is an error, not a
+// panic when a lane later asks for a missing row.
+#[tokio::test]
+async fn row_count_must_match_the_footer() {
+    let d = data();
+    let p = props(Compression::SNAPPY, false);
+    write(
+        &d.path("x.parquet"),
+        token_column(Kind::ListI32, 3, false),
+        p,
+    );
+    let mut index = d.index().await.unwrap();
+    index.files_mut()[0].row_groups[0].rows = 5;
+    let reader = Reader::new(d.store.clone(), d.prefix.clone(), &index).unwrap();
+    let got = reader.read(&index, 0).await;
+    assert!(matches!(got, Err(Error::Decode { .. })), "{got:?}");
+}
+
 #[tokio::test]
 async fn fetch_splits_large_ranges() {
     let d = data();

@@ -134,6 +134,11 @@ impl Index {
         &self.schema
     }
 
+    #[cfg(test)]
+    pub(crate) fn files_mut(&mut self) -> &mut [File] {
+        &mut self.files
+    }
+
     pub fn files(&self) -> &[File] {
         &self.files
     }
