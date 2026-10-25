@@ -56,6 +56,19 @@ fn state_past_cursor_is_refused() {
 }
 
 #[test]
+fn leftover_after_the_last_step_is_refused() {
+    let (c, rows) = small();
+    let e = epoch(&rows, 1, 2, 7, P4);
+    let end = LaneState {
+        step: e.steps(),
+        doc: e.lane_docs(0) - 1,
+        offset: 0,
+    };
+    let got = e.lane(0, end, &c);
+    assert!(got.is_err_and(|why| why.contains("after the last step")));
+}
+
+#[test]
 fn offset_past_doc_is_refused() {
     let (c, rows) = small();
     let e = epoch(&rows, 1, 2, 7, P4);

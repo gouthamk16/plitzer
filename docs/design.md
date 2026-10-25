@@ -323,7 +323,7 @@ impl Epoch {
     pub fn lane_docs(&self, lane: u32) -> u64;
     pub fn lane(self: &Arc<Self>, lane: u32, state: LaneState, tokens: &impl Tokens)
         -> Result<Lane, String>;   // Err for a state that no run makes
-    pub fn check(&self, lane: u32, state: LaneState) -> Result<u64, String>;  // lane, step and leftover in range; the cursor
+    pub fn check(&self, lane: u32, state: LaneState) -> Result<u64, String>;  // lane, step and leftover in range, no leftover after the last step; the cursor
 }
 impl Lane {
     pub fn fill(&mut self, tokens: &impl Tokens, out: &mut [u32]) -> u32;
@@ -387,6 +387,7 @@ At step 0, the leftover has 9 tokens. The lane copies 4 tokens. Then it removes 
 | `cap_and_padding` | Property | Pad tokens occur only at the end. The leftover is never more than C. A short sequence occurs only with an empty leftover. At the end of the epoch, each lane state is `(lane_docs, 0)`. |
 | `golden` | Unit | The example above, and a hash over 60 row groups, is the same on each OS. |
 | `*_panics` | Unit | Each invalid input in the limits causes a panic. |
+| `leftover_after_the_last_step_is_refused` | Unit | A state at the last step with a leftover gives an error: its tokens would never be emitted. |
 | `lane_out_of_range_is_refused` | Unit | `check` and `lane` give an error, not a panic, for a lane that is not in the order. |
 
 The property tests use small inputs. Thus empty documents, empty lanes, C = 0, C < L and L = 1 occur frequently.
@@ -732,7 +733,7 @@ Each GPU gives a checkpoint part for its own lanes. `merge` puts the parts of al
 **Limits:**
 
 - The checksum finds damage, not changes by an attacker.
-- `from_bytes` does not make sure that each lane state is correct for the epoch. `Session::resume` refuses a step past the epoch and a leftover past the cursor, through `Epoch::check` (D-64). The other states that no run makes, such as an offset past its document or a leftover past the cap, need the tokens. `Epoch::lane` then gives an error. `Session::resume` makes the loader at once, so it gives that error as `checkpoint::Error::Range`, and the session stays where it was. No checkpoint causes a panic. A state far behind its cursor can also need more than the budget: `resume` then gives the budget error. `merge` reserves no memory from the B in the bytes.
+- `from_bytes` does not make sure that each lane state is correct for the epoch. `Session::resume` refuses a step past the epoch, a leftover past the cursor and a leftover after the last step, through `Epoch::check` (D-64). The other states that no run makes, such as an offset past its document or a leftover past the cap, need the tokens. `Epoch::lane` then gives an error. `Session::resume` makes the loader at once, so it gives that error as `checkpoint::Error::Range`, and the session stays where it was. No checkpoint causes a panic. A state far behind its cursor can also need more than the budget: `resume` then gives the budget error. `merge` reserves no memory from the B in the bytes.
 
 **Verification:**
 

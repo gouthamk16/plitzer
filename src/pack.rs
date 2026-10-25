@@ -149,6 +149,13 @@ impl Epoch {
         if state.doc > cursor {
             return Err(format!("state {state:?} is past the cursor {cursor}"));
         }
+        // The flush steps empty every leftover, so a lane ends at
+        // `(cursor, 0)`; a leftover there would never be emitted.
+        if state.step == self.steps && (state.doc, state.offset) != (cursor, 0) {
+            return Err(format!(
+                "state {state:?} has a leftover after the last step"
+            ));
+        }
         Ok(cursor)
     }
 
