@@ -5,11 +5,12 @@ use std::fmt;
 use std::sync::Arc;
 
 use object_store::ObjectStore;
-#[cfg(feature = "s3")]
-use object_store::aws::{AmazonS3Builder, AmazonS3ConfigKey};
 use object_store::local::LocalFileSystem;
 use object_store::path::Path;
 use url::Url;
+
+#[cfg(feature = "s3")]
+mod s3;
 
 #[derive(Debug)]
 pub enum Error {
@@ -78,7 +79,11 @@ pub fn open(location: &str, options: &[(String, String)]) -> Result<Location, Er
             local(&path, options)
         }
         #[cfg(feature = "s3")]
-        "s3" => s3(AmazonS3Builder::from_env(), &url, options),
+        "s3" => s3::open(
+            object_store::aws::AmazonS3Builder::from_env(),
+            &url,
+            options,
+        ),
         scheme => Err(Error::Scheme(scheme.to_string())),
     }
 }
@@ -100,6 +105,10 @@ fn local(dir: &std::path::Path, options: &[(String, String)]) -> Result<Location
         return Err(Error::Option(why));
     }
     let store = LocalFileSystem::new_with_prefix(dir).map_err(Error::Store)?;
+    if !dir.is_dir() {
+        let why = format!("{dir:?} is not a folder; give the folder of the dataset");
+        return Err(Error::Option(why));
+    }
     // The store opened the folder, so it exists; links are resolved.
     let id = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
     // `Debug` keeps bytes that are not UTF-8 apart; `Display` would merge
@@ -107,60 +116,6 @@ fn local(dir: &std::path::Path, options: &[(String, String)]) -> Result<Location
     let id = format!("{id:?}");
     let (store, prefix) = (Arc::new(store), Path::from(""));
     Ok(Location { store, prefix, id })
-}
-
-/// `env` is the builder with the environment's settings, which `options`
-/// override.
-#[cfg(feature = "s3")]
-fn s3(env: AmazonS3Builder, url: &Url, options: &[(String, String)]) -> Result<Location, Error> {
-    // Only the bucket is read from the host; a port or user would be lost.
-    if url.port().is_some() || !url.username().is_empty() || url.password().is_some() {
-        let why = format!(
-            "{} has a port or user; pass them as storage options",
-            redact(url)
-        );
-        return Err(Error::Option(why));
-    }
-    let bucket = url.host_str().unwrap_or_default();
-    let builder = with_options(env.with_url(format!("s3://{bucket}")), options)?;
-    // The endpoint, from the options or the environment, tells two servers
-    // with the same bucket name apart. The builder prefers the S3-only
-    // endpoint, so the id does too. Keys and tokens stay out of the id.
-    let endpoint = (builder.get_config_value(&AmazonS3ConfigKey::S3Endpoint))
-        .or_else(|| builder.get_config_value(&AmazonS3ConfigKey::Endpoint));
-    // The builder fails only on settings, such as a missing bucket.
-    let store = (builder.build()).map_err(|e| Error::Option(format!("bad S3 settings: {e}")))?;
-    let prefix = Path::from_url_path(url.path())
-        .map_err(|e| Error::Option(format!("bad prefix in {url}: {e}")))?;
-    let id = format!("s3://{bucket}/{prefix} at {}", endpoint.unwrap_or_default());
-    Ok(Location {
-        store: Arc::new(store),
-        prefix,
-        id,
-    })
-}
-
-/// `builder` with each of `options`; an unknown one is an error.
-#[cfg(feature = "s3")]
-fn with_options(
-    mut builder: AmazonS3Builder,
-    options: &[(String, String)],
-) -> Result<AmazonS3Builder, Error> {
-    let mut keys = Vec::new();
-    for (key, value) in options {
-        let key: AmazonS3ConfigKey = (key.to_ascii_lowercase().parse())
-            .map_err(|_| Error::Option(format!("unknown S3 storage option {key:?}")))?;
-        builder = builder.with_config(key, value);
-        keys.push(key);
-    }
-    // The builder prefers the S3-only endpoint, which can come from
-    // `AWS_ENDPOINT_URL_S3`; an `endpoint` option must still win over it.
-    let (general, s3_only) = (AmazonS3ConfigKey::Endpoint, AmazonS3ConfigKey::S3Endpoint);
-    if keys.contains(&general) && !keys.contains(&s3_only) {
-        let endpoint = builder.get_config_value(&general).unwrap_or_default();
-        builder = builder.with_config(s3_only, endpoint);
-    }
-    Ok(builder)
 }
 
 #[cfg(test)]
@@ -212,6 +167,13 @@ mod tests {
         let missing = dir.path().join("missing");
         let missing = missing.to_str().unwrap();
         assert!(matches!(open(missing, &[]), Err(Error::Store(_))));
+        let file = dir.path().join("a.parquet");
+        std::fs::write(&file, b"x").unwrap();
+        let file = open(file.to_str().unwrap(), &[]);
+        assert!(
+            matches!(file, Err(Error::Option(_))),
+            "a file, not a folder"
+        );
         assert!(matches!(open("gs://bucket/x", &[]), Err(Error::Scheme(_))));
         for odd in ["file:///data/runs#2", "file:///data?x=1", "s3://b/runs#2"] {
             assert!(matches!(open(odd, &[]), Err(Error::Option(_))), "{odd}");
@@ -230,56 +192,5 @@ mod tests {
         let options = [("region".to_string(), "x".to_string())];
         let here = dir.path().to_str().unwrap();
         assert!(matches!(open(here, &options), Err(Error::Option(_))));
-    }
-
-    #[cfg(feature = "s3")]
-    #[test]
-    fn refuses_unknown_s3_options() {
-        let options = [("no_such_option".to_string(), "x".to_string())];
-        assert!(matches!(open("s3://b/p", &options), Err(Error::Option(_))));
-        assert!(
-            matches!(open("s3:///p", &[]), Err(Error::Option(_))),
-            "no bucket"
-        );
-    }
-
-    // The id names the endpoint, so two servers do not share a cache, and
-    // never the keys, so new keys do not force a new index.
-    #[cfg(feature = "s3")]
-    #[test]
-    fn s3_id_has_the_endpoint_and_no_keys() {
-        let id = |endpoint: &str, secret: &str| {
-            let options: Vec<(String, String)> = [
-                ("endpoint", endpoint),
-                ("region", "us-east-1"),
-                ("access_key_id", "AKIDEXAMPLE"),
-                ("secret_access_key", secret),
-            ]
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .into();
-            open("s3://b/p", &options).unwrap().id
-        };
-        let a = id("http://one:7070", "s3cret-1");
-        assert_eq!(a, id("http://one:7070", "s3cret-2"));
-        assert_ne!(a, id("http://two:7070", "s3cret-1"));
-        assert!(!a.contains("s3cret") && !a.contains("AKIDEXAMPLE"), "{a}");
-        // The S3-only endpoint wins in the builder, so it names the id too.
-        let s3_only = [(
-            "aws_endpoint_url_s3".to_string(),
-            "http://three:7070".to_string(),
-        )];
-        assert!(open("s3://b/p", &s3_only).unwrap().id.contains("three"));
-        // An `endpoint` option wins over `AWS_ENDPOINT_URL_S3`.
-        let env = AmazonS3Builder::new().with_config(AmazonS3ConfigKey::S3Endpoint, "http://env");
-        let url = Url::parse("s3://b/p").unwrap();
-        let option = [("endpoint".to_string(), "http://four:7070".to_string())];
-        let at = s3(env, &url, &option).unwrap();
-        assert!(at.id.ends_with("at http://four:7070"), "{}", at.id);
-        for odd in ["s3://b:9000/p", "s3://user@b/p", "s3://user:s3cret@b/p"] {
-            match open(odd, &[]) {
-                Err(Error::Option(why)) => assert!(!why.contains("s3cret"), "{why}"),
-                _ => panic!("{odd}"),
-            }
-        }
     }
 }

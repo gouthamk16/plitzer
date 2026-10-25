@@ -1,4 +1,5 @@
 import os
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Protocol, TypedDict, Unpack
 
@@ -16,7 +17,7 @@ class Extras(TypedDict, total=False):
     world: int
     column: str
     cache: str | os.PathLike[str] | None
-    storage_options: dict[str, str | bool] | None
+    storage_options: Mapping[str, str | bool] | None
 
 
 class Settings(TypedDict):

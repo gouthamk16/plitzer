@@ -1,6 +1,5 @@
 //! The `Loader` settings from Python: integers, the location and the cache.
 
-use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -12,7 +11,7 @@ use plitzer::pack::Packing;
 use pyo3::conversion::FromPyObjectOwned;
 use pyo3::exceptions::PyOverflowError;
 use pyo3::prelude::*;
-use pyo3::types::PyBool;
+use pyo3::types::{PyBool, PyMapping};
 use url::Url;
 
 use crate::errors::{ConfigError, store_error};
@@ -117,11 +116,11 @@ fn pad(value: &Bound<'_, PyAny>) -> PyResult<u32> {
 /// the default.
 pub fn locate(
     location: PathBuf,
-    storage_options: Option<HashMap<String, Bound<'_, PyAny>>>,
+    storage_options: Option<Bound<'_, PyMapping>>,
     column: &str,
     cache: Option<PathBuf>,
 ) -> PyResult<(Arc<dyn ObjectStore>, Path, PathBuf)> {
-    let options = options(storage_options.unwrap_or_default())?;
+    let options = options(storage_options)?;
     let at = plitzer::store::open(&text(location)?, &options).map_err(store_error)?;
     // The dataset's id, not the spelling: `data` from two folders, or
     // `s3://b/p/` and `s3://b/p`, must not share or split an index.
@@ -150,9 +149,11 @@ fn text(location: PathBuf) -> PyResult<String> {
 
 /// The storage options in a fixed order, each value as text. A `bool`, as
 /// in `allow_http=True`, becomes `true` or `false`.
-fn options(given: HashMap<String, Bound<'_, PyAny>>) -> PyResult<Vec<(String, String)>> {
+fn options(given: Option<Bound<'_, PyMapping>>) -> PyResult<Vec<(String, String)>> {
     let mut options = Vec::new();
-    for (key, value) in given {
+    let items = given.map(|m| m.items()).transpose()?;
+    for item in items.iter().flatten() {
+        let (key, value): (String, Bound<'_, PyAny>) = item.extract()?;
         let text = match value.extract::<bool>() {
             Ok(flag) if value.is_instance_of::<PyBool>() => flag.to_string(),
             _ => value.extract::<String>().map_err(|_| {

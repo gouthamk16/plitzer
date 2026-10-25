@@ -1,6 +1,5 @@
 //! `Loader`: one GPU's `Session`, driven from Python.
 
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard, TryLockError};
 
@@ -9,7 +8,7 @@ use plitzer::session::Session;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::pybacked::PyBackedBytes;
-use pyo3::types::{PyBytes, PyRange};
+use pyo3::types::{PyBytes, PyMapping, PyRange};
 
 use crate::array::Batch;
 use crate::errors::{checkpoint_error, session_error};
@@ -148,7 +147,7 @@ impl Loader {
         world: Option<&Bound<'_, PyAny>>,
         column: String,
         cache: Option<PathBuf>,
-        storage_options: Option<HashMap<String, Bound<'_, PyAny>>>,
+        storage_options: Option<Bound<'_, PyMapping>>,
     ) -> PyResult<Self> {
         let ints = Ints {
             seed,

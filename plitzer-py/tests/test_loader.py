@@ -5,6 +5,7 @@ import signal
 import sys
 import threading
 import time
+import types
 import warnings
 from collections.abc import Sequence
 from pathlib import Path
@@ -258,10 +259,20 @@ def test_bad_settings(make: MakeLoader, tmp_path: Path) -> None:
         make(cache=blocker / "index")
     with pytest.raises(plitzer.ConfigError):
         make(storage_options={"region": "x"})
+    with pytest.raises(plitzer.ConfigError):  # any Mapping, not only a dict
+        make(storage_options=types.MappingProxyType({"region": "x"}))
     with pytest.raises(plitzer.ConfigError, match="budget"):
         next(make(budget=1))
     with pytest.raises(plitzer.DataError):
         plitzer.Loader(tmp_path / "missing", **SETTINGS)
+    with pytest.raises(plitzer.ConfigError, match="not a folder"):
+        plitzer.Loader(blocker, **SETTINGS)
+    # object_store would panic on this endpoint at the first request.
+    with pytest.raises(plitzer.ConfigError, match="endpoint"):
+        bad = {"endpoint": "localhost:9000"}
+        plitzer.Loader(
+            "s3://b/p", **SETTINGS, cache=tmp_path / "i", storage_options=bad
+        )
     assert issubclass(plitzer.ConfigError, plitzer.PlitzerError)
 
 

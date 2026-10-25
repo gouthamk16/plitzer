@@ -128,7 +128,7 @@ flowchart LR
 | Loader | `src/load.rs` | Implemented | [5.7](#57-loader) |
 | Checkpoint | `src/checkpoint.rs` | Implemented | [5.8](#58-checkpoint) |
 | Session | `src/session.rs` | Implemented | [5.9](#59-session) |
-| Store | `src/store.rs` | Implemented | [5.10](#510-store) |
+| Store | `src/store.rs`, `src/store/s3.rs` | Implemented | [5.10](#510-store) |
 | Python bindings | `plitzer-py/` | Implemented | [5.11](#511-python-bindings) |
 | PyTorch dataset | — | Planned | [5.12](#512-planned-components) |
 
@@ -840,7 +840,8 @@ pub enum Error { Store(object_store::Error), Scheme(String), Option(String) }
 - `object_store::parse_url_opts` does not read the `AWS_*` environment variables. `from_env` reads them, and the options override them (D-49). The builder prefers the S3-only endpoint, such as `AWS_ENDPOINT_URL_S3`, to the general one. Thus an `endpoint` option is also set as the S3-only endpoint, unless the options give that endpoint too.
 - An unknown option gives `Error::Option`. If the store ignored an option, a wrong endpoint or a wrong key name would fail later with an unclear error.
 - The S3 builder fails only on settings, such as a missing bucket. Thus its error is also `Error::Option`, and Python shows it as `ConfigError`.
-- A local folder takes no options, so an option for a local folder is an error.
+- A local folder takes no options, so an option for a local folder is an error. A location that is a file, not a folder, is also an error.
+- `open` refuses an S3 endpoint that is not an `http://` or `https://` URL, that has spaces, or that holds a user or a password. It also refuses a key or a token with a control character, such as a newline at the end of a file. These values come from the options or the environment. `object_store` stops with a panic on the first request for the first ones, and it repeats the endpoint in its errors.
 - Only text with `://` is a URL. `C:\data` and `runs:2024/data` parse as URLs, but they are local paths.
 - A URL with `?` or `#`, and an `s3://` URL with a port or a user, give `Error::Option`. These characters can be part of a folder or key name, and the URL parser would drop what follows them, so another dataset would open (D-62). An error message never holds the user, the password, the query or the fragment of a URL, because they can hold keys.
 - `id` is the same for each spelling of one dataset, and different for two datasets. It holds no keys or tokens, so new credentials keep the same cache. It holds the endpoint from the options or the environment, the S3-only endpoint first as in the builder, so two servers with the same bucket name get different caches (D-58).
@@ -855,6 +856,7 @@ pub enum Error { Store(object_store::Error), Scheme(String), Option(String) }
 |---|---|---|
 | `opens_local_folders` | Unit | A path, the path with a separator at the end, and a `file://` URL open the same folder with the same `id` (the canonical path). Another folder has another `id`. |
 | `a_colon_in_a_path_is_not_a_scheme` | Unit | A folder named `runs:2024` opens as a folder (POSIX). |
+| `refuses_settings_that_would_panic` | Unit | An endpoint with no scheme, a space at the end, no text, another scheme or a password, also from the environment, and a token with a newline each give `Error::Option`, with no secret in the message. |
 | `s3_id_has_the_endpoint_and_no_keys` | Unit | Two secret keys give one `id`, and two endpoints give two. The `id` holds no key. An `endpoint` option wins over an S3-only endpoint from the environment. |
 | `refuses_what_it_cannot_open` | Unit | A missing folder, an unknown scheme, an option for a local folder, and URLs with `?` or `#` each give their error. No error repeats a password or a query. |
 | `refuses_unknown_s3_options` | Unit | An unknown S3 option and a URL with no bucket give `Error::Option`. |
@@ -871,7 +873,7 @@ class Loader:
     def __init__(self, location: str | os.PathLike[str], *, seed: int, lanes: int, window: int,
                  seq_len: int, docs: int, cap: int, pad: int, budget: int, rank: int | None = None, world: int | None = None,
                  column: str = "tokens", cache: str | os.PathLike[str] | None = None,
-                 storage_options: dict[str, str | bool] | None = None) -> None: ...
+                 storage_options: Mapping[str, str | bool] | None = None) -> None: ...
     def __iter__(self) -> Loader: ...           # the rest of the current epoch
     def __next__(self) -> Batch: ...
     def set_epoch(self, epoch: int) -> None: ...
@@ -1088,7 +1090,7 @@ This component is not in the code yet. Its section will have the full set of par
 | 2026-10-23 | #12 | Add the reader (`src/read.rs`) and the `s3` feature. Change the index to version 2, with the token column chunk of each row group. |
 | 2026-10-23 | #14 | Add the loader (`src/load.rs`) and `Order::lane_groups`. Change the index to version 3, with the value count. `Lane` holds an `Arc<Epoch>`. |
 | 2026-10-23 | #16 | Add the checkpoint (`src/checkpoint.rs`) and the session (`src/session.rs`). Add `Loader::ended`. Move the binary helpers to `src/codec.rs`. |
-| 2026-10-23 | #18 | Add the Python bindings (`plitzer-py/`), the store (`src/store.rs`) and `Session::ended`. Add a Python CI job on the three systems. The index makes the folder of its cache, and checks that it can write the cache before it reads the footers. |
+| 2026-10-23 | #18 | Add the Python bindings (`plitzer-py/`), the store (`src/store.rs`, `src/store/s3.rs`) and `Session::ended`. Add a Python CI job on the three systems. The index makes the folder of its cache, and checks that it can write the cache before it reads the footers. |
 
 ## 10. Maintenance
 
