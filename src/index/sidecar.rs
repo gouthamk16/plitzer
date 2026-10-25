@@ -131,7 +131,12 @@ fn folder(path: &std::path::Path) -> io::Result<&std::path::Path> {
 /// then renames it. Processes that start together (one per GPU) can then
 /// write at once, and no reader sees a half-written sidecar.
 pub(super) fn write(path: &std::path::Path, bytes: &[u8]) -> io::Result<()> {
-    let mut tmp = tempfile::NamedTempFile::new_in(folder(path)?)?;
+    let mut tmp = tempfile::Builder::new();
+    // A temp file is 0600, which other users of a shared cache folder could
+    // not read; this mode, less the umask, is the mode of a plain new file.
+    #[cfg(unix)]
+    tmp.permissions(std::os::unix::fs::PermissionsExt::from_mode(0o644));
+    let mut tmp = tmp.tempfile_in(folder(path)?)?;
     tmp.write_all(bytes)?;
     for attempt in 0.. {
         let Err(e) = tmp.persist(path) else {

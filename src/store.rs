@@ -79,11 +79,7 @@ pub fn open(location: &str, options: &[(String, String)]) -> Result<Location, Er
             local(&path, options)
         }
         #[cfg(feature = "s3")]
-        "s3" => s3::open(
-            object_store::aws::AmazonS3Builder::from_env(),
-            &url,
-            options,
-        ),
+        "s3" => s3::open(s3::env(), &url, options),
         scheme => Err(Error::Scheme(scheme.to_string())),
     }
 }

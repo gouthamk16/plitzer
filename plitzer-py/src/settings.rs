@@ -153,9 +153,13 @@ fn options(given: Option<Bound<'_, PyMapping>>) -> PyResult<Vec<(String, String)
     let mut options = Vec::new();
     let items = given.map(|m| m.items()).transpose()?;
     for item in items.iter().flatten() {
-        let (key, value): (String, Bound<'_, PyAny>) = item.extract()?;
+        let (key, value): (Bound<'_, PyAny>, Bound<'_, PyAny>) = item.extract()?;
+        let key: String = (key.extract()).map_err(|_| {
+            ConfigError::new_err(format!("storage option {key} must have a str name"))
+        })?;
+        // Also `np.bool_`, which PyO3 extracts as a bool.
         let text = match value.extract::<bool>() {
-            Ok(flag) if value.is_instance_of::<PyBool>() => flag.to_string(),
+            Ok(flag) => flag.to_string(),
             _ => value.extract::<String>().map_err(|_| {
                 let kind = value
                     .get_type()

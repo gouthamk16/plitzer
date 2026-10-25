@@ -44,7 +44,7 @@ def test_s3_matches_local(dataset: Path, tmp_path: Path) -> None:
     assert ENDPOINT is not None
     options: dict[str, str | bool] = {
         "endpoint": ENDPOINT,
-        "allow_http": True,  # a bool becomes "true"
+        "allow_http": np.bool_(True),  # type: ignore[dict-item]  # numpy bool
         "region": "us-east-1",
         "access_key_id": KEY,
         "secret_access_key": SECRET,

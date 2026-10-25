@@ -293,4 +293,7 @@ async fn read_only_stale_sidecar_is_replaced() {
     std::fs::set_permissions(&cache, PermissionsExt::from_mode(0o444)).unwrap();
     open(&store, &prefix, &cache).await.unwrap();
     assert_ne!(std::fs::read(&cache).unwrap(), b"stale");
+    // Not the 0600 of a temp file: other users of a shared cache read it.
+    let mode = std::fs::metadata(&cache).unwrap().permissions().mode();
+    assert_eq!(mode & 0o044, 0o044, "{mode:o}");
 }

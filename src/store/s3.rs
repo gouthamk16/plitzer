@@ -1,5 +1,6 @@
 //! S3 locations: the builder from the environment, then the options.
 
+use std::ffi::OsString;
 use std::sync::Arc;
 
 use object_store::aws::{AmazonS3Builder, AmazonS3ConfigKey};
@@ -7,6 +8,29 @@ use object_store::path::Path;
 use url::Url;
 
 use super::{Error, Location, redact};
+
+/// The builder with the `AWS_*` variables, as `AmazonS3Builder::from_env`
+/// makes it, but an empty variable counts as unset, as in the AWS CLI. A
+/// compose file often sets `AWS_ENDPOINT_URL=` for real AWS.
+pub(super) fn env() -> AmazonS3Builder {
+    from_vars(std::env::vars_os())
+}
+
+fn from_vars(vars: impl Iterator<Item = (OsString, OsString)>) -> AmazonS3Builder {
+    let mut builder = AmazonS3Builder::new();
+    for (key, value) in vars {
+        let (Some(key), Some(value)) = (key.to_str(), value.to_str()) else {
+            continue;
+        };
+        if !key.starts_with("AWS_") || value.is_empty() {
+            continue;
+        }
+        if let Ok(key) = key.to_ascii_lowercase().parse::<AmazonS3ConfigKey>() {
+            builder = builder.with_config(key, value);
+        }
+    }
+    builder
+}
 
 /// `env` is the builder with the environment's settings, which `options`
 /// override.
@@ -65,12 +89,14 @@ fn check(builder: &AmazonS3Builder, endpoint: Option<&str>) -> Result<(), Error>
             return Err(Error::Option(format!("the S3 endpoint {why}")));
         }
     }
-    let secrets = [
+    // object_store puts these in request headers and unwraps the result.
+    let headers = [
         AmazonS3ConfigKey::AccessKeyId,
         AmazonS3ConfigKey::SecretAccessKey,
         AmazonS3ConfigKey::Token,
+        AmazonS3ConfigKey::Region,
     ];
-    for key in secrets {
+    for key in headers {
         if (builder.get_config_value(&key)).is_some_and(|v| v.chars().any(char::is_control)) {
             let why = format!(
                 "{} holds a control character, such as a newline",
@@ -194,11 +220,29 @@ mod tests {
             refused(AmazonS3Builder::new(), &token),
             "a newline in a token"
         );
+        let region = [("endpoint", "http://host:9000"), ("region", "us-east-1\n")];
+        assert!(
+            refused(AmazonS3Builder::new(), &region),
+            "a newline in a region"
+        );
         for odd in ["s3://b:9000/p", "s3://user@b/p", "s3://user:s3cret@b/p"] {
             match store::open(odd, &[]) {
                 Err(Error::Option(why)) => assert!(!why.contains("s3cret"), "{why}"),
                 _ => panic!("{odd}"),
             }
         }
+    }
+
+    // An empty `AWS_ENDPOINT_URL=`, as a compose file sets for real AWS, is
+    // unset, so the builder's default endpoint is used.
+    #[test]
+    fn an_empty_variable_is_unset() {
+        let vars = [("AWS_ENDPOINT_URL", ""), ("AWS_REGION", "eu-west-1")];
+        let vars = vars.map(|(k, v)| (OsString::from(k), OsString::from(v)));
+        let env = from_vars(vars.into_iter());
+        assert_eq!(env.get_config_value(&AmazonS3ConfigKey::Endpoint), None);
+        let region = env.get_config_value(&AmazonS3ConfigKey::Region);
+        assert_eq!(region.as_deref(), Some("eu-west-1"));
+        assert!(open(env, &Url::parse("s3://b/p").unwrap(), &[]).is_ok());
     }
 }

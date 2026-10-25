@@ -474,7 +474,7 @@ The fingerprint is the 64-bit FNV-1a hash of the same layout, with no ETags and 
 - The sidecar uses its own small format. It needs no `serde` dependency, and a golden test pins the bytes (D-22).
 - Before a build, `open` makes the cache folder and a file in it. It refuses a cache path that is a folder, has no file name or ends in a separator. The write renames over the old sidecar. On Unix this needs only the folder, so a stale sidecar that is read-only is still replaced. Windows refuses to rename over a read-only file, so on Windows `open` refuses a read-only sidecar before the build. The check changes no file, because another process can have just written a good sidecar. A cache that cannot be written then fails before the footer scan, which takes long on a large dataset (D-57). If the write after the build fails, such as on a full disk, `open` still returns the index: the next start builds it again.
 - If the sidecar does not exist or is corrupt, `open` builds the index again. This is not an error. The sidecar is only a cache (D-23).
-- The module writes the sidecar to a temporary file with a unique name and then renames it. Thus the processes of all GPUs on one node can write at the same time, and no process reads a half-written sidecar.
+- The module writes the sidecar to a temporary file with a unique name and then renames it. On Unix the file gets mode 0644 less the umask, as a plain new file, so other users of a shared cache folder can read it. Thus the processes of all GPUs on one node can write at the same time, and no process reads a half-written sidecar.
 - Windows does not replace a file while a different process has it open or replaces it. If the rename fails and the sidecar already has the same bytes, a different process wrote the same index, and the write is complete. If not, the module tries again up to five times.
 - The first request reads 4 MiB, because a FineWeb-Edu footer is approximately 3.1 MiB. Thus most files need one request, not two.
 - The module checks the footer length itself, because `parquet` 60 panics on a footer length that is larger than the file.
@@ -499,7 +499,7 @@ The fingerprint is the 64-bit FNV-1a hash of the same layout, with no ETags and 
 | `open_writes_and_reuses_cache` | Unit | `open` writes the sidecar, and a second `open` gives the same index. |
 | `open_uses_cache_without_footers` | Unit | A sidecar with false row counts that matches the list of files is used, so no footer is read. A different column or a stale ETag causes a new build. |
 | `unwritable_cache_fails_before_the_build` | Unit | A cache below a file, a cache that is a folder, a path that ends in a separator and an empty cache path give `Error::Cache`, not the `Error::Footer` of a corrupt file in the dataset. The check does not change a stale sidecar. A missing cache folder is made. |
-| `read_only_stale_sidecar_is_replaced` | Unit | A stale sidecar with mode 0444 in a writable folder is replaced by the build (Unix). |
+| `read_only_stale_sidecar_is_replaced` | Unit | A stale sidecar with mode 0444 in a writable folder is replaced by the build (Unix). The new sidecar is readable by the group and others, not 0600 as a temporary file is. |
 | `open_rebuilds_on_change` | Unit | A changed file, a new file and a corrupt sidecar each cause a new build. |
 | `bad_footer_names_file` | Unit | A bad magic number, a file that is too short and a footer length larger than the file each give `Error::Footer` with the path. |
 | `no_files_is_an_error` | Unit | A prefix with no `.parquet` files gives `Error::NoFiles`. |
@@ -837,11 +837,11 @@ pub enum Error { Store(object_store::Error), Scheme(String), Option(String) }
 
 **Rationale:**
 
-- `object_store::parse_url_opts` does not read the `AWS_*` environment variables. `from_env` reads them, and the options override them (D-49). The builder prefers the S3-only endpoint, such as `AWS_ENDPOINT_URL_S3`, to the general one. Thus an `endpoint` option is also set as the S3-only endpoint, unless the options give that endpoint too.
+- `object_store::parse_url_opts` does not read the `AWS_*` environment variables. `store` reads them as `from_env` does, and the options override them (D-49). An empty variable counts as unset, as in the AWS CLI. The builder prefers the S3-only endpoint, such as `AWS_ENDPOINT_URL_S3`, to the general one. Thus an `endpoint` option is also set as the S3-only endpoint, unless the options give that endpoint too.
 - An unknown option gives `Error::Option`. If the store ignored an option, a wrong endpoint or a wrong key name would fail later with an unclear error.
 - The S3 builder fails only on settings, such as a missing bucket. Thus its error is also `Error::Option`, and Python shows it as `ConfigError`.
 - A local folder takes no options, so an option for a local folder is an error. A location that is a file, not a folder, is also an error.
-- `open` refuses an S3 endpoint that is not an `http://` or `https://` URL, that has spaces, or that holds a user or a password. It also refuses a key or a token with a control character, such as a newline at the end of a file. These values come from the options or the environment. `object_store` stops with a panic on the first request for the first ones, and it repeats the endpoint in its errors.
+- `open` refuses an S3 endpoint that is not an `http://` or `https://` URL, that has spaces, or that holds a user or a password. It also refuses a key, a token or a region with a control character, such as a newline at the end of a file. These values come from the options or the environment. `object_store` stops with a panic on the first request for the first ones, and it repeats the endpoint in its errors.
 - Only text with `://` is a URL. `C:\data` and `runs:2024/data` parse as URLs, but they are local paths.
 - A URL with `?` or `#`, and an `s3://` URL with a port or a user, give `Error::Option`. These characters can be part of a folder or key name, and the URL parser would drop what follows them, so another dataset would open (D-62). An error message never holds the user, the password, the query or the fragment of a URL, because they can hold keys.
 - `id` is the same for each spelling of one dataset, and different for two datasets. It holds no keys or tokens, so new credentials keep the same cache. It holds the endpoint from the options or the environment, the S3-only endpoint first as in the builder, so two servers with the same bucket name get different caches (D-58).
@@ -856,6 +856,7 @@ pub enum Error { Store(object_store::Error), Scheme(String), Option(String) }
 |---|---|---|
 | `opens_local_folders` | Unit | A path, the path with a separator at the end, and a `file://` URL open the same folder with the same `id` (the canonical path). Another folder has another `id`. |
 | `a_colon_in_a_path_is_not_a_scheme` | Unit | A folder named `runs:2024` opens as a folder (POSIX). |
+| `an_empty_variable_is_unset` | Unit | An empty `AWS_ENDPOINT_URL` is unset, and the location opens. |
 | `refuses_settings_that_would_panic` | Unit | An endpoint with no scheme, a space at the end, no text, another scheme or a password, also from the environment, and a token with a newline each give `Error::Option`, with no secret in the message. |
 | `s3_id_has_the_endpoint_and_no_keys` | Unit | Two secret keys give one `id`, and two endpoints give two. The `id` holds no key. An `endpoint` option wins over an S3-only endpoint from the environment. |
 | `refuses_what_it_cannot_open` | Unit | A missing folder, an unknown scheme, an option for a local folder, and URLs with `?` or `#` each give their error. No error repeats a password or a query. |
@@ -900,7 +901,7 @@ class PlitzerError(Exception); ConfigError, CheckpointError, DataError (PlitzerE
 - `rank` defaults to 0 and `world` to 1. A `world` above 1 with no `rank` gives `ConfigError`: rank 0 on each GPU would train all GPUs on the same lanes with no error.
 - Integer settings, also the epoch of `set_epoch`, come in as Python objects. Each takes an `int` or another object with `__index__`, such as `np.int64` (the stub types them as `SupportsIndex`). A value that is not an integer, such as `4.0` or `True`, or that does not fit, such as `world=-1`, gives `ConfigError`.
 - `resume` and `merge` take `bytes` or `bytearray`.
-- A storage option value is a `str` or a `bool`, which becomes `true` or `false`. Another type gives `ConfigError`.
+- A storage option name is a `str`, and a value is a `str` or a `bool` (also `np.bool_`), which becomes `true` or `false`. Another type gives `ConfigError`.
 - A local path that is not UTF-8 becomes a `file://` URL, which percent-encodes its bytes.
 - If the runtime cannot start its threads, such as at a process limit, `Loader` gives `RuntimeError`. A call from a thread that runs a tokio runtime, such as a callback from another Rust extension, also gives `RuntimeError`, because tokio cannot block that thread.
 

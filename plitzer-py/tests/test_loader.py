@@ -259,6 +259,8 @@ def test_bad_settings(make: MakeLoader, tmp_path: Path) -> None:
         make(cache=blocker / "index")
     with pytest.raises(plitzer.ConfigError):
         make(storage_options={"region": "x"})
+    with pytest.raises(plitzer.ConfigError, match="str name"):
+        make(storage_options={1: "x"})  # type: ignore[dict-item]
     with pytest.raises(plitzer.ConfigError):  # any Mapping, not only a dict
         make(storage_options=types.MappingProxyType({"region": "x"}))
     with pytest.raises(plitzer.ConfigError, match="budget"):
