@@ -16,7 +16,7 @@ class Extras(TypedDict, total=False):
     world: int
     column: str
     cache: str | os.PathLike[str] | None
-    storage_options: dict[str, str] | None
+    storage_options: dict[str, str | bool] | None
 
 
 class Settings(TypedDict):

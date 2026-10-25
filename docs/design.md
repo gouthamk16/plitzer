@@ -871,7 +871,7 @@ class Loader:
     def __init__(self, location: str | os.PathLike[str], *, seed: int, lanes: int, window: int,
                  seq_len: int, docs: int, cap: int, pad: int, budget: int, rank: int | None = None, world: int | None = None,
                  column: str = "tokens", cache: str | os.PathLike[str] | None = None,
-                 storage_options: dict[str, str] | None = None) -> None: ...
+                 storage_options: dict[str, str | bool] | None = None) -> None: ...
     def __iter__(self) -> Loader: ...           # the rest of the current epoch
     def __next__(self) -> Batch: ...
     def set_epoch(self, epoch: int) -> None: ...
@@ -898,6 +898,8 @@ class PlitzerError(Exception); ConfigError, CheckpointError, DataError (PlitzerE
 - `rank` defaults to 0 and `world` to 1. A `world` above 1 with no `rank` gives `ConfigError`: rank 0 on each GPU would train all GPUs on the same lanes with no error.
 - Integer settings, also the epoch of `set_epoch`, come in as Python objects. Each takes an `int` or another object with `__index__`, such as `np.int64` (the stub types them as `SupportsIndex`). A value that is not an integer, such as `4.0` or `True`, or that does not fit, such as `world=-1`, gives `ConfigError`.
 - `resume` and `merge` take `bytes` or `bytearray`.
+- A storage option value is a `str` or a `bool`, which becomes `true` or `false`. Another type gives `ConfigError`.
+- A local path that is not UTF-8 becomes a `file://` URL, which percent-encodes its bytes.
 - If the runtime cannot start its threads, such as at a process limit, `Loader` gives `RuntimeError`. A call from a thread that runs a tokio runtime, such as a callback from another Rust extension, also gives `RuntimeError`, because tokio cannot block that thread.
 
 The errors map to Python exceptions as follows:

@@ -12,7 +12,7 @@ use pyo3::pybacked::PyBackedBytes;
 use pyo3::types::{PyBytes, PyRange};
 
 use crate::array::Batch;
-use crate::errors::{ConfigError, checkpoint_error, session_error};
+use crate::errors::{checkpoint_error, session_error};
 use crate::runtime::block_on;
 use crate::settings::{Ints, config, int, locate, placement};
 
@@ -148,7 +148,7 @@ impl Loader {
         world: Option<&Bound<'_, PyAny>>,
         column: String,
         cache: Option<PathBuf>,
-        storage_options: Option<HashMap<String, String>>,
+        storage_options: Option<HashMap<String, Bound<'_, PyAny>>>,
     ) -> PyResult<Self> {
         let ints = Ints {
             seed,
@@ -162,8 +162,6 @@ impl Loader {
         // The settings first: their errors are the simplest to fix.
         let at = placement(rank, world, budget)?;
         let config = config(column, ints)?;
-        let location = (location.to_str())
-            .ok_or_else(|| ConfigError::new_err(format!("{location:?} is not UTF-8")))?;
         let (store, prefix, cache) = locate(location, storage_options, &config.column, cache)?;
         let open = Session::open(store, prefix, &cache, config, at.rank, at.world, at.budget);
         let session = block_on(py, open)?.map_err(session_error)?;

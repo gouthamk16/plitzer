@@ -13,6 +13,7 @@ use pyo3::conversion::FromPyObjectOwned;
 use pyo3::exceptions::PyOverflowError;
 use pyo3::prelude::*;
 use pyo3::types::PyBool;
+use url::Url;
 
 use crate::errors::{ConfigError, store_error};
 
@@ -21,7 +22,9 @@ use crate::errors::{ConfigError, store_error};
 /// negative `world` or `2**200`. An integer is anything with `__index__`,
 /// such as `np.int64`, except a `bool`.
 pub fn int<'py, T: FromPyObjectOwned<'py>>(name: &str, value: &Bound<'py, PyAny>) -> PyResult<T> {
-    if value.is_instance_of::<PyBool>() || !value.hasattr("__index__")? {
+    // Python looks up `__index__` on the type, so the class `np.int64`,
+    // which has it as an attribute, is not an integer.
+    if value.is_instance_of::<PyBool>() || !value.get_type().hasattr("__index__")? {
         let kind = value.get_type().name()?;
         return Err(ConfigError::new_err(format!(
             "{name} must be an int, not {kind}"
@@ -113,14 +116,13 @@ fn pad(value: &Bound<'_, PyAny>) -> PyResult<u32> {
 /// The store and prefix of `location`, and the index cache: `cache`, else
 /// the default.
 pub fn locate(
-    location: &str,
-    storage_options: Option<HashMap<String, String>>,
+    location: PathBuf,
+    storage_options: Option<HashMap<String, Bound<'_, PyAny>>>,
     column: &str,
     cache: Option<PathBuf>,
 ) -> PyResult<(Arc<dyn ObjectStore>, Path, PathBuf)> {
-    let mut options: Vec<_> = storage_options.unwrap_or_default().into_iter().collect();
-    options.sort();
-    let at = plitzer::store::open(location, &options).map_err(store_error)?;
+    let options = options(storage_options.unwrap_or_default())?;
+    let at = plitzer::store::open(&text(location)?, &options).map_err(store_error)?;
     // The dataset's id, not the spelling: `data` from two folders, or
     // `s3://b/p/` and `s3://b/p`, must not share or split an index.
     let cache = match cache {
@@ -132,6 +134,39 @@ pub fn locate(
         })?,
     };
     Ok((at.store, at.prefix, cache))
+}
+
+/// `location` as text for `store::open`. A local path that is not UTF-8
+/// becomes a `file://` URL, which percent-encodes its bytes.
+fn text(location: PathBuf) -> PyResult<String> {
+    if let Some(text) = location.to_str() {
+        return Ok(text.to_owned());
+    }
+    let url = std::path::absolute(&location).ok().map(Url::from_file_path);
+    let url = url.and_then(Result::ok);
+    url.map(String::from)
+        .ok_or_else(|| ConfigError::new_err(format!("{location:?} is not a usable path")))
+}
+
+/// The storage options in a fixed order, each value as text. A `bool`, as
+/// in `allow_http=True`, becomes `true` or `false`.
+fn options(given: HashMap<String, Bound<'_, PyAny>>) -> PyResult<Vec<(String, String)>> {
+    let mut options = Vec::new();
+    for (key, value) in given {
+        let text = match value.extract::<bool>() {
+            Ok(flag) if value.is_instance_of::<PyBool>() => flag.to_string(),
+            _ => value.extract::<String>().map_err(|_| {
+                let kind = value
+                    .get_type()
+                    .name()
+                    .map_or("?".into(), |n| n.to_string());
+                ConfigError::new_err(format!("storage option {key:?} must be a str, not {kind}"))
+            })?,
+        };
+        options.push((key, text));
+    }
+    options.sort();
+    Ok(options)
 }
 
 /// `$PLITZER_CACHE_DIR`, else the user cache folder, then one file per

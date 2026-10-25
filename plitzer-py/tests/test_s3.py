@@ -42,9 +42,9 @@ def upload(dataset: Path) -> str:
 
 def test_s3_matches_local(dataset: Path, tmp_path: Path) -> None:
     assert ENDPOINT is not None
-    options = {
+    options: dict[str, str | bool] = {
         "endpoint": ENDPOINT,
-        "allow_http": "true",
+        "allow_http": True,  # a bool becomes "true"
         "region": "us-east-1",
         "access_key_id": KEY,
         "secret_access_key": SECRET,

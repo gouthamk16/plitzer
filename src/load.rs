@@ -154,16 +154,22 @@ impl Loader {
         // Resumed lanes replay their leftover now, so their row groups for
         // the resume step must be in memory first.
         loader.receive(step).await?;
-        let buffer = &loader.buffer;
-        loader.lanes = lanes
-            .zip(states)
-            .map(|(l, &s)| {
-                let at = |why| format!("lane {l} of epoch {}: {why}", epoch.order().epoch);
-                epoch.lane(l, s, buffer).map_err(at)
-            })
-            .collect::<Result<_, _>>()
-            .map_err(Error::State)?;
+        loader.lanes = loader.resume_lanes(lanes, states)?;
         Ok(loader)
+    }
+
+    /// Each lane from its state, with its leftover replayed from the buffer.
+    fn resume_lanes(&self, lanes: Range<u32>, states: &[LaneState]) -> Result<Vec<Lane>, Error> {
+        let epoch = self.epoch.order().epoch;
+        let lane = |(l, &s): (u32, &LaneState)| {
+            let at = |why| format!("lane {l} of epoch {epoch}: {why}");
+            self.epoch.lane(l, s, &self.buffer).map_err(at)
+        };
+        lanes
+            .zip(states)
+            .map(lane)
+            .collect::<Result<_, _>>()
+            .map_err(Error::State)
     }
 
     /// The next step: one sequence of L tokens for each lane, in lane order,

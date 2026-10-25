@@ -75,7 +75,7 @@ class Loader:
         world: SupportsIndex | None = None,
         column: str = "tokens",
         cache: str | os.PathLike[str] | None = None,
-        storage_options: dict[str, str] | None = None,
+        storage_options: dict[str, str | bool] | None = None,
     ) -> None: ...
     def __iter__(self) -> Loader:
         """The rest of the current epoch, or the next epoch if it has ended."""

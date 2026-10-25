@@ -1330,6 +1330,7 @@ dependencies = [
  "plitzer",
  "pyo3",
  "tokio",
+ "url",
 ]
 
 [[package]]

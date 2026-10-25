@@ -1,6 +1,8 @@
 import gc
 import os
+import shutil
 import signal
+import sys
 import threading
 import time
 import warnings
@@ -141,6 +143,15 @@ def test_no_default_cache_without_a_user_folder(
         plitzer.Loader(str(dataset), **SETTINGS)
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="needs non-UTF-8 names")
+def test_a_path_that_is_not_utf8_opens(dataset: Path, tmp_path: Path) -> None:
+    odd = Path(os.fsdecode(bytes(tmp_path) + b"/caf\xe9"))
+    shutil.copytree(dataset, odd)
+    want = np.from_dlpack(next(plitzer.Loader(dataset, **SETTINGS)).tokens)
+    got = np.from_dlpack(next(plitzer.Loader(odd, **SETTINGS)).tokens)
+    assert np.array_equal(got, want)
+
+
 def test_default_cache_is_made_and_shared(
     dataset: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -226,6 +237,11 @@ def test_bad_settings(make: MakeLoader, tmp_path: Path) -> None:
     with pytest.raises(plitzer.ConfigError, match="docs must be an int, not bool"):
         make(docs=True)
     make().set_epoch(np.int64(1))  # has __index__
+
+    with pytest.raises(plitzer.ConfigError, match="seed must be an int, not type"):
+        make(seed=np.int64)  # type: ignore[arg-type]  # the class, not a value
+    with pytest.raises(plitzer.ConfigError, match="must be a str, not int"):
+        make(storage_options={"region": 1})  # type: ignore[dict-item]
 
     class Broken:
         def __index__(self) -> int:
