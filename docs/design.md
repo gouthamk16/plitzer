@@ -1036,8 +1036,11 @@ class Dataset(IterableDataset[TokenBatch]):
 - `Dataset` makes one `plitzer.Loader`. Its rank and world are the rank and size of `group`, the data-parallel group. If `group` is `None`, they come from the default process group. Without `torch.distributed`, the rank is 0 of 1.
 - `Dataset` gives `ConfigError` if `WORLD_SIZE` is more than 1 but `torch.distributed` is not initialized, and for a process that is not in `group`. In the first case, each rank would read all lanes and train on the same data, with no error.
 - `ahead` is the number of batches that the training loop gets before it trains them. The dataset keeps the checkpoint before each of its last `ahead` batches. `state_dict()` and `part()` give the checkpoint before the first batch that is not trained.
-- At the end of an epoch, the loop trains each batch that it got, so the dataset clears this list. A jump, such as `load_state_dict` or a `set_epoch` that changes the position, also clears it.
-- If the loop closes its iterator before the end of the epoch, the batches that it got but did not train are lost. Thus the dataset goes back to the first of them and gives them again. A resume from `state_dict()` does the same, so the two runs stay equal.
+- At the end of an epoch, the loop trains each batch that it got, so the dataset clears this list. A jump also clears it: `load_state_dict`, a `set_epoch` that changes the position, or a `set_epoch` past the epoch of the first batch that is not trained.
+- If an iterator stops before the end of the epoch, because the loop closes it or because of an error, the batches that it got but did not train are lost. Thus the next iterator first goes back to the first of them and gives them again. A resume from `state_dict()` does the same, so the two runs stay equal.
+- The iterator only sets a flag when it stops. The next iterator does the resume, so no read occurs at teardown, and a read error goes to the caller.
+- Each iterator and each jump gets a new number. An older iterator does not change the list or the flag.
+- `__iter__` and `state_dict()` make sure that the world size of `group` did not change. A `Dataset` made before `init_process_group`, with no `WORLD_SIZE`, would read all lanes on each rank.
 - `__iter__` gives the batches of the loader. `torch.utils.dlpack.from_dlpack` changes each array to a tensor without a copy.
 - `state_dict()` gets the checkpoint part of each rank of `group` with `all_gather_object`. Then `plitzer.merge` makes one global checkpoint. Each rank gets the same bytes. With one rank, there is no gather.
 - `load_state_dict()` makes sure that the state is `{"plitzer": bytes}`, else it gives `CheckpointError`. Then it calls `Loader.resume`. A global checkpoint resumes on each GPU count, so the GPU count can change.
@@ -1073,6 +1076,7 @@ class Dataset(IterableDataset[TokenBatch]):
 | `test_state_dict_resumes` | pytest | A state at step 0, at the middle and after the last step, saved with `torch.save` and read with `torch.load(weights_only=True)`, resumes with the same batches as a run with no stop. |
 | `test_ahead_names_the_first_untrained_batch` | pytest | With `ahead=1`, a state after k + 1 fetched batches resumes at batch k, and the batches are the same as a run with no stop. |
 | `test_ahead_follows_the_loop` | pytest | With `ahead=1`, a `set_epoch` that changes nothing keeps the fetched batch. A closed iterator gives that batch again. At the end of the epoch, the state is the start of the next epoch. |
+| `test_ahead_and_a_new_epoch` | pytest | With `ahead=1`, `set_epoch(1)` after the last batch of epoch 0 gives epoch 1. An older iterator that closes later changes nothing. |
 | `test_bad_settings` | pytest | A negative, `bool` or `float` `ahead`, and `WORLD_SIZE=2` without `torch.distributed`, give `ConfigError`. A `WORLD_SIZE` that is not a count is ignored. |
 | `test_load_state_dict_refuses_bad_states` | pytest | A state with no `plitzer` key, with text, or with damaged bytes gives `CheckpointError`. A group without `torch.distributed` gives `ConfigError`. |
 | `test_state_dict_gathers_all_ranks` | pytest | Two gloo ranks give the same state. Four ranks and one rank resume from it with the batches of a run with no stop. |

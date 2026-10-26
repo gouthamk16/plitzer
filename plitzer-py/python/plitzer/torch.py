@@ -19,6 +19,7 @@ the training loop fetches batches before it trains them, pass ``ahead``:
 the state then names the first batch not yet trained.
 """
 
+import operator
 import os
 from collections import deque
 from collections.abc import Generator, Mapping
@@ -98,24 +99,41 @@ class Dataset(IterableDataset[TokenBatch]):
         self._loader = plitzer.Loader(
             location, rank=rank, world=self._world, **settings
         )
-        # With `ahead`: the checkpoint before each of the last `ahead` batches,
-        # and now. The first is the state of the first batch not trained.
-        self._seen: deque[bytes] = deque(maxlen=ahead + 1)
+        # With `ahead`: (epoch, checkpoint) before each of the last `ahead`
+        # batches, and now. The first is the state of the first batch that
+        # the loop has not trained.
+        self._seen: deque[tuple[int, bytes]] = deque(maxlen=ahead + 1)
+        # Set when an iterator ends early: the loop dropped the batches it
+        # took but did not train, so the next iterator gives them again.
+        self._rewind = False
+        # Bumped by each iterator and each jump: an older iterator then
+        # leaves the bookkeeping alone.
+        self._generation = 0
         self._restart()
 
     def __iter__(self) -> Generator[TokenBatch, None, None]:
         if get_worker_info() is not None:
             raise RuntimeError(_ONE_PROCESS)
+        self._check_world()
+        generation = self._generation = self._generation + 1
+        if self._rewind:
+            self._loader.resume(self._seen[0][1])
+            self._rewind = False
+            self._restart()
+        ended = False
         try:
             for batch in self._loader:
-                if self._ahead:
-                    self._seen.append(self._loader.checkpoint())
+                if self._ahead and generation == self._generation:
+                    self._remember()
                 yield TokenBatch(from_dlpack(batch.tokens), from_dlpack(batch.lengths))
-        except GeneratorExit:
-            self._rewind()
-            raise
-        # At the end of the epoch, the loop trains each batch it took.
-        self._restart()
+            ended = True
+        finally:
+            # No I/O here: this can run at teardown or while an error unwinds.
+            if generation == self._generation:
+                if ended:  # the loop trains each batch it took
+                    self._restart()
+                elif len(self._seen) > 1:
+                    self._rewind = True
 
     def __getstate__(self) -> object:
         # A DataLoader worker made by spawn gets a pickled copy; refuse it as
@@ -126,13 +144,17 @@ class Dataset(IterableDataset[TokenBatch]):
         """Go to the start of ``epoch`` if it is later than the current one."""
         before = self._loader.checkpoint()
         self._loader.set_epoch(epoch)
-        if self._loader.checkpoint() != before:
-            self._restart()
+        moved = self._loader.checkpoint() != before
+        # Past the epoch of the untrained batches, the loop leaves them, also
+        # when the loader already stands there after the last step.
+        if moved or operator.index(epoch) > self._seen[0][0]:
+            self._jump()
 
     def state_dict(self) -> State:
         """The global checkpoint before the first batch not yet trained, the
         same on every rank. A collective over the group: every rank must
         call it."""
+        self._check_world()
         part = self.part()
         if self._world == 1:
             return {"plitzer": plitzer.merge([part])}
@@ -148,13 +170,13 @@ class Dataset(IterableDataset[TokenBatch]):
         if not isinstance(checkpoint, bytes | bytearray):
             raise plitzer.CheckpointError('a plitzer state is {"plitzer": bytes}')
         self._loader.resume(checkpoint)
-        self._restart()
+        self._jump()
 
     def part(self) -> bytes:
         """This rank's part of ``state_dict()``, not a collective.
         ``plitzer.merge`` joins the parts of all ranks, for checkpoint code
         that gathers them itself."""
-        return self._seen[0] if self._ahead else self._loader.checkpoint()
+        return self._seen[0][1] if self._ahead else self._loader.checkpoint()
 
     @property
     def epoch(self) -> int:
@@ -169,15 +191,27 @@ class Dataset(IterableDataset[TokenBatch]):
     def _restart(self) -> None:
         """Forget the batches before now: none of them waits to be trained."""
         self._seen.clear()
-        self._seen.append(self._loader.checkpoint())
+        self._remember()
 
-    def _rewind(self) -> None:
-        """A loop that stops early drops the batches it took but did not
-        train. Give them again, as a resume from ``state_dict()`` does, so
-        the run goes on as a resumed run would."""
-        if len(self._seen) > 1:
-            self._loader.resume(self._seen[0])
-            self._restart()
+    def _remember(self) -> None:
+        self._seen.append((self._loader.epoch, self._loader.checkpoint()))
+
+    def _jump(self) -> None:
+        """After a move to another position: older iterators and their
+        untrained batches no longer count."""
+        self._generation += 1
+        self._rewind = False
+        self._restart()
+
+    def _check_world(self) -> None:
+        # A Dataset made before init_process_group (with no WORLD_SIZE to
+        # tell) took rank 0 of 1, and every rank would read all lanes.
+        if dist.is_available() and dist.is_initialized():
+            if dist.get_world_size(self._group) != self._world:
+                raise plitzer.ConfigError(
+                    "the Dataset was made before torch.distributed was "
+                    "initialized; make it after init_process_group"
+                )
 
 
 def _placement(group: dist.ProcessGroup | None) -> tuple[int, int]:

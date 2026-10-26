@@ -125,6 +125,21 @@ def test_ahead_follows_the_loop(dataset: Path, tmp_path: Path) -> None:
     assert same(tokens(list(fresh)), epochs[1])
 
 
+def test_ahead_and_a_new_epoch(dataset: Path, tmp_path: Path) -> None:
+    """With ahead=1, set_epoch past the epoch of the untrained batch leaves
+    it, also when the loader already stands at that epoch; an older iterator
+    closed later changes nothing."""
+    epochs = reference(dataset, tmp_path)
+    ds = pt.Dataset(dataset, ahead=1, **settings(tmp_path))
+    it = iter(ds)
+    for _ in range(len(epochs[0])):
+        next(it)
+    ds.set_epoch(1)
+    assert same(tokens(list(ds)), epochs[1])
+    it.close()
+    assert ds.epoch == 2
+
+
 def test_bad_settings(
     dataset: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
