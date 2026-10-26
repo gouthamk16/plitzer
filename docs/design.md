@@ -620,9 +620,10 @@ The caller gives `lanes = gpu_lanes(B, world, rank)`. Thus the loader does not k
 
 On a resume, `new` first replays the leftover of each lane, then it makes the plan from the cursor of each lane:
 
-1. Split the leftover of each lane, the stream positions from its `doc` to its cursor, by window. Each part is a chunk: the row groups of the lane slice in that window, and the number of documents that come from them.
+1. Split the leftover of each lane, the stream positions from its `doc` to its cursor, by window. Each part is a chunk: the row groups of these documents, and the number of documents. The walk stops after the window of the last cursor.
 2. For each lane, in stream order: get the permits of the chunk from a semaphore of the budget size, read its row groups, give its documents to `Replay::take`, and release the row groups. The lanes replay at the same time.
 3. Make the plan with each `doc` set to the cursor. The plan holds only the documents that the lanes did not take.
+4. Start the prefetch, and receive the row groups of the first step. Thus a resume succeeds only if the run can go on from there.
 
 The lane copies the tokens of its leftover, so it does not need the row groups of a chunk after the chunk. `new` checks the budget against the larger of the plan peak and the largest chunk before it reads a row group (D-65).
 
@@ -655,7 +656,7 @@ The decoded row group keeps its permits. The loader releases the permits when it
 - The loader has a maximum of 16 reads at the same time. Without this limit, a large budget starts thousands of requests at the start. The index has the same limit for footers.
 - If a read fails, `next` returns the error, and the next calls return `Error::Stopped`. The lanes did not change in the failed step, so `states()` is a correct point to resume from.
 - `next` is cancel safe. The loader keeps the read that it waits for, so a dropped `next` loses no row group (D-44).
-- A resume, and a retry after a failed read, run with each budget that a run with no stop accepts. The plan from the cursor holds a subset of the ranges of that run. A chunk is the row groups of one lane slice in one window, and that run holds all of them at the steps where the lane takes from that window (D-65).
+- A resume, and a retry after a failed read, run with each budget that a run with no stop accepts. The plan from the cursor holds a subset of the ranges of that run. The row groups of a chunk are in one lane slice of one window, and that run holds all of the slice at the steps where the lane takes from that window (D-65).
 - The replay reads are tasks, so their decode runs on the worker threads of the runtime, also when Python waits with `block_on`. `new` holds them in `Abort`, so a dropped `new`, such as from a dropped `Session::resume`, stops them.
 - `Replay::take` stops with an error when the tokens after the first document of the leftover are more than C. The offset of the state is in that first document, so the state can never fit. Thus a state far behind its cursor stops after some documents, before its leftover fills the memory.
 
@@ -678,6 +679,7 @@ The decoded row group keeps its permits. The loader releases the permits when it
 | `resume_needs_no_more_than_a_fresh_run` | Unit | For two seeds and world 1 and 2, a resume at each step with the peak budget of a run with no stop gives the same batches as that run. |
 | `budget_counts_the_replay` | Unit | At a flush step with a leftover, the plan is empty, but a budget below a chunk gives `Error::Budget` and does not wait. |
 | `evicts_everything` | Unit | After the last step, no row group is in memory. |
+| `new_reads_the_first_step` | Unit | A corrupt row group of step 0 gives `Error::Read` from `new`, with no leftover to replay. |
 | `failed_read_stops_the_loader` | Unit | A corrupt chunk gives `Error::Read` one time and then `Error::Stopped`. The lane states stay at the step before the failure. |
 | `prefetches_ahead` | Unit | With a large budget, the loader reads all row groups before `next` needs them. |
 | `reads_only_own_row_groups` | Unit | The plans of all ranks cover all row groups. Ranks share only the row groups at the edges of their slices. |

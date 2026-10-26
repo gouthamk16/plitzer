@@ -10,7 +10,7 @@ use futures::future::try_join_all;
 use tokio::sync::Semaphore;
 
 use super::plan::Chunk;
-use super::{Abort, CONCURRENT_READS, Error};
+use super::{Abort, CONCURRENT_READS, Error, permits};
 use crate::index::Index;
 use crate::order::Doc;
 use crate::pack::{Epoch, Lane, LaneState, Replay, Tokens};
@@ -47,11 +47,8 @@ pub(super) async fn lanes(
     budget_kib: u64,
 ) -> Result<Vec<Lane>, Error> {
     let number = epoch.order().epoch;
-    let names: Vec<String> = (lanes.clone())
-        .map(|l| format!("lane {l} of epoch {number}"))
-        .collect();
-    let mut replays = (lanes.zip(states).zip(&names))
-        .map(|((l, &s), name)| epoch.replay(l, s).map_err(|why| state(name, why)))
+    let mut replays = (lanes.clone().zip(states))
+        .map(|(l, &s)| epoch.replay(l, s).map_err(|why| state(l, number, why)))
         .collect::<Result<Vec<_>, _>>()?;
     let mut by_lane: Vec<Vec<Chunk>> = replays.iter().map(|_| Vec::new()).collect();
     for chunk in chunks {
@@ -63,26 +60,26 @@ pub(super) async fn lanes(
         budget: Semaphore::new(budget_kib as usize),
         slots: Arc::new(Semaphore::new(CONCURRENT_READS)),
     };
-    let replay = (replays.iter_mut().zip(by_lane).zip(&names))
-        .map(|((lane, chunks), name)| replay(lane, name, chunks, &shared));
+    let replay = (replays.iter_mut().zip(lanes.clone()).zip(by_lane))
+        .map(|((lane, l), chunks)| replay(lane, (l, number), chunks, &shared));
     try_join_all(replay).await?;
-    (replays.into_iter().zip(&names))
-        .map(|(r, name)| r.finish().map_err(|why| state(name, why)))
+    (replays.into_iter().zip(lanes))
+        .map(|(r, l)| r.finish().map_err(|why| state(l, number, why)))
         .collect()
 }
 
-/// Replays `chunks`, in order, into `lane`. Each chunk holds its row groups'
-/// KiB of the budget until its documents are taken. The reads are tasks, so
-/// their decode runs on the runtime's workers, and `Abort` stops them if
-/// the replay is dropped.
+/// Replays `chunks`, in order, into `lane`, which is lane `at.0` of epoch
+/// `at.1`. Each chunk holds its row groups' KiB of the budget until its
+/// documents are taken. The reads are tasks, so their decode runs on the
+/// runtime's workers, and `Abort` stops them if the replay is dropped.
 async fn replay(
     lane: &mut Replay,
-    name: &str,
+    at: (u32, u64),
     chunks: Vec<Chunk>,
     shared: &Shared,
 ) -> Result<(), Error> {
     for chunk in chunks {
-        let _permit = shared.budget.acquire_many(chunk.kib as u32).await;
+        let _permit = shared.budget.acquire_many(permits(chunk.kib)).await;
         let mut reads = Vec::new();
         for &g in &chunk.groups {
             let slot = shared.slots.clone().acquire_owned().await;
@@ -102,12 +99,12 @@ async fn replay(
             part.insert(g, tokens);
         }
         let take = lane.take(&Part(part), chunk.docs);
-        take.map_err(|why| state(name, why))?;
+        take.map_err(|why| state(at.0, at.1, why))?;
     }
     Ok(())
 }
 
-/// A state that no run makes, named by its lane.
-fn state(name: &str, why: String) -> Error {
-    Error::State(format!("{name}: {why}"))
+/// A state that no run makes, named by its lane and epoch.
+fn state(lane: u32, epoch: u64, why: String) -> Error {
+    Error::State(format!("lane {lane} of epoch {epoch}: {why}"))
 }

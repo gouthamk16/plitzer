@@ -127,8 +127,8 @@ pub(super) fn cursors(
         .collect()
 }
 
-/// One lane's row groups of one window, and how many of the documents of
-/// its leftover come from them.
+/// The row groups of one lane's leftover documents in one window, and how
+/// many documents those are.
 #[derive(Debug)]
 pub(super) struct Chunk {
     /// The lane's index in the GPU's lanes.
@@ -139,9 +139,10 @@ pub(super) struct Chunk {
 }
 
 /// The parts of each lane's leftover, the stream positions from its state's
-/// `doc` to `cursors`, split by window, in stream order. A fresh run holds
-/// all of a lane's row groups of a window at once while it takes from them,
-/// so no chunk needs more budget than that run.
+/// `doc` to `cursors`, split by window, in stream order. Each chunk holds
+/// only the row groups of its own documents. A fresh run holds all of a
+/// lane's row groups of a window at once while it takes from them, so no
+/// chunk needs more budget than that run.
 pub(super) fn chunks(
     epoch: &Epoch,
     index: &Index,
@@ -153,21 +154,30 @@ pub(super) fn chunks(
     let mut starts = vec![0u64; lanes.len()];
     let mut chunks = Vec::new();
     for w in epoch.windows() {
-        for (i, groups) in order.lane_groups(w, lanes.clone()).into_iter().enumerate() {
+        // Every leftover ends at its cursor; later windows hold none.
+        if starts.iter().zip(cursors).all(|(s, c)| s >= c) {
+            break;
+        }
+        for (i, lane) in lanes.clone().enumerate() {
             let start = starts[i];
-            let end = start + order.lane_len(w, lanes.start + i as u32);
+            let end = start + order.lane_len(w, lane);
             starts[i] = end;
             let (lo, hi) = (start.max(states[i].doc), end.min(cursors[i]));
-            if lo < hi {
-                let groups = w.groups()[groups].to_vec();
-                let kib = groups.iter().map(|&g| kib(index, g)).sum();
-                chunks.push(Chunk {
-                    lane: i,
-                    groups,
-                    docs: hi - lo,
-                    kib,
-                });
+            if lo >= hi {
+                continue;
             }
+            let docs = &order.lane(w, lane)[(lo - start) as usize..(hi - start) as usize];
+            let mut groups: Vec<u32> = docs.iter().map(|d| d.row_group).collect();
+            groups.sort_unstable();
+            groups.dedup();
+            let kib = groups.iter().map(|&g| kib(index, g)).sum();
+            let docs = hi - lo;
+            chunks.push(Chunk {
+                lane: i,
+                groups,
+                docs,
+                kib,
+            });
         }
     }
     chunks

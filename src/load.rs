@@ -146,7 +146,7 @@ impl Loader {
         let lanes = lanes.await?;
         let held = Arc::new(AtomicUsize::new(0));
         let (arrivals, driver) = prefetch(&needs, reader, index, budget_kib, held.clone());
-        Ok(Loader {
+        let mut loader = Loader {
             epoch,
             lanes,
             evict: evictions(&needs),
@@ -158,7 +158,11 @@ impl Loader {
             held,
             stopped: false,
             _driver: driver,
-        })
+        };
+        // The first step's row groups are read now, so a resume succeeds
+        // only if the run can go on from there.
+        loader.receive(step).await?;
+        Ok(loader)
     }
 
     /// The next step: one sequence of L tokens for each lane, in lane order,
@@ -232,6 +236,12 @@ impl Loader {
     }
 }
 
+/// `kib` as semaphore permits, which tokio counts in `u32`. Only a row group
+/// or chunk past 4 TiB saturates, and then takes all `u32::MAX` permits.
+fn permits(kib: u64) -> u32 {
+    u32::try_from(kib).unwrap_or(u32::MAX)
+}
+
 /// The row groups to evict after each step: those whose last step it is.
 fn evictions(needs: &[Need]) -> BTreeMap<u64, Vec<u32>> {
     let mut evict: BTreeMap<u64, Vec<u32>> = BTreeMap::new();
@@ -255,7 +265,10 @@ fn prefetch(
     let (tx, rx) = unbounded_channel();
     let semaphore = Arc::new(Semaphore::new(budget_kib as usize));
     let slots = Arc::new(Semaphore::new(CONCURRENT_READS));
-    let needs: Vec<(u32, u32)> = needs.iter().map(|n| (n.row_group, n.kib as u32)).collect();
+    let needs: Vec<(u32, u32)> = needs
+        .iter()
+        .map(|n| (n.row_group, permits(n.kib)))
+        .collect();
     let driver = tokio::spawn(async move {
         for (row_group, kib) in needs {
             let Ok(permit) = semaphore.clone().acquire_many_owned(kib).await else {

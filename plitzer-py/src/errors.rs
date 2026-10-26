@@ -15,7 +15,7 @@ create_exception!(
     plitzer,
     ConfigError,
     PlitzerError,
-    "A setting that cannot work, such as a world that does not divide lanes or a budget below one step."
+    "A setting that cannot work, such as a world that does not divide lanes or a budget below what the lanes need at once."
 );
 create_exception!(
     plitzer,
