@@ -14,6 +14,11 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 
+[project.optional-dependencies]
+# plitzer.torch: an IterableDataset with state_dict() and load_state_dict().
+# 2.5: the first torch whose torch.load(weights_only=True) reads bytes.
+torch = ["torch>=2.5"]
+
 [project.urls]
 Repository = "https://github.com/gouthamk16/plitzer"
 
