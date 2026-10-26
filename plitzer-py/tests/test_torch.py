@@ -103,6 +103,28 @@ def test_ahead_names_the_first_untrained_batch(dataset: Path, tmp_path: Path) ->
     assert same(tokens(fetched[:k]) + tokens(list(again)), want)
 
 
+def test_ahead_follows_the_loop(dataset: Path, tmp_path: Path) -> None:
+    """With ahead=1: a set_epoch that changes nothing keeps the fetched batch
+    untrained; a loop that stops early gets it again, as a resumed run does;
+    at the end of the epoch every batch is trained."""
+    epochs = reference(dataset, tmp_path)
+    want = epochs[0]
+    k = len(want) // 2
+    ds = pt.Dataset(dataset, ahead=1, **settings(tmp_path))
+    it = iter(ds)
+    fetched = [next(it) for _ in range(k + 1)]
+    ds.set_epoch(0)
+    state = ds.state_dict()
+    it.close()  # the loop stops; batch k was fetched but not trained
+    assert ds.state_dict() == state
+    rest = list(ds)
+    assert same(tokens(fetched[:k]) + tokens(rest), want)
+    # The epoch ended: its state is the start of the next epoch.
+    fresh = pt.Dataset(dataset, **settings(tmp_path))
+    fresh.load_state_dict(ds.state_dict())
+    assert same(tokens(list(fresh)), epochs[1])
+
+
 def test_bad_settings(
     dataset: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -113,6 +135,8 @@ def test_bad_settings(
     monkeypatch.setenv("WORLD_SIZE", "2")
     with pytest.raises(plitzer.ConfigError, match="init_process_group"):
         pt.Dataset(dataset, **settings(tmp_path))
+    monkeypatch.setenv("WORLD_SIZE", "auto")  # not a count: one process
+    pt.Dataset(dataset, **settings(tmp_path))
 
 
 def test_load_state_dict_refuses_bad_states(dataset: Path, tmp_path: Path) -> None:
