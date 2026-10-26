@@ -1,3 +1,4 @@
+import importlib.util
 import os
 from collections.abc import Mapping
 from pathlib import Path
@@ -8,6 +9,10 @@ import pyarrow.parquet as pq
 import pytest
 
 import plitzer
+
+# torch is an optional extra. Its module is found without an import, which
+# is slow and, for a CUDA wheel with no CUDA libraries, fails.
+collect_ignore = [] if importlib.util.find_spec("torch") else ["test_torch.py"]
 
 
 class Extras(TypedDict, total=False):
