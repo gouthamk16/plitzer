@@ -84,8 +84,11 @@ def test_state_dict_resumes(dataset: Path, tmp_path: Path) -> None:
         state = torch.load(path, weights_only=True)
         again = pt.Dataset(dataset, **settings(tmp_path))
         again.load_state_dict(state)
-        # A state after the last step is at the start of the next epoch.
+        # The rest of the epoch; a state after the last step is at the start
+        # of the next epoch, so it resumes into all of epoch 1.
         tail = tokens(list(again))
+        n = len(want[0])
+        assert len(tail) == (n - k if k < n else len(want[1])), k
         assert same(head + tail, flat[: len(head) + len(tail)]), k
 
 
