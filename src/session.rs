@@ -11,7 +11,7 @@ use crate::checkpoint::{self, Checkpoint, Config};
 use crate::index::{self, Index};
 use crate::load::{self, Loader};
 use crate::order::{Order, gpu_lanes};
-use crate::pack::{Epoch, LaneState};
+use crate::pack::{Epoch, LaneState, at_lane};
 use crate::read::{self, Reader};
 
 #[derive(Debug)]
@@ -211,9 +211,8 @@ impl Session {
     fn in_range(&self, plan: &Epoch, states: &[LaneState]) -> Result<(), checkpoint::Error> {
         let epoch = plan.order().epoch;
         for (lane, &state) in self.lanes.clone().zip(states) {
-            let at = |why| format!("lane {lane} of epoch {epoch}: {why}");
             plan.check(lane, state)
-                .map_err(|why| checkpoint::Error::Range(at(why)))?;
+                .map_err(|why| checkpoint::Error::Range(at_lane(lane, epoch, &why)))?;
         }
         Ok(())
     }

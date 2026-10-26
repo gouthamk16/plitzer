@@ -133,17 +133,14 @@ impl Loader {
             states.iter().all(|s| s.step == step),
             "lane states from one step"
         );
-        let (needs, chunks) =
-            resume(&epoch, &index, lanes.clone(), states).map_err(Error::State)?;
-        let largest = chunks.iter().map(|c| c.kib).max().unwrap_or(0);
-        let (budget_kib, needed) = (budget / 1024, peak(&needs).max(largest));
+        let needs = resume(&epoch, &index, lanes.clone(), states).map_err(Error::State)?;
+        let (budget_kib, needed) = (budget / 1024, peak(&needs));
         if needed > budget_kib {
             let needed = needed * 1024;
             return Err(Error::Budget { needed, budget });
         }
         let (r, i) = (reader.clone(), index.clone());
-        let lanes = replay::lanes(&epoch, r, i, lanes, states, chunks, budget_kib);
-        let lanes = lanes.await?;
+        let lanes = replay::lanes(&epoch, r, i, lanes, states, budget).await?;
         let held = Arc::new(AtomicUsize::new(0));
         let (arrivals, driver) = prefetch(&needs, reader, index, budget_kib, held.clone());
         let mut loader = Loader {

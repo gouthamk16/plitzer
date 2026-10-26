@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use super::{Epoch, Lane, LaneState, Leftover, Stream, Tokens};
+use super::{Doc, Epoch, Lane, LaneState, Leftover, Stream, Tokens};
 
 /// A lane whose leftover is not yet replayed: the documents from the state's
 /// `doc` to the cursor, taken in order by calls of `take`.
@@ -32,6 +32,14 @@ impl Epoch {
 }
 
 impl Replay {
+    /// The documents of the leftover still to take that are in one window:
+    /// the next part to give `take`. Empty once the leftover is taken.
+    pub fn part(&mut self) -> &[Doc] {
+        let lane = &mut self.lane;
+        let rest = lane.stream.rest(&lane.epoch, lane.lane);
+        &rest[..rest.len().min(self.left as usize)]
+    }
+
     /// Takes the next `n` documents of the leftover, or as many as are left.
     /// The state's offset lies in the first document, so once the tokens
     /// after it are more than the cap, the state can never fit: that is an
@@ -42,6 +50,12 @@ impl Replay {
             self.lane.take(tokens, 1);
             self.left -= 1;
             let leftover = &self.lane.leftover;
+            // An empty first document is skipped at once: the state cannot
+            // start there, and `finish` would say so after the whole replay.
+            if leftover.doc != self.state.doc {
+                let why = "does not start on a document with tokens left";
+                return Err(format!("state {:?} {why}", self.state));
+            }
             let first = leftover.lens.front().copied().unwrap_or(0) as usize;
             if leftover.tokens.len() - first > cap {
                 return Err(format!("state {:?} leaves more than the cap", self.state));

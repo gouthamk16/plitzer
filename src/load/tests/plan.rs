@@ -28,8 +28,8 @@ async fn reads_only_own_row_groups() {
 }
 
 // Every document a lane takes at step s is in a row group whose planned
-// range holds that step. On resume at step k, the plan starts at the cursor,
-// and each replayed document is in one of its lane's chunks.
+// range holds that step, also after a resume at step k, where the plan
+// starts at the cursor.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn plan_matches_lane_streams() {
     for seed in [13, 14] {
@@ -53,30 +53,17 @@ async fn plan_matches_lane_streams() {
                 let cursors = cursors(&d.epoch, range.clone(), own).unwrap();
                 let ahead = at_cursors(own, &cursors);
                 let needs = plan(&d.epoch, &d.index, range.clone(), &ahead);
-                let chunks = chunks(&d.epoch, &d.index, range.clone(), own, &cursors);
-                assert!(!chunks.is_empty(), "some lane has a leftover to replay");
+                let leftover = own.iter().zip(&cursors).any(|(s, &c)| s.doc < c);
+                assert!(leftover, "some lane has a leftover to replay");
                 let at = |step: u64, rg: u32| {
                     needs
                         .iter()
                         .any(|n| n.row_group == rg && n.first <= step && step <= n.last)
                 };
+                let mut lanes: Vec<Lane> = (range.zip(own))
+                    .map(|(l, &s)| d.epoch.lane(l, s, &all).unwrap())
+                    .collect();
                 all.log.borrow_mut().clear();
-                let mut lanes = Vec::new();
-                for (i, (l, &s)) in range.zip(own).enumerate() {
-                    lanes.push(d.epoch.lane(l, s, &all).unwrap());
-                    // In stream order: the first chunk's documents come first.
-                    let mut log = all.log.take().into_iter();
-                    for chunk in chunks.iter().filter(|c| c.lane == i) {
-                        for _ in 0..chunk.docs {
-                            let rg = log.next().expect("a document for each in the chunk");
-                            assert!(
-                                chunk.groups.contains(&rg),
-                                "lane {l}: replayed row group {rg} not in its chunk"
-                            );
-                        }
-                    }
-                    assert!(log.next().is_none(), "lane {l}: chunks cover the leftover");
-                }
                 for step in k..d.epoch.steps() {
                     for l in &mut lanes {
                         l.fill(&all, &mut seq);

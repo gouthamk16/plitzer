@@ -57,8 +57,8 @@ async fn resume_needs_no_more_than_a_fresh_run() {
 }
 
 // In a flush step the plan from the cursor is empty, but the leftover still
-// needs its chunks. A budget below a chunk is refused, never a replay that
-// waits for more permits than the budget has.
+// needs its row groups. A budget below a part of the replay is refused,
+// never a replay that waits for more permits than the budget has.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn budget_counts_the_replay() {
     let d = data(5).await;
@@ -66,8 +66,10 @@ async fn budget_counts_the_replay() {
     let (_, mut states) = run(&d, 1, &fresh, 0, PLENTY).await;
     let mut steps = 0;
     let found = loop {
-        let (needs, chunks) = resume(&d.epoch, &d.index, 0..LANES, &states).unwrap();
-        if needs.is_empty() && !chunks.is_empty() {
+        let needs = resume(&d.epoch, &d.index, 0..LANES, &states).unwrap();
+        let cursors = cursors(&d.epoch, 0..LANES, &states).unwrap();
+        let leftover = states.iter().zip(&cursors).any(|(s, &c)| s.doc < c);
+        if needs.is_empty() && leftover {
             break states;
         }
         steps += 1;

@@ -1,22 +1,23 @@
-//! Resumed lanes: each lane's leftover is replayed one chunk at a time,
-//! within the budget, before the prefetch starts. A lane copies the tokens
-//! it takes, so each chunk's row groups are freed as soon as it is replayed.
+//! Resumed lanes: each lane's leftover is replayed one part at a time,
+//! within the budget, before the prefetch starts. A part is the leftover's
+//! documents in one window. A lane copies the tokens it takes, so a part's
+//! row groups are freed as soon as it is replayed.
 
 use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
 
 use futures::future::try_join_all;
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, SemaphorePermit};
 
-use super::plan::Chunk;
+use super::plan::kib;
 use super::{Abort, CONCURRENT_READS, Error, permits};
 use crate::index::Index;
 use crate::order::Doc;
-use crate::pack::{Epoch, Lane, LaneState, Replay, Tokens};
+use crate::pack::{Epoch, Lane, LaneState, Replay, Tokens, at_lane};
 use crate::read::{Reader, RowGroupTokens};
 
-/// The row groups of one chunk.
+/// The row groups of one part.
 struct Part(HashMap<u32, RowGroupTokens>);
 
 impl Tokens for Part {
@@ -25,86 +26,102 @@ impl Tokens for Part {
     }
 }
 
-/// What every lane's replay shares: the reader, the budget in KiB and the
-/// read slots.
+/// What every lane's replay shares: the reader, the budget and the read
+/// slots.
 struct Shared {
     reader: Arc<Reader>,
     index: Arc<Index>,
-    budget: Semaphore,
+    budget: u64,
+    permits: Semaphore,
     slots: Arc<Semaphore>,
 }
 
-/// Lanes `lanes`, each rebuilt from its state in `states` with the leftover
-/// replayed from `chunks`. The chunks of all lanes together hold at most
-/// `budget_kib` at once; lanes replay at the same time, each in stream order.
+/// Lanes `lanes`, each rebuilt from its state in `states` with its leftover
+/// replayed. The parts of all lanes together hold at most `budget` bytes at
+/// once; lanes replay at the same time, each in stream order.
+///
+/// A part is in one lane slice of one window, and a run with no stop holds
+/// that whole slice while the lane takes from it, so each part fits any
+/// budget that run accepts. A larger part gives `Error::Budget`.
 pub(super) async fn lanes(
     epoch: &Arc<Epoch>,
     reader: Arc<Reader>,
     index: Arc<Index>,
     lanes: Range<u32>,
     states: &[LaneState],
-    chunks: Vec<Chunk>,
-    budget_kib: u64,
+    budget: u64,
 ) -> Result<Vec<Lane>, Error> {
     let number = epoch.order().epoch;
+    let state = |l: u32| move |why: String| Error::State(at_lane(l, number, &why));
     let mut replays = (lanes.clone().zip(states))
-        .map(|(l, &s)| epoch.replay(l, s).map_err(|why| state(l, number, why)))
+        .map(|(l, &s)| epoch.replay(l, s).map_err(state(l)))
         .collect::<Result<Vec<_>, _>>()?;
-    let mut by_lane: Vec<Vec<Chunk>> = replays.iter().map(|_| Vec::new()).collect();
-    for chunk in chunks {
-        by_lane[chunk.lane].push(chunk);
-    }
     let shared = Shared {
         reader,
         index,
-        budget: Semaphore::new(budget_kib as usize),
+        budget,
+        permits: Semaphore::new((budget / 1024) as usize),
         slots: Arc::new(Semaphore::new(CONCURRENT_READS)),
     };
-    let replay = (replays.iter_mut().zip(lanes.clone()).zip(by_lane))
-        .map(|((lane, l), chunks)| replay(lane, (l, number), chunks, &shared));
+    let replay = (replays.iter_mut().zip(lanes.clone()))
+        .map(|(lane, l)| replay_lane(lane, l, number, &shared));
     try_join_all(replay).await?;
     (replays.into_iter().zip(lanes))
-        .map(|(r, l)| r.finish().map_err(|why| state(l, number, why)))
+        .map(|(r, l)| r.finish().map_err(state(l)))
         .collect()
 }
 
-/// Replays `chunks`, in order, into `lane`, which is lane `at.0` of epoch
-/// `at.1`. Each chunk holds its row groups' KiB of the budget until its
-/// documents are taken. The reads are tasks, so their decode runs on the
-/// runtime's workers, and `Abort` stops them if the replay is dropped.
-async fn replay(
-    lane: &mut Replay,
-    at: (u32, u64),
-    chunks: Vec<Chunk>,
-    shared: &Shared,
-) -> Result<(), Error> {
-    for chunk in chunks {
-        let _permit = shared.budget.acquire_many(permits(chunk.kib)).await;
-        let mut reads = Vec::new();
-        for &g in &chunk.groups {
-            let slot = shared.slots.clone().acquire_owned().await;
-            let (reader, index) = (shared.reader.clone(), shared.index.clone());
-            reads.push(Abort(tokio::spawn(async move {
-                let tokens = reader.read(&index, g).await;
-                drop(slot);
-                tokens.map(|tokens| (g, tokens))
-            })));
+/// Replays `lane`, lane `l` of epoch `number`, part by part. Each part holds
+/// its row groups' KiB of the budget until its documents are taken. The
+/// reads are tasks, so their decode runs on the runtime's workers, and
+/// `Abort` stops them if the replay is dropped.
+async fn replay_lane(lane: &mut Replay, l: u32, number: u64, shared: &Shared) -> Result<(), Error> {
+    loop {
+        let docs = lane.part();
+        if docs.is_empty() {
+            return Ok(());
         }
-        let mut part = HashMap::new();
-        for mut read in reads {
-            let (g, tokens) = (&mut read.0)
-                .await
-                .map_err(Error::Join)?
-                .map_err(Error::Read)?;
-            part.insert(g, tokens);
-        }
-        let take = lane.take(&Part(part), chunk.docs);
-        take.map_err(|why| state(at.0, at.1, why))?;
+        let n = docs.len() as u64;
+        let mut groups: Vec<u32> = docs.iter().map(|d| d.row_group).collect();
+        groups.sort_unstable();
+        groups.dedup();
+        // The permits live until the part's tokens are taken and dropped.
+        let (tokens, _held) = read(&groups, shared).await?;
+        let take = lane.take(&tokens, n);
+        take.map_err(|why| Error::State(at_lane(l, number, &why)))?;
     }
-    Ok(())
 }
 
-/// A state that no run makes, named by its lane and epoch.
-fn state(lane: u32, epoch: u64, why: String) -> Error {
-    Error::State(format!("lane {lane} of epoch {epoch}: {why}"))
+/// Row groups `groups`, read at once, and the permits of the budget that
+/// they take.
+async fn read<'a>(
+    groups: &[u32],
+    shared: &'a Shared,
+) -> Result<(Part, SemaphorePermit<'a>), Error> {
+    let kib: u64 = groups.iter().map(|&g| kib(&shared.index, g)).sum();
+    if kib > shared.budget / 1024 {
+        let (needed, budget) = (kib * 1024, shared.budget);
+        return Err(Error::Budget { needed, budget });
+    }
+    let held = shared.permits.acquire_many(permits(kib)).await;
+    let held = held.expect("the replay never closes its budget");
+    let mut reads = Vec::new();
+    for &g in groups {
+        let slot = shared.slots.clone().acquire_owned().await;
+        let (reader, index) = (shared.reader.clone(), shared.index.clone());
+        reads.push(Abort(tokio::spawn(async move {
+            let tokens = reader.read(&index, g).await;
+            drop(slot);
+            tokens.map(|tokens| (g, tokens))
+        })));
+    }
+    let mut part = HashMap::new();
+    for mut read in reads {
+        let (g, tokens) = (&mut read.0)
+            .await
+            .map_err(Error::Join)?
+            .map_err(Error::Read)?;
+        part.insert(g, tokens);
+    }
+    Ok((Part(part), held))
 }

@@ -70,10 +70,16 @@ async fn resume_is_cancel_safe() {
     for _ in 0..5 {
         two.next(&mut seq).await.unwrap();
     }
-    let elsewhere = two.checkpoint();
-    // Its reads take 20 ms, so one poll never finishes the resume.
-    assert!(one.resume(&elsewhere).now_or_never().is_none());
-    assert_eq!(one.checkpoint(), before);
+    let leftovers = two.checkpoint();
+    // And one with none, where the resume reads only the first step.
+    let mut start = before.clone();
+    start.epoch = 1;
+    start.lanes.fill(LaneState::default());
+    for elsewhere in [leftovers, start] {
+        // Its reads take 20 ms, so one poll never finishes the resume.
+        assert!(one.resume(&elsewhere).now_or_never().is_none());
+        assert_eq!(one.checkpoint(), before);
+    }
     while got.len() < want.len() {
         got.push(one.next(&mut seq).await.unwrap().map(|_| seq.clone()));
     }
