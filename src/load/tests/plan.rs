@@ -27,8 +27,9 @@ async fn reads_only_own_row_groups() {
     }
 }
 
-// Every document a lane takes at step s, or replays on resume at step k, is
-// in a row group whose planned range holds that step.
+// Every document a lane takes at step s is in a row group whose planned
+// range holds that step. On resume at step k, the plan starts at the cursor,
+// and each replayed document is in one of its lane's chunks.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn plan_matches_lane_streams() {
     for seed in [13, 14] {
@@ -49,19 +50,41 @@ async fn plan_matches_lane_streams() {
             for rank in 0..world {
                 let range = gpu_lanes(LANES, world, rank);
                 let own = &states[range.start as usize..range.end as usize];
-                let needs = plan(&d.epoch, &d.index, range.clone(), own);
+                let cursors: Vec<u64> = (range.clone().zip(own))
+                    .map(|(l, &s)| d.epoch.check(l, s).unwrap())
+                    .collect();
+                let ahead: Vec<LaneState> = (own.iter().zip(&cursors))
+                    .map(|(s, &doc)| LaneState {
+                        doc,
+                        offset: 0,
+                        ..*s
+                    })
+                    .collect();
+                let needs = plan(&d.epoch, &d.index, range.clone(), &ahead);
+                let chunks = chunks(&d.epoch, &d.index, range.clone(), own, &cursors);
+                assert!(!chunks.is_empty(), "some lane has a leftover to replay");
                 let at = |step: u64, rg: u32| {
                     needs
                         .iter()
                         .any(|n| n.row_group == rg && n.first <= step && step <= n.last)
                 };
                 all.log.borrow_mut().clear();
-                let mut lanes: Vec<Lane> = range
-                    .zip(own)
-                    .map(|(l, &s)| d.epoch.lane(l, s, &all).unwrap())
-                    .collect();
-                for rg in all.log.take() {
-                    assert!(at(k, rg), "replayed row group {rg} not planned at step {k}");
+                let mut lanes = Vec::new();
+                for (i, (l, &s)) in range.zip(own).enumerate() {
+                    lanes.push(d.epoch.lane(l, s, &all).unwrap());
+                    let mut replayed = chunks.iter().filter(|c| c.lane == i);
+                    for rg in all.log.take() {
+                        assert!(
+                            replayed.clone().any(|c| c.groups.contains(&rg)),
+                            "replayed row group {rg} of lane {l} in no chunk"
+                        );
+                    }
+                    let docs: u64 = replayed.by_ref().map(|c| c.docs).sum();
+                    assert_eq!(
+                        docs,
+                        cursors[i] - s.doc,
+                        "lane {l}: chunks cover the leftover"
+                    );
                 }
                 for step in k..d.epoch.steps() {
                     for l in &mut lanes {

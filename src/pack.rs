@@ -3,8 +3,10 @@ use std::sync::Arc;
 use crate::order::{Doc, Order, Window};
 
 mod leftover;
+mod replay;
 
 use leftover::Leftover;
+pub use replay::Replay;
 
 /// Where a lane gets each document's tokens. The packer adds no separators,
 /// so a source that wants EOS between documents includes it in the tokens.
@@ -110,17 +112,9 @@ impl Epoch {
         state: LaneState,
         tokens: &impl Tokens,
     ) -> Result<Lane, String> {
-        let cursor = self.check(lane, state)?;
-        let mut l = Lane {
-            epoch: self.clone(),
-            lane,
-            step: state.step,
-            stream: Stream::seek(self, lane, state.doc),
-            leftover: Leftover::new(state.doc),
-        };
-        l.take(tokens, cursor - state.doc);
-        l.start_at(state)?;
-        Ok(l)
+        let mut replay = self.replay(lane, state)?;
+        replay.take(tokens, u64::MAX);
+        replay.finish()
     }
 
     /// The documents lane `lane` takes in the whole epoch.

@@ -122,10 +122,10 @@ flowchart LR
 | Shuffle | `src/shuffle.rs` | Implemented | [5.1](#51-shuffle) |
 | Seed key | `src/seed.rs` | Implemented | [5.2](#52-seed-key) |
 | Order | `src/order.rs` | Implemented | [5.3](#53-order) |
-| Pack | `src/pack.rs` | Implemented | [5.4](#54-pack) |
+| Pack | `src/pack.rs`, `src/pack/replay.rs` | Implemented | [5.4](#54-pack) |
 | Index | `src/index.rs` | Implemented | [5.5](#55-index) |
 | Read | `src/read.rs` | Implemented | [5.6](#56-read) |
-| Loader | `src/load.rs` | Implemented | [5.7](#57-loader) |
+| Loader | `src/load.rs`, `src/load/plan.rs`, `src/load/replay.rs` | Implemented | [5.7](#57-loader) |
 | Checkpoint | `src/checkpoint.rs` | Implemented | [5.8](#58-checkpoint) |
 | Session | `src/session.rs` | Implemented | [5.9](#59-session) |
 | Store | `src/store.rs`, `src/store/s3.rs` | Implemented | [5.10](#510-store) |
@@ -323,7 +323,12 @@ impl Epoch {
     pub fn lane_docs(&self, lane: u32) -> u64;
     pub fn lane(self: &Arc<Self>, lane: u32, state: LaneState, tokens: &impl Tokens)
         -> Result<Lane, String>;   // Err for a state that no run makes
+    pub fn replay(self: &Arc<Self>, lane: u32, state: LaneState) -> Result<Replay, String>;
     pub fn check(&self, lane: u32, state: LaneState) -> Result<u64, String>;  // lane, step and leftover in range, no leftover after the last step; the cursor
+}
+impl Replay {   // a lane before its leftover is replayed
+    pub fn take(&mut self, tokens: &impl Tokens, n: u64);   // the next n documents of the leftover
+    pub fn finish(self) -> Result<Lane, String>;           // Err if documents are left
 }
 impl Lane {
     pub fn fill(&mut self, tokens: &impl Tokens, out: &mut [u32]) -> u32;
@@ -382,6 +387,7 @@ At step 0, the leftover has 9 tokens. The lane copies 4 tokens. Then it removes 
 | Test | Type | What it shows |
 |---|---|---|
 | `resume_matches_tail` | Property | For each lane and step k, a lane made from the state at step k supplies the same sequences as the run without a stop. |
+| `replay_in_parts` | Property | A leftover replayed one document at a time gives the same lane as one replay of all of it. `finish` before the last document gives an error. |
 | `world_invariant` | Property | B is 12. A run with world a, a stop at step k and a resume with world b gives the global batches of world 1. |
 | `exactly_once_tokens` | Property | The real tokens of each sequence are one continuous run of the lane stream, and the runs go forward. With a large C, all lanes together supply each token exactly once. |
 | `cap_and_padding` | Property | Pad tokens occur only at the end. The leftover is never more than C. A short sequence occurs only with an empty leftover. At the end of the epoch, each lane state is `(lane_docs, 0)`. |
@@ -611,7 +617,13 @@ The caller gives `lanes = gpu_lanes(B, world, rank)`. Thus the loader does not k
 4. Merge the ranges of all lanes of the GPU. Each row group gets a first step and a last step.
 5. Sort the row groups by first step.
 
-On a resume, the plan starts at the lane state of each lane. The lane reads its leftover again at the resume step, so these documents are necessary at that step.
+On a resume, `new` first replays the leftover of each lane, then it makes the plan from the cursor of each lane:
+
+1. Split the leftover of each lane, the stream positions from its `doc` to its cursor, by window. Each part is a chunk: the row groups of the lane slice in that window, and the number of documents that come from them.
+2. For each lane, in stream order: get the permits of the chunk from a semaphore of the budget size, read its row groups, give its documents to `Replay::take`, and release the row groups. The lanes replay at the same time.
+3. Make the plan with each `doc` set to the cursor. The plan holds only the documents that the lanes did not take.
+
+The lane copies the tokens of its leftover, so it does not need the row groups of a chunk after the chunk. `new` checks the budget against the larger of the plan peak and the largest chunk before it reads a row group (D-65).
 
 The cost of a row group is its decoded size: `values · 4 + (rows + 1) · 8` bytes. `peak` finds the largest cost of the row groups that are necessary at the same step. If the budget is less than this peak, `new` returns `Error::Budget`.
 
@@ -642,6 +654,8 @@ The decoded row group keeps its permits. The loader releases the permits when it
 - The loader has a maximum of 16 reads at the same time. Without this limit, a large budget starts thousands of requests at the start. The index has the same limit for footers.
 - If a read fails, `next` returns the error, and the next calls return `Error::Stopped`. The lanes did not change in the failed step, so `states()` is a correct point to resume from.
 - `next` is cancel safe. The loader keeps the read that it waits for, so a dropped `next` loses no row group (D-44).
+- A resume, and a retry after a failed read, run with each budget that a run with no stop accepts. The plan from the cursor holds a subset of the ranges of that run. A chunk is the row groups of one lane slice in one window, and that run holds all of them at the steps where the lane takes from that window (D-65).
+- The replay reads are futures of the `new` call, not tasks. Thus a dropped `new`, such as from a dropped `Session::resume`, stops them.
 
 **Limits:**
 
@@ -650,7 +664,7 @@ The decoded row group keeps its permits. The loader releases the permits when it
 - `new` makes the plan synchronously. At FineWeb-Edu scale this takes approximately 0.1 s in a release build.
 - The decode of a row group runs in a tokio task and blocks its worker thread for a few milliseconds.
 - All lane states must have the same step.
-- A plan for a resume can hold row groups that the lane read before the resume, if they are in the same slice.
+- A resume reads the row groups of the current window of each lane two times: one time for the replay and one time for the plan.
 
 **Verification:**
 
@@ -659,11 +673,13 @@ The decoded row group keeps its permits. The loader releases the permits when it
 | `loader_matches_direct` | Unit | For world 1, 2 and 4, the batches of all ranks are equal to a run over all row groups in memory. |
 | `resume_matches_tail` | Unit | A stop at step k on world a and a resume on world b give the same batches as a run with no stop. |
 | `budget_is_checked_and_kept` | Unit | A budget below the peak gives `Error::Budget`. A budget equal to the peak runs to the end, and the bytes in memory stay at or below the budget. |
+| `resume_needs_no_more_than_a_fresh_run` | Unit | For two seeds and world 1 and 2, a resume at each step with the peak budget of a run with no stop gives the same batches as that run. |
+| `budget_counts_the_replay` | Unit | At a flush step with a leftover, the plan is empty, but a budget below a chunk gives `Error::Budget` and does not wait. |
 | `evicts_everything` | Unit | After the last step, no row group is in memory. |
 | `failed_read_stops_the_loader` | Unit | A corrupt chunk gives `Error::Read` one time and then `Error::Stopped`. The lane states stay at the step before the failure. |
 | `prefetches_ahead` | Unit | With a large budget, the loader reads all row groups before `next` needs them. |
 | `reads_only_own_row_groups` | Unit | The plans of all ranks cover all row groups. Ranks share only the row groups at the edges of their slices. |
-| `plan_matches_lane_streams` | Unit | Each document that a lane takes at step s, also at a resume, is in a row group that the plan needs at s. |
+| `plan_matches_lane_streams` | Unit | Each document that a lane takes at step s is in a row group that the plan needs at s. At a resume, the chunks of each lane hold the row groups of its replayed documents and cover its whole leftover. |
 | `lane_groups_match` | Property | `Order::lane_groups` gives the row groups that `Order::lane` uses. |
 | `next_is_cancel_safe` | Unit | Over a store with 20 ms reads, `next` futures dropped while a read is in flight lose no row group. The test counts these drops and needs at least one. |
 
@@ -733,7 +749,7 @@ Each GPU gives a checkpoint part for its own lanes. `merge` puts the parts of al
 **Limits:**
 
 - The checksum finds damage, not changes by an attacker.
-- `from_bytes` does not make sure that each lane state is correct for the epoch. `Session::resume` refuses a step past the epoch, a leftover past the cursor and a leftover after the last step, through `Epoch::check` (D-64). The other states that no run makes, such as an offset past its document or a leftover past the cap, need the tokens. `Epoch::lane` then gives an error. `Session::resume` makes the loader at once, so it gives that error as `checkpoint::Error::Range`, and the session stays where it was. No checkpoint causes a panic. A state far behind its cursor can also need more than the budget: `resume` then gives the budget error. `merge` reserves no memory from the B in the bytes.
+- `from_bytes` does not make sure that each lane state is correct for the epoch. `Session::resume` refuses a step past the epoch, a leftover past the cursor and a leftover after the last step, through `Epoch::check` (D-64). The other states that no run makes, such as an offset past its document or a leftover past the cap, need the tokens. `Epoch::lane` then gives an error. `Session::resume` makes the loader at once, so it gives that error as `checkpoint::Error::Range`, and the session stays where it was. No checkpoint causes a panic. `merge` reserves no memory from the B in the bytes.
 
 **Verification:**
 
@@ -1070,6 +1086,7 @@ This component is not in the code yet. Its section will have the full set of par
 | D-62 | A URL with `?` or `#` is an error. | The parser drops what follows them, and they can be part of a real name, so another dataset would open with no error. | Drop the query and the fragment. | #18 |
 | D-63 | `Session::open` refuses more than 2²⁴ lanes, and more than 2³⁰ tokens in one step of one GPU or in its leftovers. | These sizes are far past any real batch. Larger values could only use all memory, which stops the process with no Python exception. | No bound. | #18 |
 | D-64 | `Epoch::lane` gives an error, not a panic, for a state that no run makes. `Session::resume` makes the loader at once and keeps the old position on an error. | A checkpoint made by hand passes the checksum, and its states would stop the packer with a panic. A resume that cannot go on must not replace a good position. | Trust each checksummed checkpoint, or check only some states, or make the loader at the next step. | #18 |
+| D-65 | A resume replays the leftover of each lane one window at a time, then plans from the cursor. | The plan counted the replayed row groups together with the row groups of the resume step. A resume, and a retry after a failed read, then could need more than the budget of a run with no stop. | Count the worst resume in the budget of each run, which makes each budget larger. | #20 |
 | D-22 | The sidecar uses its own binary format and FNV-1a. | No new dependency, and the bytes are fixed by our code. | `serde` with `bincode`, or JSON. | #10 |
 | D-23 | A sidecar that does not exist or is corrupt causes a new build. | The sidecar is only a cache. | An error that the user must correct. | #10 |
 | D-24 | The index keeps the place of each token column chunk, and the reader reads no footer. | A window has row groups from approximately W files. A footer read for each row group costs approximately 1.5 times the data. | Read the footer of each file again, or keep footers in memory (9.4 GB for FineWeb-Edu). | #12 |
@@ -1092,6 +1109,7 @@ This component is not in the code yet. Its section will have the full set of par
 | 2026-10-23 | #14 | Add the loader (`src/load.rs`) and `Order::lane_groups`. Change the index to version 3, with the value count. `Lane` holds an `Arc<Epoch>`. |
 | 2026-10-23 | #16 | Add the checkpoint (`src/checkpoint.rs`) and the session (`src/session.rs`). Add `Loader::ended`. Move the binary helpers to `src/codec.rs`. |
 | 2026-10-23 | #18 | Add the Python bindings (`plitzer-py/`), the store (`src/store.rs`, `src/store/s3.rs`) and `Session::ended`. Add a Python CI job on the three systems. The index makes the folder of its cache, and checks that it can write the cache before it reads the footers. |
+| 2026-10-26 | #20 | A resume replays leftovers in chunks before the plan (`Epoch::replay`, `Replay`, `src/load/replay.rs`). A resume needs no more budget than a run with no stop. |
 
 ## 10. Maintenance
 

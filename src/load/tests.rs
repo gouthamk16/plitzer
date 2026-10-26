@@ -9,6 +9,7 @@ use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
 use tempfile::TempDir;
 
+use super::plan::{chunks, cursors, plan};
 use super::*;
 
 mod budget;

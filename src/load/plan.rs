@@ -17,12 +17,13 @@ pub(super) struct Need {
 
 /// Every row group that lanes `lanes` take a document from, from the steps
 /// in `states` to the end of the epoch, in the order the loader needs them.
+/// Each state's `doc` is the lane's cursor: the leftover before it is
+/// replayed apart, by `chunks`.
 ///
 /// A lane's slice of a window holds stream positions `[p, p + len)`, which
 /// it takes at steps `p / D ..= (p + len - 1) / D`. The lane shuffles its
 /// slice, so each row group of the slice counts as needed over that whole
-/// range. On resume, the positions before the cursor are replayed into the
-/// leftover at the resume step, so they count as needed then.
+/// range.
 pub(super) fn plan(
     epoch: &Epoch,
     index: &Index,
@@ -40,7 +41,7 @@ pub(super) fn plan(
             row_group,
             first,
             last,
-            kib: index.row_group(row_group).1.decoded_bytes().div_ceil(1024),
+            kib: kib(index, row_group),
         })
         .collect();
     needs.sort_unstable_by_key(|n| (n.first, n.row_group));
@@ -75,6 +76,92 @@ fn add_window(
             *range = (range.0.min(first), range.1.max(last));
         }
     }
+}
+
+/// The plan and the replay chunks of lanes `lanes` at `states`. The plan
+/// starts at each lane's cursor, since the leftover before it is replayed
+/// first, apart from the plan.
+pub(super) fn resume(
+    epoch: &Epoch,
+    index: &Index,
+    lanes: Range<u32>,
+    states: &[LaneState],
+) -> Result<(Vec<Need>, Vec<Chunk>), String> {
+    let cursors = cursors(epoch, lanes.clone(), states)?;
+    let chunks = chunks(epoch, index, lanes.clone(), states, &cursors);
+    let ahead: Vec<LaneState> = (states.iter().zip(&cursors))
+        .map(|(s, &doc)| LaneState {
+            doc,
+            offset: 0,
+            ..*s
+        })
+        .collect();
+    Ok((plan(epoch, index, lanes, &ahead), chunks))
+}
+
+/// The cursor of each lane at its state, or the error of a state that no
+/// run makes.
+pub(super) fn cursors(
+    epoch: &Epoch,
+    lanes: Range<u32>,
+    states: &[LaneState],
+) -> Result<Vec<u64>, String> {
+    let number = epoch.order().epoch;
+    (lanes.zip(states))
+        .map(|(l, &s)| epoch.check(l, s))
+        .collect::<Result<_, _>>()
+        .map_err(|why| format!("{why} in epoch {number}"))
+}
+
+/// One lane's row groups of one window, and how many of the documents of
+/// its leftover come from them.
+#[derive(Debug)]
+pub(super) struct Chunk {
+    /// The lane's index in the GPU's lanes.
+    pub lane: usize,
+    pub groups: Vec<u32>,
+    pub docs: u64,
+    pub kib: u64,
+}
+
+/// The parts of each lane's leftover, the stream positions from its state's
+/// `doc` to `cursors`, split by window, in stream order. A fresh run holds
+/// all of a lane's row groups of a window at once while it takes from them,
+/// so no chunk needs more budget than that run.
+pub(super) fn chunks(
+    epoch: &Epoch,
+    index: &Index,
+    lanes: Range<u32>,
+    states: &[LaneState],
+    cursors: &[u64],
+) -> Vec<Chunk> {
+    let order = epoch.order();
+    let mut starts = vec![0u64; lanes.len()];
+    let mut chunks = Vec::new();
+    for w in epoch.windows() {
+        for (i, groups) in order.lane_groups(w, lanes.clone()).into_iter().enumerate() {
+            let start = starts[i];
+            let end = start + order.lane_len(w, lanes.start + i as u32);
+            starts[i] = end;
+            let (lo, hi) = (start.max(states[i].doc), end.min(cursors[i]));
+            if lo < hi {
+                let groups = w.groups()[groups].to_vec();
+                let kib = groups.iter().map(|&g| kib(index, g)).sum();
+                chunks.push(Chunk {
+                    lane: i,
+                    groups,
+                    docs: hi - lo,
+                    kib,
+                });
+            }
+        }
+    }
+    chunks
+}
+
+/// The budget cost of row group `g`: its decoded size, in KiB.
+fn kib(index: &Index, g: u32) -> u64 {
+    index.row_group(g).1.decoded_bytes().div_ceil(1024)
 }
 
 /// The most KiB live at one step: row groups needed from `first` to `last`.

@@ -98,6 +98,40 @@ proptest! {
         }
     }
 
+    // A leftover replayed one document at a time, as the loader replays it
+    // one window at a time, gives the same lane as one replay of it all.
+    // `finish` before the last document is an error.
+    #[test]
+    fn replay_in_parts((lens, lanes, window, seed, p) in inputs()) {
+        let c = Corpus::new(&lens);
+        let rows = c.rows();
+        let e = epoch(&rows, lanes, window, seed, p);
+        for lane in 0..lanes {
+            for (_, _, state) in run(&e, &c, lane, LaneState::default()) {
+                let left = e.check(lane, state).unwrap() - state.doc;
+                if left > 0 {
+                    let mut short = e.replay(lane, state).unwrap();
+                    short.take(&c, left - 1);
+                    prop_assert!(short.finish().is_err());
+                }
+                let mut parts = e.replay(lane, state).unwrap();
+                for _ in 0..left {
+                    parts.take(&c, 1);
+                }
+                let mut l = parts.finish().unwrap();
+                prop_assert_eq!(l.state(), state);
+                let mut out = vec![0; p.seq_len as usize];
+                let tail: Vec<Out> = (state.step..e.steps())
+                    .map(|_| {
+                        let real = l.fill(&c, &mut out);
+                        (out.clone(), real, l.state())
+                    })
+                    .collect();
+                prop_assert_eq!(&tail[..], &run(&e, &c, lane, state)[..]);
+            }
+        }
+    }
+
     // Each sequence's real tokens are one run of the lane's stream, and runs
     // only move forward. With a cap that never overflows, nothing is lost.
     #[test]
