@@ -5,7 +5,7 @@
 | Field | Value |
 |---|---|
 | Status | Active. It changes with each feature PR. The code is pre-alpha. |
-| Last change | 2026-10-23, PR #18 |
+| Last change | 2026-10-26, PR #21 |
 | Language standard | ASD-STE100 (Simplified Technical English) |
 | Code | `src/` at the commit of this file |
 
@@ -102,6 +102,7 @@ Each term has only one definition in this document.
 | REQ-10 | A resume with different settings or a different dataset stops with an error that names the field. | `checkpoint::check_names_the_field` and `session::resume_refuses_other_runs`. | Met |
 | REQ-11 | Python reads each batch without a copy, through DLPack and Arrow. | `test_dlpack_versioned_and_legacy`, `test_arrow_export` and `test_data_outlives_the_batch_and_the_loader`. | Met |
 | REQ-12 | Input from Python gives a Python exception, never a panic or a wait with no end. | `test_bad_settings`, `test_resume_refuses_other_runs` and `test_forked_child_makes_its_own_loader`. Manual tests: Ctrl-C during a stopped S3 read gives `KeyboardInterrupt` in 0.51 s. A SIGUSR1 handler that calls `checkpoint()` during a stopped S3 read saves a complete checkpoint. | Met |
+| REQ-13 | A PyTorch `state_dict` from each GPU count resumes on each GPU count. | `test_state_dict_gathers_all_ranks` (2 ranks save, 4 ranks and 1 rank resume) and `test_state_dict_resumes` (`torch.save` and `torch.load(weights_only=True)`). | Met |
 
 ## 4. System overview
 
@@ -130,7 +131,7 @@ flowchart LR
 | Session | `src/session.rs` | Implemented | [5.9](#59-session) |
 | Store | `src/store.rs`, `src/store/s3.rs` | Implemented | [5.10](#510-store) |
 | Python bindings | `plitzer-py/` | Implemented | [5.11](#511-python-bindings) |
-| PyTorch dataset | — | Planned | [5.12](#512-planned-components) |
+| PyTorch dataset | `plitzer-py/python/plitzer/torch.py` | Implemented | [5.12](#512-pytorch-dataset) |
 
 ## 5. Component design
 
@@ -1005,11 +1006,62 @@ An Arrow consumer moves the structs out of the capsules and sets their `release`
 | `test_forked_child_makes_its_own_loader` | pytest | In a child of `os.fork`, the copied loader gives `RuntimeError`. A new loader gives the same first batch as the parent. The child frees the copy with no wait. |
 | `test_s3_matches_local` | pytest | The same files on versitygw and on local disk give the same batches. |
 
-### 5.12 Planned components
+### 5.12 PyTorch dataset
 
-This component is not in the code yet. Its section will have the full set of parts when it is implemented.
+**Function:** `plitzer.torch.Dataset` is a PyTorch `IterableDataset` for one rank. Each item is one step of that rank. `state_dict()` gives a global checkpoint, and `load_state_dict()` resumes from it on each GPU count.
 
-- **PyTorch dataset:** `plitzer.torch` gives an `IterableDataset` with `state_dict()` and `load_state_dict()`. The state is `{"plitzer": bytes}`, gathered from all ranks of the data-parallel group. Users must set `num_workers=0`. The parallel work is in Rust, and a fork of a process with a tokio runtime is not safe.
+**Interface (`plitzer/torch.py`):**
+
+```python
+class TokenBatch(NamedTuple):
+    tokens: torch.Tensor     # shape (lanes, seq_len), int32
+    lengths: torch.Tensor    # shape (lanes,), int32: the real tokens of each row
+class LoaderSettings(TypedDict): ...  # the keywords of plitzer.Loader, without rank and world
+class State(TypedDict):
+    plitzer: bytes           # a global checkpoint
+class Dataset(IterableDataset[TokenBatch]):
+    def __init__(self, location: str | os.PathLike[str], *,
+                 group: ProcessGroup | None = None, **settings: Unpack[LoaderSettings]) -> None: ...
+    def __iter__(self) -> Iterator[TokenBatch]: ...   # the rest of the current epoch
+    def set_epoch(self, epoch: SupportsIndex) -> None: ...
+    def state_dict(self) -> State: ...               # a collective over group
+    def load_state_dict(self, state: Mapping[str, object]) -> None: ...
+    def part(self) -> bytes: ...                     # the part of this rank, not a collective
+    epoch: int; lanes: range                         # read-only properties
+```
+
+**Design:**
+
+- `Dataset` makes one `plitzer.Loader`. Its rank and world are the rank and size of `group`, the data-parallel group. If `group` is `None`, they come from the default process group. Without `torch.distributed`, the rank is 0 of 1.
+- `__iter__` gives the batches of the loader. `torch.utils.dlpack.from_dlpack` changes each array to a tensor without a copy.
+- `state_dict()` gets the checkpoint part of each rank of `group` with `all_gather_object`. Then `plitzer.merge` makes one global checkpoint. Each rank gets the same bytes. With one rank, there is no gather.
+- `load_state_dict()` makes sure that the state is `{"plitzer": bytes}`, else it gives `CheckpointError`. Then it calls `Loader.resume`. A global checkpoint resumes on each GPU count, so the GPU count can change.
+- `__iter__` in a DataLoader worker gives `RuntimeError`. A pickle of the dataset, for a worker that starts with spawn, gives the same error.
+
+**Rationale:**
+
+- A global checkpoint needs the state of each lane. A rank knows only its own lanes, and the leftover of a lane depends on its tokens. Thus `state_dict()` must collect the parts from all ranks (D-66).
+- Lightning makes the checkpoint on each rank, and then one rank writes it. `torch.distributed.checkpoint` writes an item that each rank holds with the same key only one time. Thus a collective `state_dict()` with the same bytes on each rank works with both (D-66).
+- `TokenBatch` is a `NamedTuple` of tensors. `DataLoader` with `batch_size=None` keeps a `NamedTuple`, also with `pin_memory=True` (D-67).
+- The tokens stay int32, as in section 5.11. `nn.Embedding` takes int32 indices.
+- The state is bytes, so `torch.load(weights_only=True)` reads it (D-37).
+- `plitzer/__init__.py` does not import `plitzer.torch`. Thus `import plitzer` does not load torch. torch is the optional extra `plitzer[torch]`.
+
+**Limits:**
+
+- Each rank of `group` must call `state_dict()`. If only rank 0 calls it, rank 0 waits with no end. Checkpoint code that gathers the parts itself can use `part()` and `plitzer.merge`.
+- Use `num_workers=0`. Each item is already a batch, so use `DataLoader(dataset, batch_size=None)`.
+- A `KeyboardInterrupt` after a step can lose that batch, as in section 5.11. Save the state between training steps.
+
+**Verification:**
+
+| Test | Type | What it shows |
+|---|---|---|
+| `test_matches_the_loader` | pytest | For two epochs, the tensors are equal to the arrays of `plitzer.Loader`, with int32 and the correct shapes. |
+| `test_dataloader_passes_batches_on` | pytest | `DataLoader(batch_size=None, num_workers=0)` gives the same `TokenBatch` items. `num_workers=1` gives `RuntimeError`. |
+| `test_state_dict_resumes` | pytest | A state at step 0, at the middle and after the last step, saved with `torch.save` and read with `torch.load(weights_only=True)`, resumes with the same batches as a run with no stop. |
+| `test_load_state_dict_refuses_bad_states` | pytest | A state with no `plitzer` key, with text, or with damaged bytes gives `CheckpointError`. A group without `torch.distributed` gives `ConfigError`. |
+| `test_state_dict_gathers_all_ranks` | pytest | Two gloo ranks give the same state. Four ranks and one rank resume from it with the batches of a run with no stop. |
 
 ## 6. Read amplification
 
@@ -1092,6 +1144,8 @@ This component is not in the code yet. Its section will have the full set of par
 | D-63 | `Session::open` refuses more than 2²⁴ lanes, and more than 2³⁰ tokens in one step of one GPU or in its leftovers. | These sizes are far past any real batch. Larger values could only use all memory, which stops the process with no Python exception. | No bound. | #18 |
 | D-64 | `Epoch::lane` gives an error, not a panic, for a state that no run makes. `Session::resume` makes the loader at once and keeps the old position on an error. | A checkpoint made by hand passes the checksum, and its states would stop the packer with a panic. A resume that cannot go on must not replace a good position. | Trust each checksummed checkpoint, or check only some states, or make the loader at the next step. | #18 |
 | D-65 | A resume replays the leftover of each lane one window at a time, then plans from the cursor. | The plan counted the replayed row groups together with the row groups of the resume step. A resume, and a retry after a failed read, then could need more than the budget of a run with no stop. | Count the worst resume in the budget of each run, which makes each budget larger. | #20 |
+| D-66 | `Dataset.state_dict()` gathers the parts of all ranks and gives the same global checkpoint on each rank. | A global checkpoint needs each lane, and a rank knows only its own lanes. Lightning makes the checkpoint on each rank, and `torch.distributed.checkpoint` writes an item that all ranks hold only one time. | A part for each rank: a resume then needs the same GPU count, or code that merges the parts. | #21 |
+| D-67 | Each item is a `TokenBatch` `NamedTuple` of int32 tensors for one step. | `DataLoader` with `batch_size=None` keeps it, also with `pin_memory=True`. The tensors share memory with the export. | A dict, which is not typed, or int64 tensors, which need a copy. | #21 |
 | D-22 | The sidecar uses its own binary format and FNV-1a. | No new dependency, and the bytes are fixed by our code. | `serde` with `bincode`, or JSON. | #10 |
 | D-23 | A sidecar that does not exist or is corrupt causes a new build. | The sidecar is only a cache. | An error that the user must correct. | #10 |
 | D-24 | The index keeps the place of each token column chunk, and the reader reads no footer. | A window has row groups from approximately W files. A footer read for each row group costs approximately 1.5 times the data. | Read the footer of each file again, or keep footers in memory (9.4 GB for FineWeb-Edu). | #12 |
@@ -1115,6 +1169,7 @@ This component is not in the code yet. Its section will have the full set of par
 | 2026-10-23 | #16 | Add the checkpoint (`src/checkpoint.rs`) and the session (`src/session.rs`). Add `Loader::ended`. Move the binary helpers to `src/codec.rs`. |
 | 2026-10-23 | #18 | Add the Python bindings (`plitzer-py/`), the store (`src/store.rs`, `src/store/s3.rs`) and `Session::ended`. Add a Python CI job on the three systems. The index makes the folder of its cache, and checks that it can write the cache before it reads the footers. |
 | 2026-10-26 | #20 | A resume replays leftovers one part at a time, then plans from the cursor (`Epoch::replay`, `Replay`, `src/load/replay.rs`). A resume needs no more budget than a run with no stop. |
+| 2026-10-26 | #21 | Add the PyTorch dataset (`plitzer/torch.py`): `Dataset`, `TokenBatch` and a collective `state_dict()`. torch is the optional extra `plitzer[torch]`. CI installs the CPU build of torch. |
 
 ## 10. Maintenance
 
