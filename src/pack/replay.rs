@@ -33,10 +33,21 @@ impl Epoch {
 
 impl Replay {
     /// Takes the next `n` documents of the leftover, or as many as are left.
-    pub fn take(&mut self, tokens: &impl Tokens, n: u64) {
-        let n = n.min(self.left);
-        self.lane.take(tokens, n);
-        self.left -= n;
+    /// The state's offset lies in the first document, so once the tokens
+    /// after it are more than the cap, the state can never fit: that is an
+    /// error at once, before a state far behind its cursor fills memory.
+    pub fn take(&mut self, tokens: &impl Tokens, n: u64) -> Result<(), String> {
+        let cap = self.lane.epoch.packing.cap as usize;
+        for _ in 0..n.min(self.left) {
+            self.lane.take(tokens, 1);
+            self.left -= 1;
+            let leftover = &self.lane.leftover;
+            let first = leftover.lens.front().copied().unwrap_or(0) as usize;
+            if leftover.tokens.len() - first > cap {
+                return Err(format!("state {:?} leaves more than the cap", self.state));
+            }
+        }
+        Ok(())
     }
 
     /// The lane, once every document of the leftover is taken.

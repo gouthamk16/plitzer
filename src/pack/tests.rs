@@ -111,12 +111,12 @@ proptest! {
                 let left = e.check(lane, state).unwrap() - state.doc;
                 if left > 0 {
                     let mut short = e.replay(lane, state).unwrap();
-                    short.take(&c, left - 1);
+                    short.take(&c, left - 1).unwrap();
                     prop_assert!(short.finish().is_err());
                 }
                 let mut parts = e.replay(lane, state).unwrap();
                 for _ in 0..left {
-                    parts.take(&c, 1);
+                    parts.take(&c, 1).unwrap();
                 }
                 let mut l = parts.finish().unwrap();
                 prop_assert_eq!(l.state(), state);

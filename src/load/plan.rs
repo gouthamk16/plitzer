@@ -80,7 +80,8 @@ fn add_window(
 
 /// The plan and the replay chunks of lanes `lanes` at `states`. The plan
 /// starts at each lane's cursor, since the leftover before it is replayed
-/// first, apart from the plan.
+/// first, apart from the plan. With no leftover there are no chunks, and a
+/// fresh loader skips their walk over the windows.
 pub(super) fn resume(
     epoch: &Epoch,
     index: &Index,
@@ -88,19 +89,31 @@ pub(super) fn resume(
     states: &[LaneState],
 ) -> Result<(Vec<Need>, Vec<Chunk>), String> {
     let cursors = cursors(epoch, lanes.clone(), states)?;
-    let chunks = chunks(epoch, index, lanes.clone(), states, &cursors);
-    let ahead: Vec<LaneState> = (states.iter().zip(&cursors))
+    let replayed = (states.iter().zip(&cursors)).any(|(s, &c)| s.doc < c);
+    let chunks = match replayed {
+        true => chunks(epoch, index, lanes.clone(), states, &cursors),
+        false => Vec::new(),
+    };
+    Ok((
+        plan(epoch, index, lanes, &at_cursors(states, &cursors)),
+        chunks,
+    ))
+}
+
+/// `states` with each leftover start moved to the cursor: what a lane still
+/// takes after its replay.
+pub(super) fn at_cursors(states: &[LaneState], cursors: &[u64]) -> Vec<LaneState> {
+    (states.iter().zip(cursors))
         .map(|(s, &doc)| LaneState {
             doc,
             offset: 0,
             ..*s
         })
-        .collect();
-    Ok((plan(epoch, index, lanes, &ahead), chunks))
+        .collect()
 }
 
 /// The cursor of each lane at its state, or the error of a state that no
-/// run makes.
+/// run makes, which names the lane.
 pub(super) fn cursors(
     epoch: &Epoch,
     lanes: Range<u32>,
@@ -108,9 +121,10 @@ pub(super) fn cursors(
 ) -> Result<Vec<u64>, String> {
     let number = epoch.order().epoch;
     (lanes.zip(states))
-        .map(|(l, &s)| epoch.check(l, s))
-        .collect::<Result<_, _>>()
-        .map_err(|why| format!("{why} in epoch {number}"))
+        .map(|(l, &s)| {
+            (epoch.check(l, s)).map_err(|why| format!("lane {l} of epoch {number}: {why}"))
+        })
+        .collect()
 }
 
 /// One lane's row groups of one window, and how many of the documents of

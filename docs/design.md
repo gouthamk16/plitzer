@@ -327,7 +327,7 @@ impl Epoch {
     pub fn check(&self, lane: u32, state: LaneState) -> Result<u64, String>;  // lane, step and leftover in range, no leftover after the last step; the cursor
 }
 impl Replay {   // a lane before its leftover is replayed
-    pub fn take(&mut self, tokens: &impl Tokens, n: u64);   // the next n documents of the leftover
+    pub fn take(&mut self, tokens: &impl Tokens, n: u64) -> Result<(), String>;  // the next n documents; Err past the cap
     pub fn finish(self) -> Result<Lane, String>;           // Err if documents are left
 }
 impl Lane {
@@ -388,6 +388,7 @@ At step 0, the leftover has 9 tokens. The lane copies 4 tokens. Then it removes 
 |---|---|---|
 | `resume_matches_tail` | Property | For each lane and step k, a lane made from the state at step k supplies the same sequences as the run without a stop. |
 | `replay_in_parts` | Property | A leftover replayed one document at a time gives the same lane as one replay of all of it. `finish` before the last document gives an error. |
+| `far_behind_state_stops_early` | Unit | A state 10 documents behind its cursor with C = 8 gives the cap error after 3 documents. |
 | `world_invariant` | Property | B is 12. A run with world a, a stop at step k and a resume with world b gives the global batches of world 1. |
 | `exactly_once_tokens` | Property | The real tokens of each sequence are one continuous run of the lane stream, and the runs go forward. With a large C, all lanes together supply each token exactly once. |
 | `cap_and_padding` | Property | Pad tokens occur only at the end. The leftover is never more than C. A short sequence occurs only with an empty leftover. At the end of the epoch, each lane state is `(lane_docs, 0)`. |
@@ -655,7 +656,8 @@ The decoded row group keeps its permits. The loader releases the permits when it
 - If a read fails, `next` returns the error, and the next calls return `Error::Stopped`. The lanes did not change in the failed step, so `states()` is a correct point to resume from.
 - `next` is cancel safe. The loader keeps the read that it waits for, so a dropped `next` loses no row group (D-44).
 - A resume, and a retry after a failed read, run with each budget that a run with no stop accepts. The plan from the cursor holds a subset of the ranges of that run. A chunk is the row groups of one lane slice in one window, and that run holds all of them at the steps where the lane takes from that window (D-65).
-- The replay reads are futures of the `new` call, not tasks. Thus a dropped `new`, such as from a dropped `Session::resume`, stops them.
+- The replay reads are tasks, so their decode runs on the worker threads of the runtime, also when Python waits with `block_on`. `new` holds them in `Abort`, so a dropped `new`, such as from a dropped `Session::resume`, stops them.
+- `Replay::take` stops with an error when the tokens after the first document of the leftover are more than C. The offset of the state is in that first document, so the state can never fit. Thus a state far behind its cursor stops after some documents, before its leftover fills the memory.
 
 **Limits:**
 
@@ -664,7 +666,7 @@ The decoded row group keeps its permits. The loader releases the permits when it
 - `new` makes the plan synchronously. At FineWeb-Edu scale this takes approximately 0.1 s in a release build.
 - The decode of a row group runs in a tokio task and blocks its worker thread for a few milliseconds.
 - All lane states must have the same step.
-- A resume reads the row groups of the current window of each lane two times: one time for the replay and one time for the plan.
+- A resume reads the row groups of the current window of each lane two times: one time for the replay and one time for the plan. In the replay, a row group that more than one lane of the GPU takes from is read one time for each of these lanes. This occurs only at a resume.
 
 **Verification:**
 
@@ -679,7 +681,7 @@ The decoded row group keeps its permits. The loader releases the permits when it
 | `failed_read_stops_the_loader` | Unit | A corrupt chunk gives `Error::Read` one time and then `Error::Stopped`. The lane states stay at the step before the failure. |
 | `prefetches_ahead` | Unit | With a large budget, the loader reads all row groups before `next` needs them. |
 | `reads_only_own_row_groups` | Unit | The plans of all ranks cover all row groups. Ranks share only the row groups at the edges of their slices. |
-| `plan_matches_lane_streams` | Unit | Each document that a lane takes at step s is in a row group that the plan needs at s. At a resume, the chunks of each lane hold the row groups of its replayed documents and cover its whole leftover. |
+| `plan_matches_lane_streams` | Unit | Each document that a lane takes at step s is in a row group that the plan needs at s. At a resume, the chunks of each lane, in order, hold the row groups of its replayed documents, in stream order, and cover its whole leftover. |
 | `lane_groups_match` | Property | `Order::lane_groups` gives the row groups that `Order::lane` uses. |
 | `next_is_cancel_safe` | Unit | Over a store with 20 ms reads, `next` futures dropped while a read is in flight lose no row group. The test counts these drops and needs at least one. |
 

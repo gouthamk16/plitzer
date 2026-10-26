@@ -29,8 +29,6 @@ async fn budget_is_checked_and_kept() {
     assert_eq!(got.expect("no deadlock at the peak budget").0, want);
 }
 
-// With room for everything, the prefetch reads every row group ahead of
-
 // A resume at any step, and the retry after a failed read (a new loader
 // from `states()`), runs with the budget of a fresh run of the epoch.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -48,7 +46,9 @@ async fn resume_needs_no_more_than_a_fresh_run() {
             }
             for k in 0..want.len() as u64 {
                 let (head, states) = run(&d, world, &fresh, k, budget).await;
-                let (tail, _) = run(&d, world, &states, u64::MAX, budget).await;
+                let tail = run(&d, world, &states, u64::MAX, budget);
+                let tail = tokio::time::timeout(Duration::from_secs(20), tail).await;
+                let (tail, _) = tail.expect("no deadlock at the fresh budget");
                 let joined: Vec<_> = head.into_iter().chain(tail).collect();
                 assert_eq!(joined, want, "seed {seed}, world {world}, resume at {k}");
             }
@@ -66,16 +66,8 @@ async fn budget_counts_the_replay() {
     let (_, mut states) = run(&d, 1, &fresh, 0, PLENTY).await;
     let mut steps = 0;
     let found = loop {
-        let cursors = cursors(&d.epoch, 0..LANES, &states).unwrap();
-        let ahead: Vec<LaneState> = (states.iter().zip(&cursors))
-            .map(|(s, &doc)| LaneState {
-                doc,
-                offset: 0,
-                ..*s
-            })
-            .collect();
-        let empty = plan(&d.epoch, &d.index, 0..LANES, &ahead).is_empty();
-        if empty && !chunks(&d.epoch, &d.index, 0..LANES, &states, &cursors).is_empty() {
+        let (needs, chunks) = resume(&d.epoch, &d.index, 0..LANES, &states).unwrap();
+        if needs.is_empty() && !chunks.is_empty() {
             break states;
         }
         steps += 1;

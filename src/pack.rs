@@ -113,7 +113,7 @@ impl Epoch {
         tokens: &impl Tokens,
     ) -> Result<Lane, String> {
         let mut replay = self.replay(lane, state)?;
-        replay.take(tokens, u64::MAX);
+        replay.take(tokens, u64::MAX)?;
         replay.finish()
     }
 

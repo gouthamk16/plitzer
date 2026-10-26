@@ -20,8 +20,9 @@ use plan::{Need, peak, resume};
 
 #[derive(Debug)]
 pub enum Error {
-    /// The budget is below the most the GPU's lanes need at one step, so
-    /// the prefetch would wait for itself.
+    /// The budget is below the most the GPU's lanes need at once, at one
+    /// step or to replay one chunk of a leftover, so the loader would wait
+    /// for itself.
     Budget {
         needed: u64,
         budget: u64,
@@ -41,7 +42,7 @@ impl fmt::Display for Error {
         match self {
             Error::Budget { needed, budget } => write!(
                 f,
-                "the prefetch budget is {budget} bytes, but one step needs {needed}"
+                "the prefetch budget is {budget} bytes, but the lanes need {needed} at once"
             ),
             Error::Read(e) => write!(f, "{e}"),
             Error::Join(e) => write!(f, "a read task failed: {e}"),
@@ -140,7 +141,8 @@ impl Loader {
             let needed = needed * 1024;
             return Err(Error::Budget { needed, budget });
         }
-        let lanes = replay::lanes(&epoch, &reader, &index, lanes, states, chunks, budget_kib);
+        let (r, i) = (reader.clone(), index.clone());
+        let lanes = replay::lanes(&epoch, r, i, lanes, states, chunks, budget_kib);
         let lanes = lanes.await?;
         let held = Arc::new(AtomicUsize::new(0));
         let (arrivals, driver) = prefetch(&needs, reader, index, budget_kib, held.clone());

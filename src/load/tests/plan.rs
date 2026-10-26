@@ -50,16 +50,8 @@ async fn plan_matches_lane_streams() {
             for rank in 0..world {
                 let range = gpu_lanes(LANES, world, rank);
                 let own = &states[range.start as usize..range.end as usize];
-                let cursors: Vec<u64> = (range.clone().zip(own))
-                    .map(|(l, &s)| d.epoch.check(l, s).unwrap())
-                    .collect();
-                let ahead: Vec<LaneState> = (own.iter().zip(&cursors))
-                    .map(|(s, &doc)| LaneState {
-                        doc,
-                        offset: 0,
-                        ..*s
-                    })
-                    .collect();
+                let cursors = cursors(&d.epoch, range.clone(), own).unwrap();
+                let ahead = at_cursors(own, &cursors);
                 let needs = plan(&d.epoch, &d.index, range.clone(), &ahead);
                 let chunks = chunks(&d.epoch, &d.index, range.clone(), own, &cursors);
                 assert!(!chunks.is_empty(), "some lane has a leftover to replay");
@@ -72,19 +64,18 @@ async fn plan_matches_lane_streams() {
                 let mut lanes = Vec::new();
                 for (i, (l, &s)) in range.zip(own).enumerate() {
                     lanes.push(d.epoch.lane(l, s, &all).unwrap());
-                    let mut replayed = chunks.iter().filter(|c| c.lane == i);
-                    for rg in all.log.take() {
-                        assert!(
-                            replayed.clone().any(|c| c.groups.contains(&rg)),
-                            "replayed row group {rg} of lane {l} in no chunk"
-                        );
+                    // In stream order: the first chunk's documents come first.
+                    let mut log = all.log.take().into_iter();
+                    for chunk in chunks.iter().filter(|c| c.lane == i) {
+                        for _ in 0..chunk.docs {
+                            let rg = log.next().expect("a document for each in the chunk");
+                            assert!(
+                                chunk.groups.contains(&rg),
+                                "lane {l}: replayed row group {rg} not in its chunk"
+                            );
+                        }
                     }
-                    let docs: u64 = replayed.by_ref().map(|c| c.docs).sum();
-                    assert_eq!(
-                        docs,
-                        cursors[i] - s.doc,
-                        "lane {l}: chunks cover the leftover"
-                    );
+                    assert!(log.next().is_none(), "lane {l}: chunks cover the leftover");
                 }
                 for step in k..d.epoch.steps() {
                     for l in &mut lanes {

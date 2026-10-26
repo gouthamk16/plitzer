@@ -9,7 +9,7 @@ use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
 use tempfile::TempDir;
 
-use super::plan::{chunks, cursors, plan};
+use super::plan::{at_cursors, chunks, cursors, plan};
 use super::*;
 
 mod budget;
@@ -219,6 +219,7 @@ async fn evicts_everything() {
     assert_eq!(loader.next, loader.needs.len());
 }
 
+// With room for everything, the prefetch reads every row group ahead of
 // use, without any call to `next`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn prefetches_ahead() {
