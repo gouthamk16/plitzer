@@ -51,6 +51,8 @@ while dataset.epoch < 3:                 # also right after dataset.load_state_d
 # later, on any number of GPUs: dataset.load_state_dict(state)
 ```
 
+The state is the position of the next batch the dataset gives, so a loop that prefetches batches before training them skips those on a resume ([#22](https://github.com/gouthamk16/plitzer/issues/22)).
+
 S3 credentials come from the usual `AWS_*` variables, or from `storage_options={"endpoint": ..., "region": ...}`.
 
 The design, its rationale and the decision log are in [docs/design.md](docs/design.md).
