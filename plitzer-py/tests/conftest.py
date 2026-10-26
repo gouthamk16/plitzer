@@ -10,8 +10,7 @@ import pytest
 
 import plitzer
 
-# torch is an optional extra. Its module is found without an import, which
-# is slow and, for a CUDA wheel with no CUDA libraries, fails.
+# torch is an optional extra. Find it without importing it, which is slow.
 collect_ignore = [] if importlib.util.find_spec("torch") else ["test_torch.py"]
 
 

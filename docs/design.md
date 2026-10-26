@@ -1021,7 +1021,8 @@ class State(TypedDict):
     plitzer: bytes           # a global checkpoint
 class Dataset(IterableDataset[TokenBatch]):
     def __init__(self, location: str | os.PathLike[str], *,
-                 group: ProcessGroup | None = None, **settings: Unpack[LoaderSettings]) -> None: ...
+                 group: ProcessGroup | None = None, ahead: int = 0,
+                 **settings: Unpack[LoaderSettings]) -> None: ...
     def __iter__(self) -> Iterator[TokenBatch]: ...   # the rest of the current epoch
     def set_epoch(self, epoch: SupportsIndex) -> None: ...
     def state_dict(self) -> State: ...               # a collective over group
@@ -1033,6 +1034,8 @@ class Dataset(IterableDataset[TokenBatch]):
 **Design:**
 
 - `Dataset` makes one `plitzer.Loader`. Its rank and world are the rank and size of `group`, the data-parallel group. If `group` is `None`, they come from the default process group. Without `torch.distributed`, the rank is 0 of 1.
+- `Dataset` gives `ConfigError` if `WORLD_SIZE` is more than 1 but `torch.distributed` is not initialized, and for a process that is not in `group`. In the first case, each rank would read all lanes and train on the same data, with no error.
+- `ahead` is the number of batches that the training loop gets before it trains them. The dataset keeps the checkpoint before each of its last `ahead` batches. `state_dict()` and `part()` give the checkpoint before the first batch that is not trained. A jump, such as `load_state_dict` or `set_epoch`, clears this list.
 - `__iter__` gives the batches of the loader. `torch.utils.dlpack.from_dlpack` changes each array to a tensor without a copy.
 - `state_dict()` gets the checkpoint part of each rank of `group` with `all_gather_object`. Then `plitzer.merge` makes one global checkpoint. Each rank gets the same bytes. With one rank, there is no gather.
 - `load_state_dict()` makes sure that the state is `{"plitzer": bytes}`, else it gives `CheckpointError`. Then it calls `Loader.resume`. A global checkpoint resumes on each GPU count, so the GPU count can change.
@@ -1042,7 +1045,8 @@ class Dataset(IterableDataset[TokenBatch]):
 
 - A global checkpoint needs the state of each lane. A rank knows only its own lanes, and the leftover of a lane depends on its tokens. Thus `state_dict()` must collect the parts from all ranks (D-66).
 - Lightning makes the checkpoint on each rank, and then one rank writes it. `torch.distributed.checkpoint` writes an item that each rank holds with the same key only one time. Thus a collective `state_dict()` with the same bytes on each rank works with both (D-66).
-- `TokenBatch` is a `NamedTuple` of tensors. `DataLoader` with `batch_size=None` keeps a `NamedTuple`, also with `pin_memory=True` (D-67).
+- `TokenBatch` is a `NamedTuple` of tensors. `DataLoader` with `batch_size=None` keeps a `NamedTuple` (D-67).
+- Some training loops get a batch before they train the previous one. Then the loader is one step ahead of the training, and a resume would skip a batch. The loop knows this count, so `ahead` comes from the user, with 0 as the default (D-68).
 - The tokens stay int32, as in section 5.11. `nn.Embedding` takes int32 indices.
 - The state is bytes, so `torch.load(weights_only=True)` reads it (D-37).
 - `plitzer/__init__.py` does not import `plitzer.torch`. Thus `import plitzer` does not load torch. torch is the optional extra `plitzer[torch]`.
@@ -1051,6 +1055,10 @@ class Dataset(IterableDataset[TokenBatch]):
 
 - Each rank of `group` must call `state_dict()`. If only rank 0 calls it, rank 0 waits with no end. Checkpoint code that gathers the parts itself can use `part()` and `plitzer.merge`.
 - Use `num_workers=0`. Each item is already a batch, so use `DataLoader(dataset, batch_size=None)`.
+- The dataset splits the lanes by rank. Do not let a framework split it again, such as `accelerator.prepare` on its `DataLoader`.
+- With NCCL, `all_gather_object` uses the current CUDA device. Call `torch.cuda.set_device` on each rank before `state_dict()`.
+- With `pin_memory=True`, the tensors are pinned copies, not views of the export.
+- A `Dataset` cannot be pickled or copied, because it holds Rust threads.
 - A `KeyboardInterrupt` after a step can lose that batch, as in section 5.11. Save the state between training steps.
 
 **Verification:**
@@ -1060,6 +1068,8 @@ class Dataset(IterableDataset[TokenBatch]):
 | `test_matches_the_loader` | pytest | For two epochs, the tensors are equal to the arrays of `plitzer.Loader`, with int32 and the correct shapes. |
 | `test_dataloader_passes_batches_on` | pytest | `DataLoader(batch_size=None, num_workers=0)` gives the same `TokenBatch` items. `num_workers=1` gives `RuntimeError`. |
 | `test_state_dict_resumes` | pytest | A state at step 0, at the middle and after the last step, saved with `torch.save` and read with `torch.load(weights_only=True)`, resumes with the same batches as a run with no stop. |
+| `test_ahead_names_the_first_untrained_batch` | pytest | With `ahead=1`, a state after k + 1 fetched batches resumes at batch k, and the batches are the same as a run with no stop. |
+| `test_bad_settings` | pytest | A negative, `bool` or `float` `ahead`, and `WORLD_SIZE=2` without `torch.distributed`, give `ConfigError`. |
 | `test_load_state_dict_refuses_bad_states` | pytest | A state with no `plitzer` key, with text, or with damaged bytes gives `CheckpointError`. A group without `torch.distributed` gives `ConfigError`. |
 | `test_state_dict_gathers_all_ranks` | pytest | Two gloo ranks give the same state. Four ranks and one rank resume from it with the batches of a run with no stop. |
 
@@ -1145,7 +1155,8 @@ class Dataset(IterableDataset[TokenBatch]):
 | D-64 | `Epoch::lane` gives an error, not a panic, for a state that no run makes. `Session::resume` makes the loader at once and keeps the old position on an error. | A checkpoint made by hand passes the checksum, and its states would stop the packer with a panic. A resume that cannot go on must not replace a good position. | Trust each checksummed checkpoint, or check only some states, or make the loader at the next step. | #18 |
 | D-65 | A resume replays the leftover of each lane one window at a time, then plans from the cursor. | The plan counted the replayed row groups together with the row groups of the resume step. A resume, and a retry after a failed read, then could need more than the budget of a run with no stop. | Count the worst resume in the budget of each run, which makes each budget larger. | #20 |
 | D-66 | `Dataset.state_dict()` gathers the parts of all ranks and gives the same global checkpoint on each rank. | A global checkpoint needs each lane, and a rank knows only its own lanes. Lightning makes the checkpoint on each rank, and `torch.distributed.checkpoint` writes an item that all ranks hold only one time. | A part for each rank: a resume then needs the same GPU count, or code that merges the parts. | #21 |
-| D-67 | Each item is a `TokenBatch` `NamedTuple` of int32 tensors for one step. | `DataLoader` with `batch_size=None` keeps it, also with `pin_memory=True`. The tensors share memory with the export. | A dict, which is not typed, or int64 tensors, which need a copy. | #21 |
+| D-67 | Each item is a `TokenBatch` `NamedTuple` of int32 tensors for one step. | `DataLoader` with `batch_size=None` keeps it. The tensors share memory with the export. | A dict, which is not typed, or int64 tensors, which need a copy. | #21 |
+| D-68 | `ahead` sets how many fetched batches the training loop has not trained, with 0 as the default. | A loop that gets a batch before it trains the previous one moves the loader ahead of the training, and its count depends on the loop. | A fixed count, which is wrong for one of the two kinds of loops. | #21 |
 | D-22 | The sidecar uses its own binary format and FNV-1a. | No new dependency, and the bytes are fixed by our code. | `serde` with `bincode`, or JSON. | #10 |
 | D-23 | A sidecar that does not exist or is corrupt causes a new build. | The sidecar is only a cache. | An error that the user must correct. | #10 |
 | D-24 | The index keeps the place of each token column chunk, and the reader reads no footer. | A window has row groups from approximately W files. A footer read for each row group costs approximately 1.5 times the data. | Read the footer of each file again, or keep footers in memory (9.4 GB for FineWeb-Edu). | #12 |
