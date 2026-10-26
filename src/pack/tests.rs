@@ -1,6 +1,7 @@
 use super::*;
 
 mod edges;
+mod replay;
 use crate::order::gpu_lanes;
 use proptest::prelude::*;
 

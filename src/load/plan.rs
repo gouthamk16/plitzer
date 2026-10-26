@@ -1,9 +1,10 @@
 use std::collections::HashMap;
 use std::ops::Range;
 
+use super::Error;
 use crate::index::Index;
 use crate::order::Window;
-use crate::pack::{Epoch, LaneState};
+use crate::pack::{Epoch, LaneState, at_lane};
 
 /// One row group a GPU needs, and the steps it is needed over.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -17,12 +18,13 @@ pub(super) struct Need {
 
 /// Every row group that lanes `lanes` take a document from, from the steps
 /// in `states` to the end of the epoch, in the order the loader needs them.
+/// Each state's `doc` is the lane's cursor: the leftover before it is
+/// replayed apart, by `replay::lanes`.
 ///
 /// A lane's slice of a window holds stream positions `[p, p + len)`, which
 /// it takes at steps `p / D ..= (p + len - 1) / D`. The lane shuffles its
 /// slice, so each row group of the slice counts as needed over that whole
-/// range. On resume, the positions before the cursor are replayed into the
-/// leftover at the resume step, so they count as needed then.
+/// range.
 pub(super) fn plan(
     epoch: &Epoch,
     index: &Index,
@@ -40,7 +42,7 @@ pub(super) fn plan(
             row_group,
             first,
             last,
-            kib: index.row_group(row_group).1.decoded_bytes().div_ceil(1024),
+            kib: kib(index, row_group),
         })
         .collect();
     needs.sort_unstable_by_key(|n| (n.first, n.row_group));
@@ -75,6 +77,72 @@ fn add_window(
             *range = (range.0.min(first), range.1.max(last));
         }
     }
+}
+
+/// The step of `states` and the plan from their cursors, or `Error::Budget`
+/// if its peak is more than `budget`.
+pub(super) fn needs(
+    epoch: &Epoch,
+    index: &Index,
+    lanes: Range<u32>,
+    states: &[LaneState],
+    budget: u64,
+) -> Result<(u64, Vec<Need>), Error> {
+    assert_eq!(states.len(), lanes.len(), "one state for each lane");
+    let step = states.first().map_or(0, |s| s.step);
+    assert!(
+        states.iter().all(|s| s.step == step),
+        "lane states from one step"
+    );
+    let needs = resume(epoch, index, lanes, states).map_err(Error::State)?;
+    let needed = peak(&needs);
+    if needed > budget / 1024 {
+        let needed = needed * 1024;
+        return Err(Error::Budget { needed, budget });
+    }
+    Ok((step, needs))
+}
+
+/// The plan of lanes `lanes` at `states`. It starts at each lane's cursor,
+/// since the leftover before it is replayed first, apart from the plan.
+pub(super) fn resume(
+    epoch: &Epoch,
+    index: &Index,
+    lanes: Range<u32>,
+    states: &[LaneState],
+) -> Result<Vec<Need>, String> {
+    let cursors = cursors(epoch, lanes.clone(), states)?;
+    Ok(plan(epoch, index, lanes, &at_cursors(states, &cursors)))
+}
+
+/// `states` with each leftover start moved to the cursor: what a lane still
+/// takes after its replay.
+pub(super) fn at_cursors(states: &[LaneState], cursors: &[u64]) -> Vec<LaneState> {
+    (states.iter().zip(cursors))
+        .map(|(s, &doc)| LaneState {
+            doc,
+            offset: 0,
+            ..*s
+        })
+        .collect()
+}
+
+/// The cursor of each lane at its state, or the error of a state that no
+/// run makes, which names the lane.
+pub(super) fn cursors(
+    epoch: &Epoch,
+    lanes: Range<u32>,
+    states: &[LaneState],
+) -> Result<Vec<u64>, String> {
+    let number = epoch.order().epoch;
+    (lanes.zip(states))
+        .map(|(l, &s)| (epoch.check(l, s)).map_err(|why| at_lane(l, number, &why)))
+        .collect()
+}
+
+/// The budget cost of row group `g`: its decoded size, in KiB.
+pub(super) fn kib(index: &Index, g: u32) -> u64 {
+    index.row_group(g).1.decoded_bytes().div_ceil(1024)
 }
 
 /// The most KiB live at one step: row groups needed from `first` to `last`.

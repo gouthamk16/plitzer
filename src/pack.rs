@@ -2,9 +2,17 @@ use std::sync::Arc;
 
 use crate::order::{Doc, Order, Window};
 
+/// A lane state error, named by its lane: the session and the loader both
+/// give it, and Python users see it in `CheckpointError`.
+pub(crate) fn at_lane(lane: u32, epoch: u64, why: &str) -> String {
+    format!("lane {lane} of epoch {epoch}: {why}")
+}
+
 mod leftover;
+mod replay;
 
 use leftover::Leftover;
+pub use replay::Replay;
 
 /// Where a lane gets each document's tokens. The packer adds no separators,
 /// so a source that wants EOS between documents includes it in the tokens.
@@ -110,17 +118,9 @@ impl Epoch {
         state: LaneState,
         tokens: &impl Tokens,
     ) -> Result<Lane, String> {
-        let cursor = self.check(lane, state)?;
-        let mut l = Lane {
-            epoch: self.clone(),
-            lane,
-            step: state.step,
-            stream: Stream::seek(self, lane, state.doc),
-            leftover: Leftover::new(state.doc),
-        };
-        l.take(tokens, cursor - state.doc);
-        l.start_at(state)?;
-        Ok(l)
+        let mut replay = self.replay(lane, state)?;
+        replay.take(tokens, u64::MAX)?;
+        replay.finish()
     }
 
     /// The documents lane `lane` takes in the whole epoch.
@@ -276,16 +276,20 @@ impl Stream {
     }
 
     fn next(&mut self, epoch: &Epoch, lane: u32) -> Option<Doc> {
-        while self.next == self.docs.len() {
-            if self.window + 1 >= epoch.windows.len() {
-                return None;
-            }
+        let doc = *self.rest(epoch, lane).first()?;
+        self.next += 1;
+        Some(doc)
+    }
+
+    /// The documents left in the current window, after moving past windows
+    /// with none left. Empty at the end of the epoch.
+    fn rest(&mut self, epoch: &Epoch, lane: u32) -> &[Doc] {
+        while self.next == self.docs.len() && self.window + 1 < epoch.windows.len() {
             self.window += 1;
             self.docs = epoch.order().lane(&epoch.windows[self.window], lane);
             self.next = 0;
         }
-        self.next += 1;
-        Some(self.docs[self.next - 1])
+        &self.docs[self.next..]
     }
 }
 

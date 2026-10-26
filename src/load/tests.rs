@@ -9,10 +9,12 @@ use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
 use tempfile::TempDir;
 
+use super::plan::{at_cursors, cursors, peak, plan, resume};
 use super::*;
 
 mod budget;
 mod cancel;
+mod fail;
 mod plan;
 use crate::order::{Order, gpu_lanes};
 use crate::pack::Packing;
@@ -218,6 +220,7 @@ async fn evicts_everything() {
     assert_eq!(loader.next, loader.needs.len());
 }
 
+// With room for everything, the prefetch reads every row group ahead of
 // use, without any call to `next`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn prefetches_ahead() {
@@ -247,47 +250,4 @@ async fn prefetches_ahead() {
     tokio::time::timeout(Duration::from_secs(10), full)
         .await
         .expect("every row group prefetched");
-}
-
-// A read that fails mid-epoch returns its error once. The lanes have not
-// moved, so `states()` is a valid resume point, and later calls report
-// `Stopped` instead of reading a row group that never arrived.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn failed_read_stops_the_loader() {
-    let d = data(17).await;
-    let fresh = vec![LaneState::default(); LANES as usize];
-    let needs = plan(&d.epoch, &d.index, 0..LANES, &fresh);
-    let bad = needs
-        .iter()
-        .find(|n| n.first >= 2)
-        .expect("a row group needed later");
-    let (file, rg) = d.index.row_group(bad.row_group);
-    let path = d.dir.path().join(&file.path);
-    let mut bytes = std::fs::read(&path).unwrap();
-    let chunk = rg.start as usize..rg.start as usize + rg.len as usize;
-    bytes[chunk].fill(0xAB);
-    std::fs::write(&path, bytes).unwrap();
-
-    let mut loader = Loader::new(
-        d.epoch.clone(),
-        d.reader.clone(),
-        d.index.clone(),
-        0..LANES,
-        &fresh,
-        PLENTY,
-    )
-    .await
-    .unwrap();
-    let mut out = vec![0; (LANES * PACKING.seq_len) as usize];
-    let mut before = loader.states();
-    let err = loop {
-        match loader.next(&mut out).await {
-            Ok(Some(_)) => before = loader.states(),
-            Ok(None) => panic!("the corrupt row group was never read"),
-            Err(e) => break e,
-        }
-    };
-    assert!(matches!(err, Error::Read(_)), "{err:?}");
-    assert_eq!(loader.states(), before);
-    assert!(matches!(loader.next(&mut out).await, Err(Error::Stopped)));
 }

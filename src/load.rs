@@ -14,13 +14,15 @@ use crate::pack::{Epoch, Lane, LaneState, Tokens};
 use crate::read::{self, Reader, RowGroupTokens};
 
 mod plan;
+mod replay;
 
-use plan::{Need, peak, plan};
+use plan::{Need, needs};
 
 #[derive(Debug)]
 pub enum Error {
-    /// The budget is below the most the GPU's lanes need at one step, so
-    /// the prefetch would wait for itself.
+    /// The budget is below the most the GPU's lanes need at once, at one
+    /// step or to replay one part of a leftover, so the loader would wait
+    /// for itself.
     Budget {
         needed: u64,
         budget: u64,
@@ -40,7 +42,7 @@ impl fmt::Display for Error {
         match self {
             Error::Budget { needed, budget } => write!(
                 f,
-                "the prefetch budget is {budget} bytes, but one step needs {needed}"
+                "the prefetch budget is {budget} bytes, but the lanes need {needed} at once"
             ),
             Error::Read(e) => write!(f, "{e}"),
             Error::Join(e) => write!(f, "a read task failed: {e}"),
@@ -113,9 +115,10 @@ pub struct Loader {
 
 impl Loader {
     /// The loader for lanes `lanes`, each resumed from its state in
-    /// `states`. `budget` caps the bytes of decoded tokens in memory. The
-    /// reads run as tokio tasks; on a multi-thread runtime they continue in
-    /// the background while the caller trains.
+    /// `states`. `budget` caps the bytes of decoded tokens in memory. It
+    /// replays the lanes' leftovers before it returns; the later reads run
+    /// as tokio tasks, and on a multi-thread runtime they continue in the
+    /// background while the caller trains.
     pub async fn new(
         epoch: Arc<Epoch>,
         reader: Arc<Reader>,
@@ -124,23 +127,14 @@ impl Loader {
         states: &[LaneState],
         budget: u64,
     ) -> Result<Self, Error> {
-        assert_eq!(states.len(), lanes.len(), "one state for each lane");
-        let step = states.first().map_or(0, |s| s.step);
-        assert!(
-            states.iter().all(|s| s.step == step),
-            "lane states from one step"
-        );
-        let needs = plan(&epoch, &index, lanes.clone(), states);
-        let (budget_kib, needed) = (budget / 1024, peak(&needs));
-        if needed > budget_kib {
-            let needed = needed * 1024;
-            return Err(Error::Budget { needed, budget });
-        }
+        let (step, needs) = needs(&epoch, &index, lanes.clone(), states, budget)?;
+        let (r, i) = (reader.clone(), index.clone());
+        let lanes = replay::lanes(&epoch, r, i, lanes, states, budget).await?;
         let held = Arc::new(AtomicUsize::new(0));
-        let (arrivals, driver) = prefetch(&needs, reader, index, budget_kib, held.clone());
+        let (arrivals, driver) = prefetch(&needs, reader, index, budget / 1024, held.clone());
         let mut loader = Loader {
-            epoch: epoch.clone(),
-            lanes: Vec::new(),
+            epoch,
+            lanes,
             evict: evictions(&needs),
             needs,
             next: 0,
@@ -151,25 +145,10 @@ impl Loader {
             stopped: false,
             _driver: driver,
         };
-        // Resumed lanes replay their leftover now, so their row groups for
-        // the resume step must be in memory first.
+        // The first step's row groups are read now, so a resume succeeds
+        // only if the run can go on from there.
         loader.receive(step).await?;
-        loader.lanes = loader.resume_lanes(lanes, states)?;
         Ok(loader)
-    }
-
-    /// Each lane from its state, with its leftover replayed from the buffer.
-    fn resume_lanes(&self, lanes: Range<u32>, states: &[LaneState]) -> Result<Vec<Lane>, Error> {
-        let epoch = self.epoch.order().epoch;
-        let lane = |(l, &s): (u32, &LaneState)| {
-            let at = |why| format!("lane {l} of epoch {epoch}: {why}");
-            self.epoch.lane(l, s, &self.buffer).map_err(at)
-        };
-        lanes
-            .zip(states)
-            .map(lane)
-            .collect::<Result<_, _>>()
-            .map_err(Error::State)
     }
 
     /// The next step: one sequence of L tokens for each lane, in lane order,
@@ -243,6 +222,12 @@ impl Loader {
     }
 }
 
+/// `kib` as semaphore permits, which tokio counts in `u32`. Only a row group
+/// or chunk past 4 TiB saturates, and then takes all `u32::MAX` permits.
+fn permits(kib: u64) -> u32 {
+    u32::try_from(kib).unwrap_or(u32::MAX)
+}
+
 /// The row groups to evict after each step: those whose last step it is.
 fn evictions(needs: &[Need]) -> BTreeMap<u64, Vec<u32>> {
     let mut evict: BTreeMap<u64, Vec<u32>> = BTreeMap::new();
@@ -266,7 +251,10 @@ fn prefetch(
     let (tx, rx) = unbounded_channel();
     let semaphore = Arc::new(Semaphore::new(budget_kib as usize));
     let slots = Arc::new(Semaphore::new(CONCURRENT_READS));
-    let needs: Vec<(u32, u32)> = needs.iter().map(|n| (n.row_group, n.kib as u32)).collect();
+    let needs: Vec<(u32, u32)> = needs
+        .iter()
+        .map(|n| (n.row_group, permits(n.kib)))
+        .collect();
     let driver = tokio::spawn(async move {
         for (row_group, kib) in needs {
             let Ok(permit) = semaphore.clone().acquire_many_owned(kib).await else {

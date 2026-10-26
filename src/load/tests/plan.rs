@@ -27,8 +27,9 @@ async fn reads_only_own_row_groups() {
     }
 }
 
-// Every document a lane takes at step s, or replays on resume at step k, is
-// in a row group whose planned range holds that step.
+// Every document a lane takes at step s is in a row group whose planned
+// range holds that step, also after a resume at step k, where the plan
+// starts at the cursor.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn plan_matches_lane_streams() {
     for seed in [13, 14] {
@@ -49,20 +50,20 @@ async fn plan_matches_lane_streams() {
             for rank in 0..world {
                 let range = gpu_lanes(LANES, world, rank);
                 let own = &states[range.start as usize..range.end as usize];
-                let needs = plan(&d.epoch, &d.index, range.clone(), own);
+                let cursors = cursors(&d.epoch, range.clone(), own).unwrap();
+                let ahead = at_cursors(own, &cursors);
+                let needs = plan(&d.epoch, &d.index, range.clone(), &ahead);
+                let leftover = own.iter().zip(&cursors).any(|(s, &c)| s.doc < c);
+                assert!(leftover, "some lane has a leftover to replay");
                 let at = |step: u64, rg: u32| {
                     needs
                         .iter()
                         .any(|n| n.row_group == rg && n.first <= step && step <= n.last)
                 };
-                all.log.borrow_mut().clear();
-                let mut lanes: Vec<Lane> = range
-                    .zip(own)
+                let mut lanes: Vec<Lane> = (range.zip(own))
                     .map(|(l, &s)| d.epoch.lane(l, s, &all).unwrap())
                     .collect();
-                for rg in all.log.take() {
-                    assert!(at(k, rg), "replayed row group {rg} not planned at step {k}");
-                }
+                all.log.borrow_mut().clear();
                 for step in k..d.epoch.steps() {
                     for l in &mut lanes {
                         l.fill(&all, &mut seq);

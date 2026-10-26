@@ -100,3 +100,65 @@ fn lane_out_of_range_is_refused() {
             .is_err_and(|why| why.contains("out of range"))
     );
 }
+
+/// Counts the documents a lane takes.
+struct Counted<'a>(&'a Corpus, std::cell::Cell<u32>);
+
+impl Tokens for Counted<'_> {
+    fn tokens(&self, doc: Doc) -> &[u32] {
+        self.1.set(self.1.get() + 1);
+        self.0.tokens(doc)
+    }
+}
+
+// A state far behind its cursor is refused as soon as its leftover cannot
+// fit the cap, not after every document before the cursor is in memory.
+#[test]
+fn far_behind_state_stops_early() {
+    let c = Corpus::new(&[vec![5; 20]]);
+    let rows = c.rows();
+    let p = Packing {
+        seq_len: 4,
+        docs: 1,
+        cap: 8,
+        pad: PAD,
+    };
+    let e = epoch(&rows, 1, 1, 7, p);
+    let behind = LaneState {
+        step: 10,
+        doc: 0,
+        offset: 0,
+    };
+    let counted = Counted(&c, std::cell::Cell::new(0));
+    let mut replay = e.replay(0, behind).unwrap();
+    let got = replay.take(&counted, u64::MAX);
+    assert!(got.is_err_and(|why| why.contains("more than the cap")));
+    // 5 + 5 tokens fit after the first document's 5; the third does not.
+    assert_eq!(counted.1.get(), 3);
+}
+
+// A state on an empty document can never start there, so it is refused at
+// its first document, with that reason, not after the whole leftover.
+#[test]
+fn empty_start_stops_at_once() {
+    let c = Corpus::new(&[vec![0, 5, 5, 5, 5]]);
+    let rows = c.rows();
+    let p = Packing {
+        seq_len: 4,
+        docs: 1,
+        cap: 100,
+        pad: PAD,
+    };
+    let e = epoch(&rows, 1, 1, 7, p);
+    let order = e.order().lane(&e.windows()[0], 0);
+    let empty = order.iter().position(|d| d.row == 0).unwrap() as u64;
+    let on_empty = LaneState {
+        step: 5,
+        doc: empty,
+        offset: 0,
+    };
+    let counted = Counted(&c, std::cell::Cell::new(0));
+    let got = e.replay(0, on_empty).unwrap().take(&counted, u64::MAX);
+    assert!(got.is_err_and(|why| why.contains("does not start on a document")));
+    assert_eq!(counted.1.get(), 1);
+}
