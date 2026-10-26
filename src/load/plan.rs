@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::ops::Range;
 
+use super::Error;
 use crate::index::Index;
 use crate::order::Window;
 use crate::pack::{Epoch, LaneState, at_lane};
@@ -18,7 +19,7 @@ pub(super) struct Need {
 /// Every row group that lanes `lanes` take a document from, from the steps
 /// in `states` to the end of the epoch, in the order the loader needs them.
 /// Each state's `doc` is the lane's cursor: the leftover before it is
-/// replayed apart, by `chunks`.
+/// replayed apart, by `replay::lanes`.
 ///
 /// A lane's slice of a window holds stream positions `[p, p + len)`, which
 /// it takes at steps `p / D ..= (p + len - 1) / D`. The lane shuffles its
@@ -76,6 +77,30 @@ fn add_window(
             *range = (range.0.min(first), range.1.max(last));
         }
     }
+}
+
+/// The step of `states` and the plan from their cursors, or `Error::Budget`
+/// if its peak is more than `budget`.
+pub(super) fn needs(
+    epoch: &Epoch,
+    index: &Index,
+    lanes: Range<u32>,
+    states: &[LaneState],
+    budget: u64,
+) -> Result<(u64, Vec<Need>), Error> {
+    assert_eq!(states.len(), lanes.len(), "one state for each lane");
+    let step = states.first().map_or(0, |s| s.step);
+    assert!(
+        states.iter().all(|s| s.step == step),
+        "lane states from one step"
+    );
+    let needs = resume(epoch, index, lanes, states).map_err(Error::State)?;
+    let needed = peak(&needs);
+    if needed > budget / 1024 {
+        let needed = needed * 1024;
+        return Err(Error::Budget { needed, budget });
+    }
+    Ok((step, needs))
 }
 
 /// The plan of lanes `lanes` at `states`. It starts at each lane's cursor,

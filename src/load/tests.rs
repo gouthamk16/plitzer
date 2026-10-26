@@ -9,7 +9,7 @@ use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
 use tempfile::TempDir;
 
-use super::plan::{at_cursors, cursors, plan};
+use super::plan::{at_cursors, cursors, peak, plan, resume};
 use super::*;
 
 mod budget;

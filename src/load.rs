@@ -16,12 +16,12 @@ use crate::read::{self, Reader, RowGroupTokens};
 mod plan;
 mod replay;
 
-use plan::{Need, peak, resume};
+use plan::{Need, needs};
 
 #[derive(Debug)]
 pub enum Error {
     /// The budget is below the most the GPU's lanes need at once, at one
-    /// step or to replay one chunk of a leftover, so the loader would wait
+    /// step or to replay one part of a leftover, so the loader would wait
     /// for itself.
     Budget {
         needed: u64,
@@ -127,22 +127,11 @@ impl Loader {
         states: &[LaneState],
         budget: u64,
     ) -> Result<Self, Error> {
-        assert_eq!(states.len(), lanes.len(), "one state for each lane");
-        let step = states.first().map_or(0, |s| s.step);
-        assert!(
-            states.iter().all(|s| s.step == step),
-            "lane states from one step"
-        );
-        let needs = resume(&epoch, &index, lanes.clone(), states).map_err(Error::State)?;
-        let (budget_kib, needed) = (budget / 1024, peak(&needs));
-        if needed > budget_kib {
-            let needed = needed * 1024;
-            return Err(Error::Budget { needed, budget });
-        }
+        let (step, needs) = needs(&epoch, &index, lanes.clone(), states, budget)?;
         let (r, i) = (reader.clone(), index.clone());
         let lanes = replay::lanes(&epoch, r, i, lanes, states, budget).await?;
         let held = Arc::new(AtomicUsize::new(0));
-        let (arrivals, driver) = prefetch(&needs, reader, index, budget_kib, held.clone());
+        let (arrivals, driver) = prefetch(&needs, reader, index, budget / 1024, held.clone());
         let mut loader = Loader {
             epoch,
             lanes,
