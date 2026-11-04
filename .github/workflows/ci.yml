@@ -25,6 +25,8 @@ jobs:
         working-directory: plitzer-py
         run: |
           uv venv -p 3.11
+          # The CPU build, for mypy to check plitzer.torch against torch's types.
+          uv pip install torch --index-url https://download.pytorch.org/whl/cpu
           uv pip install ruff mypy numpy pyarrow pytest
           uv run --no-project ruff check python tests
           uv run --no-project ruff format --check python tests
@@ -54,6 +56,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: astral-sh/setup-uv@v6
       - run: uv venv -p 3.11
+      # The CPU build of torch, for the plitzer.torch tests.
+      - run: uv pip install torch --index-url https://download.pytorch.org/whl/cpu
       - run: uv pip install maturin pytest numpy pyarrow
       - run: uv run --no-project maturin develop -m plitzer-py/Cargo.toml
       - run: uv run --no-project python -m pytest plitzer-py/tests

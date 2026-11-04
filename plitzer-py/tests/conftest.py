@@ -1,3 +1,4 @@
+import importlib.util
 import os
 from collections.abc import Mapping
 from pathlib import Path
@@ -8,6 +9,9 @@ import pyarrow.parquet as pq
 import pytest
 
 import plitzer
+
+# torch is an optional extra. Find it without importing it, which is slow.
+collect_ignore = [] if importlib.util.find_spec("torch") else ["test_torch.py"]
 
 
 class Extras(TypedDict, total=False):

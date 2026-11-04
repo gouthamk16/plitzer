@@ -35,6 +35,24 @@ while loader.epoch < 3:                  # also right after loader.resume(state)
     state = loader.checkpoint()          # this GPU's part; plitzer.merge(parts) joins all GPUs
 ```
 
+With PyTorch (`pip install plitzer[torch]`), `plitzer.torch.Dataset` takes the same settings. It reads the rank and world from `torch.distributed`, and its `state_dict()` is one global checkpoint that resumes on any number of GPUs:
+
+```python
+from torch.utils.data import DataLoader
+import plitzer.torch
+
+dataset = plitzer.torch.Dataset("s3://bucket/fineweb-edu", seed=0, lanes=512, window=64,
+                                seq_len=2048, docs=4, cap=4096, pad=0, budget=8 << 30)
+loader = DataLoader(dataset, batch_size=None, num_workers=0)  # each item is one step
+while dataset.epoch < 3:                 # also right after dataset.load_state_dict(state)
+    for batch in loader:                 # batch.tokens: (lanes per GPU, seq_len) int32
+        ...
+    state = dataset.state_dict()         # call it on every rank: it gathers all GPUs
+# later, on any number of GPUs: dataset.load_state_dict(state)
+```
+
+The state is the position of the next batch the dataset gives, so a loop that prefetches batches before training them skips those on a resume ([#22](https://github.com/gouthamk16/plitzer/issues/22)).
+
 S3 credentials come from the usual `AWS_*` variables, or from `storage_options={"endpoint": ..., "region": ...}`.
 
 The design, its rationale and the decision log are in [docs/design.md](docs/design.md).
@@ -53,10 +71,10 @@ The design, its rationale and the decision log are in [docs/design.md](docs/desi
 - [x] **I/O:** async reads with `object_store` (local disk and S3, tested against versitygw), plus a prefetch queue capped by bytes
   - [x] read one row group's token column without its footer (local disk and S3)
   - [x] prefetch each GPU's row groups for a window, capped by bytes
-- [ ] **Python:** PyO3 and maturin bindings, a PyTorch `IterableDataset` with `state_dict()`, and Arrow PyCapsule export
+- [x] **Python:** PyO3 and maturin bindings, a PyTorch `IterableDataset` with `state_dict()`, and Arrow PyCapsule export
   - [x] typed checkpoint bytes that merge across GPUs, and a per-GPU session that runs epochs and refuses a mismatched resume
   - [x] bindings: a `plitzer` wheel exporting batches through DLPack and Arrow
-  - [ ] `plitzer.torch` `IterableDataset` with `state_dict()` and `load_state_dict()`
+  - [x] `plitzer.torch` `IterableDataset` with `state_dict()` and `load_state_dict()`
 - [ ] **End-to-end test:** kill training at a random step, resume on a different GPU count, and check the sample-stream hash matches
 - [ ] **Read amplification check:** measure bytes read per GPU on real data. Lane slices simulate at 1.01–1.25×. Add a per-node cache only if it's needed
 - [ ] **Benchmarks:** publish a comparison table against Mosaic and HF
