@@ -1,13 +1,15 @@
 import importlib.util
 import os
+import random
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Protocol, TypedDict, Unpack
+from typing import NamedTuple, Protocol, TypedDict, Unpack
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
+import e2e
 import plitzer
 
 # torch is an optional extra. Find it without importing it, which is slow.
@@ -96,3 +98,39 @@ def make(dataset: Path, tmp_path: Path) -> MakeLoader:
         return plitzer.Loader(str(dataset), **args)
 
     return make
+
+
+class E2E(NamedTuple):
+    """The end-to-end tests' dataset and the run that never stops."""
+
+    data: Path
+    cache: Path
+    epoch: int  # steps in one epoch
+    steps: int  # steps in the run: 2.5 epochs
+    want: e2e.Stream
+
+
+@pytest.fixture(scope="session")
+def e2e_data(tmp_path_factory: pytest.TempPathFactory) -> E2E:
+    """Eight files of row groups of 5 rows, every token unique, and the
+    stream of one GPU over 2.5 epochs."""
+    base = tmp_path_factory.mktemp("e2e")
+    data = base / "data"
+    data.mkdir()
+    for f in range(8):
+        rows = [
+            [f * 100_000 + r * 100 + t for t in range(1 + 5 * ((3 * f + r) % 7))]
+            for r in range(11 + 2 * f)
+        ]
+        table = pa.table({"tokens": pa.array(rows, pa.list_(pa.int32()))})
+        pq.write_table(table, data / f"{f}.parquet", row_group_size=5)
+    epoch, steps, want = e2e.reference(data, base / "cache", 2.5)
+    return E2E(data, base / "cache", epoch, steps, want)
+
+
+def e2e_seeds(count: int) -> list[int]:
+    """`PLITZER_E2E_SEED` to repeat a failure, else new seeds each run."""
+    given = os.environ.get("PLITZER_E2E_SEED")
+    if given:
+        return [int(given)]
+    return [random.randrange(2**32) for _ in range(count)]

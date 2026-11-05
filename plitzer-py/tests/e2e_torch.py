@@ -1,7 +1,7 @@
 """The end-to-end trainer with `plitzer.torch`: a gloo job whose ranks save
 one global state through the collective `state_dict()`."""
 
-import os
+import io
 from collections.abc import Iterable
 from pathlib import Path
 
@@ -43,19 +43,14 @@ def torch_rank(rank: int, job: Job) -> None:
     def save(step: int) -> None:
         state = ds.state_dict()  # a collective: every rank calls it
         if rank == 0:
-            path = Path(job.out, f"state-{step}.pt")
-            temp = path.with_name(path.name + ".tmp")
-            torch.save({"step": step, "plitzer": state["plitzer"]}, temp)
-            os.replace(temp, path)
+            data = io.BytesIO()
+            torch.save(state, data)
+            e2e.atomic_write(Path(job.out, f"state-{step}.pt"), data.getvalue())
 
     e2e.train(job, rank, ds.lanes, epoch, save)
     dist.destroy_process_group()
 
 
-def last_torch_checkpoint(job: Job) -> tuple[int, str | None]:
-    """The newest state that rank 0 saved (none: step 0)."""
-    for step in range(job.steps - job.steps % e2e.EVERY, 0, -e2e.EVERY):
-        path = Path(job.out, f"state-{step}.pt")
-        if path.exists():
-            return step, str(path)
-    return 0, None
+def torch_checkpoint(job: Job, step: int) -> str:
+    """The state that rank 0 saved at `step`."""
+    return str(Path(job.out, f"state-{step}.pt"))
