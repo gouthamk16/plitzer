@@ -50,6 +50,11 @@ FOREVER = 10**9  # the steps of a run that only a kill ends
 # The exit code of a killed rank: SIGKILL on POSIX; on Windows,
 # multiprocessing reports its TerminateProcess as SIGTERM.
 KILLED = -signal.SIGTERM if sys.platform == "win32" else -signal.SIGKILL
+# The exit code of a gloo rank whose gather failed because a peer died.
+PEER_DIED = 3
+# Steps between the kill step and the end of the run: the slowest rank can
+# save a few more steps (PAUSE each) between the poll and its kill.
+MARGIN = 6
 
 Stream = dict[tuple[int, int], str]
 Arrays = tuple[npt.NDArray[np.generic], npt.NDArray[np.generic]]
@@ -116,14 +121,14 @@ def atomic_write(path: Path, data: bytes) -> None:
     temp = path.with_name(path.name + ".tmp")
     temp.write_bytes(data)
     # Windows refuses a rename while a scanner holds the new file open.
-    for attempt in range(20):
+    for attempt in range(9):  # about 2.5 s in all
         try:
             os.replace(temp, path)
             return
         except PermissionError:
-            if attempt == 19:
+            if attempt == 8:
                 raise
-            time.sleep(0.01)
+            time.sleep(0.01 * 2**attempt)
 
 
 def loader_rank(rank: int, job: Job) -> None:
@@ -302,9 +307,8 @@ def scenario(seed: int, ends: list[int], steps: int) -> Scenario:
     at the start of the next epoch."""
     rng = random.Random(seed)
     old, new = rng.sample(WORLDS, 2)
-    # A few steps after the kill step: the slowest rank may save one or two
-    # more before its kill, and the resume must leave steps to compare.
-    last = steps - 3
+    # The resume must leave steps to compare: see MARGIN.
+    last = steps - MARGIN
     boundaries = [e for e in ends if e <= last]
     if boundaries and rng.random() < 1 / 3:
         return Scenario(seed, rng.choice(boundaries), old, new, True)
@@ -332,9 +336,10 @@ def kill_and_resume(
     old = Job(at[0], str(base / "old"), at[1], case.old, 0, FOREVER, None)
     ran = run(target, old, case.kill_at)
     if gloo:
-        # A gloo rank that sees a dead peer can end with an error just
-        # before its own kill: each rank reached the kill step, none ended.
-        killed = ran.killed and KILLED in ran.codes and 0 not in ran.codes
+        # A gloo rank that sees a dead peer can end just before its own
+        # kill, with PEER_DIED; any other end is a failure of its own.
+        ends = {KILLED, PEER_DIED}
+        killed = ran.killed and KILLED in ran.codes and set(ran.codes) <= ends
     else:
         killed = ran.killed and ran.codes == [KILLED] * case.old
     assert killed, f"{case}: not killed: {ran}"

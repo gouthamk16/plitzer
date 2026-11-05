@@ -102,7 +102,7 @@ def make(dataset: Path, tmp_path: Path) -> MakeLoader:
 
 class E2E(NamedTuple):
     """The end-to-end tests' dataset, its warm index cache, and the run
-    that never stops, over 2.5 epochs."""
+    that never stops, over 3.5 epochs."""
 
     data: Path
     cache: Path
@@ -112,7 +112,7 @@ class E2E(NamedTuple):
 @pytest.fixture(scope="session")
 def e2e_data(tmp_path_factory: pytest.TempPathFactory) -> E2E:
     """Eight files of row groups of 5 rows, every token unique, and the
-    stream of one GPU over 2.5 epochs."""
+    stream of one GPU over 3.5 epochs."""
     base = tmp_path_factory.mktemp("e2e")
     data = base / "data"
     data.mkdir()
@@ -123,7 +123,7 @@ def e2e_data(tmp_path_factory: pytest.TempPathFactory) -> E2E:
         ]
         table = pa.table({"tokens": pa.array(rows, pa.list_(pa.int32()))})
         pq.write_table(table, data / f"{f}.parquet", row_group_size=5)
-    return E2E(data, base / "cache", e2e.reference(data, base / "cache", 2.5))
+    return E2E(data, base / "cache", e2e.reference(data, base / "cache", 3.5))
 
 
 def e2e_seeds(count: int) -> list[int]:

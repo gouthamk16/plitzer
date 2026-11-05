@@ -2,6 +2,7 @@
 one global state through the collective `state_dict()`."""
 
 import io
+import os
 from collections.abc import Iterable
 from pathlib import Path
 
@@ -41,7 +42,11 @@ def torch_rank(rank: int, job: Job) -> None:
             yield b.tokens.numpy(), b.lengths.numpy()
 
     def save(step: int) -> None:
-        state = ds.state_dict()  # a collective: every rank calls it
+        try:
+            state = ds.state_dict()  # a collective: every rank calls it
+        except RuntimeError:
+            # A peer was killed in this gather: see e2e.PEER_DIED.
+            os._exit(e2e.PEER_DIED)
         path = Path(job.out, f"state-{step}")
         if rank == 0 and path.exists():  # the epoch end: see e2e.train
             saved = torch.load(path, weights_only=True)["plitzer"]
