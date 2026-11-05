@@ -161,12 +161,13 @@ def saved(out: Path, prefix: str) -> set[int]:
     return {int(n[len(prefix) :]) for n in names}
 
 
-def loader_checkpoint(job: Job) -> tuple[int, str]:
-    """The newest step that every rank saved a part of, as a real trainer
-    finds it after a crash, and those parts merged into one file."""
+def loader_checkpoint(job: Job, step: int | None) -> tuple[int, str]:
+    """The parts saved at `step`, else at the newest step that every rank
+    saved, as a real trainer finds it after a crash, merged into one file."""
     out = Path(job.out)
-    steps = set.intersection(*(saved(out, f"part-{r}-") for r in range(job.world)))
-    step = max(steps)
+    if step is None:
+        ranks = range(job.world)
+        step = max(set.intersection(*(saved(out, f"part-{r}-") for r in ranks)))
     parts = [out / f"part-{r}-{step}" for r in range(job.world)]
     merged = out / f"merged-{step}"
     merged.write_bytes(plitzer.merge([p.read_bytes() for p in parts]))
@@ -193,21 +194,23 @@ def run(target: Callable[[int, Job], None], job: Job, kill_at: int | None) -> Ra
             p.start()
         deadline = time.monotonic() + DEADLINE
         while any(p.is_alive() for p in ranks) and time.monotonic() < deadline:
-            if kill_at is not None:
-                if reached(job, kill_at):
-                    killed = True
-                    break
-                # A rank that ends by itself never reaches the kill.
-                if any(p.exitcode is not None for p in ranks):
-                    break
+            if kill_at is not None and reached(job, kill_at):
+                killed = True
+                break
+            # A rank that fails leaves the others waiting for it; one that
+            # ends by itself before a kill never reaches it.
+            ended = [p.exitcode for p in ranks if p.exitcode is not None]
+            if any(ended) or (kill_at is not None and ended):
+                break
             time.sleep(0.005)
     finally:
         # Kill them all before a join, and also when this loop fails: an
         # old run never ends by itself.
-        for p in ranks:
+        started = [p for p in ranks if p.pid is not None]
+        for p in started:
             if p.is_alive():
                 p.kill()
-        for p in ranks:
+        for p in started:
             p.join()
     return Ran(killed, [p.exitcode for p in ranks])
 
@@ -284,6 +287,7 @@ class Scenario:
     kill_at: int  # every rank has logged this step before the kill
     old: int  # world before the kill
     new: int  # world after it
+    boundary: bool  # kill_at ends an epoch: resume from exactly there
 
     def __str__(self) -> str:
         return (
@@ -298,20 +302,24 @@ def scenario(seed: int, ends: list[int], steps: int) -> Scenario:
     at the start of the next epoch."""
     rng = random.Random(seed)
     old, new = rng.sample(WORLDS, 2)
-    boundaries = [e for e in ends if e < steps]
+    # A few steps after the kill step: the slowest rank may save one or two
+    # more before its kill, and the resume must leave steps to compare.
+    last = steps - 3
+    boundaries = [e for e in ends if e <= last]
     if boundaries and rng.random() < 1 / 3:
-        return Scenario(seed, rng.choice(boundaries), old, new)
-    return Scenario(seed, rng.randint(1, steps - 1), old, new)
+        return Scenario(seed, rng.choice(boundaries), old, new, True)
+    return Scenario(seed, rng.randint(1, last), old, new, False)
 
 
 def kill_and_resume(
     target: Callable[[int, Job], None],
-    checkpoint: Callable[[Job], tuple[int, str]],
+    checkpoint: Callable[[Job, int | None], tuple[int, str]],
     location: Path,
     cache: Path,
     base: Path,
     case: Scenario,
     steps: int,
+    gloo: bool = False,
 ) -> Stream:
     """Runs world `case.old` of `target` until it is killed once every rank
     has logged `case.kill_at`, then world `case.new` from the newest
@@ -323,12 +331,15 @@ def kill_and_resume(
     at = (str(location), str(cache))
     old = Job(at[0], str(base / "old"), at[1], case.old, 0, FOREVER, None)
     ran = run(target, old, case.kill_at)
-    # A gloo rank that sees a dead peer can end with an error just before
-    # its own kill; each rank reached the kill step, and none ended well.
-    killed = ran.killed and KILLED in ran.codes and 0 not in ran.codes
+    if gloo:
+        # A gloo rank that sees a dead peer can end with an error just
+        # before its own kill: each rank reached the kill step, none ended.
+        killed = ran.killed and KILLED in ran.codes and 0 not in ran.codes
+    else:
+        killed = ran.killed and ran.codes == [KILLED] * case.old
     assert killed, f"{case}: not killed: {ran}"
-    start, resume = checkpoint(old)
-    assert start >= case.kill_at, f"{case}: no checkpoint at or after the kill"
+    start, resume = checkpoint(old, case.kill_at if case.boundary else None)
+    assert case.kill_at <= start < steps, f"{case}: resume at {start}"
     print(f"resume at step {start}")
     new = Job(at[0], str(base / "new"), at[1], case.new, start, steps, resume)
     codes = run(target, new, None).codes

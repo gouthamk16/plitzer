@@ -55,7 +55,9 @@ def torch_rank(rank: int, job: Job) -> None:
     dist.destroy_process_group()
 
 
-def torch_checkpoint(job: Job) -> tuple[int, str]:
-    """The newest state that rank 0 saved, as a real trainer finds it."""
-    step = max(e2e.saved(Path(job.out), "state-"))
+def torch_checkpoint(job: Job, step: int | None) -> tuple[int, str]:
+    """The state saved at `step`, else the newest state that rank 0 saved,
+    as a real trainer finds it."""
+    if step is None:
+        step = max(e2e.saved(Path(job.out), "state-"))
     return step, str(Path(job.out, f"state-{step}"))

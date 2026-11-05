@@ -24,5 +24,6 @@ def test_kill_and_resume_with_torch(e2e_data: E2E, tmp_path: Path) -> None:
         tmp_path,
         case,
         d.ref.steps,
+        gloo=True,
     )
     e2e.check(d.ref.want, got, d.ref.steps, str(case))
