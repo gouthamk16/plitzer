@@ -5,7 +5,7 @@
 | Field | Value |
 |---|---|
 | Status | Active. It changes with each feature PR. The code is pre-alpha. |
-| Last change | 2026-10-26, PR #21 |
+| Last change | 2026-11-05, PR #23 |
 | Language standard | ASD-STE100 (Simplified Technical English) |
 | Code | `src/` at the commit of this file |
 
@@ -93,7 +93,7 @@ Each term has only one definition in this document.
 | REQ-1 | The order is a pure function of `(seed, epoch, step)` and the index. | Golden tests in `shuffle`, `seed`, `order` and `pack`. | Met for the order and the packer |
 | REQ-2 | Each epoch supplies each document exactly once. The only exception is leftover tokens that a lane drops at its cap. | `order::exactly_once` and `pack::exactly_once_tokens` (property tests). | Met for the order and the packer |
 | REQ-3 | Lanes and their slices depend only on `(seed, epoch, B, W)`. They do not depend on world. | `Order` has no world input. `order::gpu_lanes_partition` (property test). | Met |
-| REQ-4 | A resume at step k gives the same tail as a run without a stop. This is also true when world changes. | `pack::resume_matches_tail` and `pack::world_invariant` (property tests). `session::resume_on_another_world_matches_one_run` reads Parquet files through checkpoint bytes. | Met |
+| REQ-4 | A resume at step k gives the same tail as a run without a stop. This is also true when world changes. | `pack::resume_matches_tail` and `pack::world_invariant` (property tests). `session::resume_on_another_world_matches_one_run` reads Parquet files through checkpoint bytes. `test_kill_and_resume_on_another_world` and `test_kill_and_resume_with_torch` kill a training run of real processes at a random step and resume it on another number of processes (sections 5.11 and 5.12). | Met |
 | REQ-5 | The output is the same on Linux, macOS and Windows. | CI runs the golden tests on the three systems. | Met |
 | REQ-6 | Read amplification is approximately 1 + world/W or less. | The reader reads no footer (`read::reads_without_footer`). Each GPU reads only its own slices (`load::reads_only_own_row_groups`). Planned: measurement on FineWeb-Edu. | Partly met |
 | REQ-7 | A dependency upgrade does not change the order without a test failure. | Golden tests pin the shuffle output and the key bytes. | Met |
@@ -1003,6 +1003,7 @@ An Arrow consumer moves the structs out of the capsules and sets their `release`
 | `test_resume_refuses_other_runs` | pytest | A different L, bad bytes and an incomplete merge give `CheckpointError`. |
 | `test_resume_refuses_a_hand_made_checkpoint` | pytest | Checksummed bytes whose leftover starts at an earlier document give `CheckpointError` at `resume`, and `checkpoint()` is unchanged. |
 | `test_bad_settings` | pytest | Bad settings, `world=-1`, `seed=2**200`, `lanes=4.0`, `docs=True`, a URL with `#` and a cache below a file give `ConfigError`. A missing folder gives `DataError`. |
+| `test_kill_and_resume_on_another_world` | pytest, end to end | Three times with a new seed: a run of 1 to 6 processes is killed at a random step of 2.5 epochs. Each rank saved its own part every 3 steps. The newest step that all ranks saved is merged and resumed on another number of processes. The batch of each step and lane, before and after the kill, is the same as one process with no stop. `PLITZER_E2E_SEED` repeats a seed. |
 | `test_forked_child_makes_its_own_loader` | pytest | In a child of `os.fork`, the copied loader gives `RuntimeError`. A new loader gives the same first batch as the parent. The child frees the copy with no wait. |
 | `test_s3_matches_local` | pytest | The same files on versitygw and on local disk give the same batches. |
 
@@ -1071,6 +1072,7 @@ class Dataset(IterableDataset[TokenBatch]):
 | `test_bad_settings` | pytest | `WORLD_SIZE=2` without `torch.distributed` gives `ConfigError`. A `WORLD_SIZE` that is not a count is ignored. |
 | `test_load_state_dict_refuses_bad_states` | pytest | A state with no `plitzer` key, with text, or with damaged bytes gives `CheckpointError`. A group without `torch.distributed` gives `ConfigError`. |
 | `test_state_dict_gathers_all_ranks` | pytest | Two gloo ranks give the same state. Four ranks and one rank resume from it with the batches of a run with no stop. |
+| `test_kill_and_resume_with_torch` | pytest, end to end | The same kill and resume as `test_kill_and_resume_on_another_world`, over gloo. Each rank calls `state_dict()`, and rank 0 saves it with `torch.save`. The resume reads it with `torch.load(weights_only=True)`. |
 
 ## 6. Read amplification
 
@@ -1180,6 +1182,7 @@ class Dataset(IterableDataset[TokenBatch]):
 | 2026-10-23 | #18 | Add the Python bindings (`plitzer-py/`), the store (`src/store.rs`, `src/store/s3.rs`) and `Session::ended`. Add a Python CI job on the three systems. The index makes the folder of its cache, and checks that it can write the cache before it reads the footers. |
 | 2026-10-26 | #20 | A resume replays leftovers one part at a time, then plans from the cursor (`Epoch::replay`, `Replay`, `src/load/replay.rs`). A resume needs no more budget than a run with no stop. |
 | 2026-10-26 | #21 | Add the PyTorch dataset (`plitzer/torch.py`): `Dataset`, `TokenBatch` and a collective `state_dict()`. torch is the optional extra `plitzer[torch]`. CI installs the CPU build of torch. |
+| 2026-11-05 | #23 | Add the end-to-end tests that kill a training run at a random step and resume it on another number of processes (`plitzer-py/tests/e2e.py`). |
 
 ## 10. Maintenance
 

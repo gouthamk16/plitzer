@@ -36,7 +36,7 @@ target-version = "py311"
 select = ["E", "F", "I", "UP", "B", "ANN"]
 
 [tool.ruff.lint.isort]
-known-first-party = ["plitzer", "conftest"]
+known-first-party = ["plitzer", "conftest", "e2e", "e2e_torch", "test_e2e"]
 
 [tool.mypy]
 strict = true
