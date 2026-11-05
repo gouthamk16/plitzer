@@ -7,7 +7,8 @@ stream does not depend on the number of processes that made it. It saves
 a checkpoint at every step, so the resume step is the kill step: once
 every rank has logged step k, every rank has saved step k. The ranks
 start with `spawn`, since a forked child cannot use the parent's Rust
-threads, and they import only numpy and plitzer.
+threads. This module imports only numpy and plitzer, so that each rank
+starts fast.
 """
 
 import hashlib
@@ -20,7 +21,7 @@ import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 import numpy as np
 import numpy.typing as npt
@@ -97,15 +98,31 @@ def train(
             save(step)
             if step == job.steps:
                 break
+        else:
+            # After StopIteration too: the state must be the one saved
+            # after the last batch, the start of the next epoch.
+            save(step)
         assert taken > 0, "an epoch gave no batch"
     os.close(log)
 
 
 def atomic_write(path: Path, data: bytes) -> None:
-    """Writes `data` so that a kill leaves either no file or the whole."""
+    """Writes `data` so that a kill leaves either no file or the whole. A
+    second write of one step must give the same bytes: see `train`."""
+    if path.exists():
+        assert path.read_bytes() == data, f"{path.name} changed after the epoch end"
+        return
     temp = path.with_name(path.name + ".tmp")
     temp.write_bytes(data)
-    os.replace(temp, path)
+    # Windows refuses a rename while a scanner holds the new file open.
+    for attempt in range(20):
+        try:
+            os.replace(temp, path)
+            return
+        except PermissionError:
+            if attempt == 19:
+                raise
+            time.sleep(0.01)
 
 
 def loader_rank(rank: int, job: Job) -> None:
@@ -144,12 +161,14 @@ def loader_checkpoint(job: Job, step: int) -> str:
     return str(merged)
 
 
-def run(
-    target: Callable[[int, Job], None], job: Job, kill_at: int | None
-) -> tuple[bool, list[int | None]]:
+class Ran(NamedTuple):
+    killed: bool  # the kill came, at `kill_at`
+    codes: list[int | None]  # the exit code of each rank
+
+
+def run(target: Callable[[int, Job], None], job: Job, kill_at: int | None) -> Ran:
     """Runs every rank of `job`. With `kill_at`, kills them all once each
-    has logged that step. Gives whether it killed them, and the exit code
-    of each rank."""
+    has logged that step."""
     Path(job.out).mkdir()
     spawn = multiprocessing.get_context("spawn")
     ranks = [
@@ -164,18 +183,28 @@ def run(
             killed = True
             break
         time.sleep(0.005)
+    # Kill them all before a join: a gloo rank that sees a dead peer could
+    # end by itself first.
     for p in ranks:
         if p.is_alive():
             p.kill()
+    for p in ranks:
         p.join()
-    return killed, [p.exitcode for p in ranks]
+    return Ran(killed, [p.exitcode for p in ranks])
 
 
 def reached(job: Job, step: int) -> bool:
-    """Whether every rank of `job` has logged `step`."""
+    """Whether every rank of `job` has logged `step`. A rank logs its steps
+    in order, so its last complete line tells; only the end is read."""
     for r in range(job.world):
-        steps = {s for s, _ in read(Path(job.out, f"log-{r}"))}
-        if step not in steps:
+        path = Path(job.out, f"log-{r}")
+        if not path.exists():
+            return False
+        with path.open("rb") as log:
+            log.seek(max(0, path.stat().st_size - 4096))
+            tail = log.read()
+        lines = tail[: tail.rfind(b"\n")].splitlines()
+        if not lines or int(lines[-1].split()[0]) < step:
             return False
     return True
 
@@ -199,23 +228,30 @@ def stream(out: Path, world: int) -> Stream:
     return joined
 
 
-def reference(location: Path, cache: Path, epochs: float) -> tuple[int, int, Stream]:
-    """One GPU, no stop, in this process: the steps of one epoch, the steps
-    of `epochs` epochs, and the stream of those steps."""
+class Reference(NamedTuple):
+    """One GPU, no stop."""
+
+    ends: list[int]  # the step count at the end of each epoch
+    steps: int  # the steps of the run
+    want: Stream
+
+
+def reference(location: Path, cache: Path, epochs: float) -> Reference:
+    """One GPU, no stop, in this process, for `epochs` epochs."""
     loader = plitzer.Loader(location, **SETTINGS, cache=str(cache))
     want: list[dict[int, str]] = []
-    counts = []
+    ends = []
     for _ in range(int(epochs) + 1):
-        before = len(want)
         for b in loader:
             tokens, lengths = np.from_dlpack(b.tokens), np.from_dlpack(b.lengths)
             lanes = range(SETTINGS["lanes"])
             want.append({i: digest(tokens[i], int(lengths[i])) for i in lanes})
-        counts.append(len(want) - before)
+        ends.append(len(want))
     whole = int(epochs)
-    steps = sum(counts[:whole]) + int(counts[whole] * (epochs - whole))
+    last = ends[whole] - (ends[whole - 1] if whole else 0)
+    steps = (ends[whole - 1] if whole else 0) + int(last * (epochs - whole))
     stream = {(s, i): d for s in range(steps) for i, d in want[s].items()}
-    return counts[0], steps, stream
+    return Reference(ends, steps, stream)
 
 
 @dataclass(frozen=True)
@@ -232,13 +268,13 @@ class Scenario:
         )
 
 
-def scenario(seed: int, epoch: int, steps: int) -> Scenario:
+def scenario(seed: int, ends: list[int], steps: int) -> Scenario:
     """A kill step and two different worlds, from `seed`. One time in
     three the kill step is an epoch boundary, where the checkpoint stands
     at the start of the next epoch."""
     rng = random.Random(seed)
     old, new = rng.sample(WORLDS, 2)
-    boundaries = list(range(epoch, steps, epoch))
+    boundaries = [e for e in ends if e < steps]
     if boundaries and rng.random() < 1 / 3:
         return Scenario(seed, rng.choice(boundaries), old, new)
     return Scenario(seed, rng.randint(1, steps - 1), old, new)
@@ -248,6 +284,7 @@ def kill_and_resume(
     target: Callable[[int, Job], None],
     checkpoint: Callable[[Job, int], str],
     location: Path,
+    cache: Path,
     base: Path,
     case: Scenario,
     steps: int,
@@ -256,14 +293,15 @@ def kill_and_resume(
     `case.kill_at`, then world `case.new` from the `checkpoint` of that
     step to `steps`. Gives the old run's stream before that step and the
     new run's after it."""
-    cache, base = str(base / "cache"), base / f"seed-{case.seed}"
+    base = base / f"seed-{case.seed}"
     base.mkdir()
-    old = Job(str(location), str(base / "old"), cache, case.old, 0, FOREVER, None)
-    killed, codes = run(target, old, case.kill_at)
-    assert killed and codes == [KILLED] * case.old, f"{case}: not killed: {codes}"
+    at = (str(location), str(cache))
+    old = Job(at[0], str(base / "old"), at[1], case.old, 0, FOREVER, None)
+    ran = run(target, old, case.kill_at)
+    assert ran.killed and ran.codes == [KILLED] * case.old, f"{case}: {ran}"
     start, resume = case.kill_at, checkpoint(old, case.kill_at)
-    new = Job(str(location), str(base / "new"), cache, case.new, start, steps, resume)
-    killed, codes = run(target, new, None)
+    new = Job(at[0], str(base / "new"), at[1], case.new, start, steps, resume)
+    codes = run(target, new, None).codes
     assert codes == [0] * case.new, f"{case}: the resumed run: {codes}"
     before = stream(Path(old.out), case.old)
     after = stream(Path(new.out), case.new)

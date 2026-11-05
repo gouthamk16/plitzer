@@ -10,8 +10,14 @@ def test_kill_and_resume_on_another_world(e2e_data: E2E, tmp_path: Path) -> None
     equals a run that never stopped."""
     d = e2e_data
     for seed in e2e_seeds(3):
-        case = e2e.scenario(seed, d.epoch, d.steps)
+        case = e2e.scenario(seed, d.ref.ends, d.ref.steps)
         got = e2e.kill_and_resume(
-            e2e.loader_rank, e2e.loader_checkpoint, d.data, tmp_path, case, d.steps
+            e2e.loader_rank,
+            e2e.loader_checkpoint,
+            d.data,
+            d.cache,
+            tmp_path,
+            case,
+            d.ref.steps,
         )
-        e2e.check(d.want, got, d.steps, str(case))
+        e2e.check(d.ref.want, got, d.ref.steps, str(case))
