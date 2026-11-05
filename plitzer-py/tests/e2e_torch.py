@@ -42,15 +42,20 @@ def torch_rank(rank: int, job: Job) -> None:
 
     def save(step: int) -> None:
         state = ds.state_dict()  # a collective: every rank calls it
-        if rank == 0:
+        path = Path(job.out, f"state-{step}")
+        if rank == 0 and path.exists():  # the epoch end: see e2e.train
+            saved = torch.load(path, weights_only=True)["plitzer"]
+            assert saved == state["plitzer"], "the state changed after the epoch end"
+        elif rank == 0:
             data = io.BytesIO()
             torch.save(state, data)
-            e2e.atomic_write(Path(job.out, f"state-{step}.pt"), data.getvalue())
+            e2e.atomic_write(path, data.getvalue())
 
     e2e.train(job, rank, ds.lanes, epoch, save)
     dist.destroy_process_group()
 
 
-def torch_checkpoint(job: Job, step: int) -> str:
-    """The state that rank 0 saved at `step`."""
-    return str(Path(job.out, f"state-{step}.pt"))
+def torch_checkpoint(job: Job) -> tuple[int, str]:
+    """The newest state that rank 0 saved, as a real trainer finds it."""
+    step = max(e2e.saved(Path(job.out), "state-"))
+    return step, str(Path(job.out, f"state-{step}"))

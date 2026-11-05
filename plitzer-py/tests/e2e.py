@@ -4,8 +4,9 @@ batches with a run that never stopped.
 
 The trainer logs one line per lane and step, `step lane digest`, so the
 stream does not depend on the number of processes that made it. It saves
-a checkpoint at every step, so the resume step is the kill step: once
-every rank has logged step k, every rank has saved step k. The ranks
+a checkpoint at every step; once every rank has logged step k, every rank
+has saved step k, so the newest complete checkpoint after the kill is at
+step k or later. The ranks
 start with `spawn`, since a forked child cannot use the parent's Rust
 threads. This module imports only numpy and plitzer, so that each rank
 starts fast.
@@ -140,7 +141,7 @@ def loader_rank(rank: int, job: Job) -> None:
             yield np.from_dlpack(b.tokens), np.from_dlpack(b.lengths)
 
     def save(step: int) -> None:
-        atomic_write(Path(job.out, f"part-{step}-{rank}"), loader.checkpoint())
+        atomic_write(Path(job.out, f"part-{rank}-{step}"), loader.checkpoint())
 
     train(job, rank, loader.lanes, epoch, save)
 
@@ -153,12 +154,23 @@ def barrier(job: Job, rank: int) -> None:
         time.sleep(0.005)
 
 
-def loader_checkpoint(job: Job, step: int) -> str:
-    """The parts that every rank saved at `step`, merged into one file."""
-    parts = [Path(job.out, f"part-{step}-{r}") for r in range(job.world)]
-    merged = Path(job.out, f"merged-{step}")
+def saved(out: Path, prefix: str) -> set[int]:
+    """The steps of the files `<prefix><step>` in `out`; a kill can leave a
+    `.tmp` file, which does not count."""
+    names = (p.name for p in out.glob(f"{prefix}*") if not p.name.endswith(".tmp"))
+    return {int(n[len(prefix) :]) for n in names}
+
+
+def loader_checkpoint(job: Job) -> tuple[int, str]:
+    """The newest step that every rank saved a part of, as a real trainer
+    finds it after a crash, and those parts merged into one file."""
+    out = Path(job.out)
+    steps = set.intersection(*(saved(out, f"part-{r}-") for r in range(job.world)))
+    step = max(steps)
+    parts = [out / f"part-{r}-{step}" for r in range(job.world)]
+    merged = out / f"merged-{step}"
     merged.write_bytes(plitzer.merge([p.read_bytes() for p in parts]))
-    return str(merged)
+    return step, str(merged)
 
 
 class Ran(NamedTuple):
@@ -175,21 +187,28 @@ def run(target: Callable[[int, Job], None], job: Job, kill_at: int | None) -> Ra
         spawn.Process(target=target, args=(r, job), daemon=True)
         for r in range(job.world)
     ]
-    for p in ranks:
-        p.start()
-    deadline, killed = time.monotonic() + DEADLINE, False
-    while any(p.is_alive() for p in ranks) and time.monotonic() < deadline:
-        if kill_at is not None and reached(job, kill_at):
-            killed = True
-            break
-        time.sleep(0.005)
-    # Kill them all before a join: a gloo rank that sees a dead peer could
-    # end by itself first.
-    for p in ranks:
-        if p.is_alive():
-            p.kill()
-    for p in ranks:
-        p.join()
+    killed = False
+    try:
+        for p in ranks:
+            p.start()
+        deadline = time.monotonic() + DEADLINE
+        while any(p.is_alive() for p in ranks) and time.monotonic() < deadline:
+            if kill_at is not None:
+                if reached(job, kill_at):
+                    killed = True
+                    break
+                # A rank that ends by itself never reaches the kill.
+                if any(p.exitcode is not None for p in ranks):
+                    break
+            time.sleep(0.005)
+    finally:
+        # Kill them all before a join, and also when this loop fails: an
+        # old run never ends by itself.
+        for p in ranks:
+            if p.is_alive():
+                p.kill()
+        for p in ranks:
+            p.join()
     return Ran(killed, [p.exitcode for p in ranks])
 
 
@@ -217,14 +236,19 @@ def read(path: Path) -> Stream:
     stream: Stream = {}
     for line in text[: text.rfind("\n") + 1].splitlines():
         step, lane, digest = line.split()
-        stream[int(step), int(lane)] = digest
+        key = (int(step), int(lane))
+        assert key not in stream, f"{path.name} logs {key} twice"
+        stream[key] = digest
     return stream
 
 
 def stream(out: Path, world: int) -> Stream:
     joined: Stream = {}
     for r in range(world):
-        joined.update(read(out / f"log-{r}"))
+        part = read(out / f"log-{r}")
+        twice = joined.keys() & part.keys()
+        assert not twice, f"two ranks log {min(twice)}"
+        joined.update(part)
     return joined
 
 
@@ -257,13 +281,13 @@ def reference(location: Path, cache: Path, epochs: float) -> Reference:
 @dataclass(frozen=True)
 class Scenario:
     seed: int
-    kill_at: int  # also the resume step
+    kill_at: int  # every rank has logged this step before the kill
     old: int  # world before the kill
     new: int  # world after it
 
     def __str__(self) -> str:
         return (
-            f"seed {self.seed}: kill and resume at step {self.kill_at}, "
+            f"seed {self.seed}: kill after step {self.kill_at}, "
             f"world {self.old} then {self.new}"
         )
 
@@ -282,27 +306,33 @@ def scenario(seed: int, ends: list[int], steps: int) -> Scenario:
 
 def kill_and_resume(
     target: Callable[[int, Job], None],
-    checkpoint: Callable[[Job, int], str],
+    checkpoint: Callable[[Job], tuple[int, str]],
     location: Path,
     cache: Path,
     base: Path,
     case: Scenario,
     steps: int,
 ) -> Stream:
-    """Runs world `case.old` of `target` until it is killed at
-    `case.kill_at`, then world `case.new` from the `checkpoint` of that
-    step to `steps`. Gives the old run's stream before that step and the
-    new run's after it."""
+    """Runs world `case.old` of `target` until it is killed once every rank
+    has logged `case.kill_at`, then world `case.new` from the newest
+    checkpoint that `checkpoint` finds after the kill, to `steps`. Gives
+    the old run's stream before that step and the new run's after it."""
+    print(case)  # pytest shows it with any failure, also one without `case`
     base = base / f"seed-{case.seed}"
     base.mkdir()
     at = (str(location), str(cache))
     old = Job(at[0], str(base / "old"), at[1], case.old, 0, FOREVER, None)
     ran = run(target, old, case.kill_at)
-    assert ran.killed and ran.codes == [KILLED] * case.old, f"{case}: {ran}"
-    start, resume = case.kill_at, checkpoint(old, case.kill_at)
+    # A gloo rank that sees a dead peer can end with an error just before
+    # its own kill; each rank reached the kill step, and none ended well.
+    killed = ran.killed and KILLED in ran.codes and 0 not in ran.codes
+    assert killed, f"{case}: not killed: {ran}"
+    start, resume = checkpoint(old)
+    assert start >= case.kill_at, f"{case}: no checkpoint at or after the kill"
+    print(f"resume at step {start}")
     new = Job(at[0], str(base / "new"), at[1], case.new, start, steps, resume)
     codes = run(target, new, None).codes
-    assert codes == [0] * case.new, f"{case}: the resumed run: {codes}"
+    assert codes == [0] * case.new, f"{case}, resumed at {start}: {codes}"
     before = stream(Path(old.out), case.old)
     after = stream(Path(new.out), case.new)
     return {**{k: v for k, v in before.items() if k[0] < start}, **after}
