@@ -1072,7 +1072,7 @@ class Dataset(IterableDataset[TokenBatch]):
 | `test_bad_settings` | pytest | `WORLD_SIZE=2` without `torch.distributed` gives `ConfigError`. A `WORLD_SIZE` that is not a count is ignored. |
 | `test_load_state_dict_refuses_bad_states` | pytest | A state with no `plitzer` key, with text, or with damaged bytes gives `CheckpointError`. A group without `torch.distributed` gives `ConfigError`. |
 | `test_state_dict_gathers_all_ranks` | pytest | Two gloo ranks give the same state. Four ranks and one rank resume from it with the batches of a run with no stop. |
-| `test_kill_and_resume_with_torch` | pytest, end to end | The same kill and resume as `test_kill_and_resume_on_another_world`, over gloo. Each rank calls `state_dict()`, and rank 0 saves it with `torch.save`. The resume reads it with `torch.load(weights_only=True)`. |
+| `test_kill_and_resume_with_torch` | pytest, end to end | The same kill and resume as `test_kill_and_resume_on_another_world`, over gloo. Each rank calls `state_dict()`, and rank 0 saves it with `torch.save`. The resume reads it with `torch.load(weights_only=True)`. A rank whose gather fails because a peer is killed can end with its own exit code, `PEER_DIED`. Each other end before the kill is a failure. |
 
 ## 6. Read amplification
 
@@ -1182,7 +1182,7 @@ class Dataset(IterableDataset[TokenBatch]):
 | 2026-10-23 | #18 | Add the Python bindings (`plitzer-py/`), the store (`src/store.rs`, `src/store/s3.rs`) and `Session::ended`. Add a Python CI job on the three systems. The index makes the folder of its cache, and checks that it can write the cache before it reads the footers. |
 | 2026-10-26 | #20 | A resume replays leftovers one part at a time, then plans from the cursor (`Epoch::replay`, `Replay`, `src/load/replay.rs`). A resume needs no more budget than a run with no stop. |
 | 2026-10-26 | #21 | Add the PyTorch dataset (`plitzer/torch.py`): `Dataset`, `TokenBatch` and a collective `state_dict()`. torch is the optional extra `plitzer[torch]`. CI installs the CPU build of torch. |
-| 2026-11-05 | #23 | Add the end-to-end tests that kill a training run at a random step and resume it on another number of processes (`plitzer-py/tests/e2e.py`). |
+| 2026-11-05 | #23 | Add the end-to-end tests that kill a training run at a random step and resume it on another number of processes (`plitzer-py/tests/e2e.py`, `e2e_stream.py`, `e2e_torch.py`). |
 
 ## 10. Maintenance
 

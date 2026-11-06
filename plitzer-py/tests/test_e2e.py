@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import e2e
+import e2e_stream
 from conftest import E2E, e2e_seeds
 
 
@@ -20,4 +21,4 @@ def test_kill_and_resume_on_another_world(e2e_data: E2E, tmp_path: Path) -> None
             case,
             d.ref.steps,
         )
-        e2e.check(d.ref.want, got, d.ref.steps, str(case))
+        e2e_stream.check(d.ref.want, got, d.ref.steps, str(case))

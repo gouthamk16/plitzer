@@ -4,6 +4,7 @@ import pytest
 import torch.distributed as dist
 
 import e2e
+import e2e_stream
 import e2e_torch
 from conftest import E2E, e2e_seeds
 
@@ -26,4 +27,4 @@ def test_kill_and_resume_with_torch(e2e_data: E2E, tmp_path: Path) -> None:
         d.ref.steps,
         gloo=True,
     )
-    e2e.check(d.ref.want, got, d.ref.steps, str(case))
+    e2e_stream.check(d.ref.want, got, d.ref.steps, str(case))

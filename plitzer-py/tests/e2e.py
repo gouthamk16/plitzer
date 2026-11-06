@@ -1,18 +1,16 @@
 """End-to-end harness: train on several processes, kill them at a random
 step, resume on another number of processes, and compare the stream of
-batches with a run that never stopped.
+batches with a run that never stopped (see e2e_stream).
 
 The trainer logs one line per lane and step, `step lane digest`, so the
 stream does not depend on the number of processes that made it. It saves
 a checkpoint at every step; once every rank has logged step k, every rank
 has saved step k, so the newest complete checkpoint after the kill is at
-step k or later. The ranks
-start with `spawn`, since a forked child cannot use the parent's Rust
-threads. This module imports only numpy and plitzer, so that each rank
-starts fast.
+step k or later. The ranks start with `spawn`, since a forked child cannot
+use the parent's Rust threads. This module imports only numpy and plitzer,
+so that each rank starts fast.
 """
 
-import hashlib
 import multiprocessing
 import os
 import random
@@ -21,42 +19,29 @@ import sys
 import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
+from multiprocessing.synchronize import Barrier
 from pathlib import Path
-from typing import TYPE_CHECKING, NamedTuple
+from typing import NamedTuple
 
 import numpy as np
 import numpy.typing as npt
 
 import plitzer
+from e2e_stream import SETTINGS, Stream, digest, stream
 
-if TYPE_CHECKING:
-    from conftest import Settings
-
-# 12 lanes: the world can be 1, 2, 3, 4 or 6.
-WORLDS = [1, 2, 3, 4, 6]
-SETTINGS: "Settings" = {
-    "seed": 5,
-    "lanes": 12,
-    "window": 4,
-    "seq_len": 16,
-    "docs": 2,
-    "cap": 24,
-    "pad": 2**32 - 1,
-    "budget": 1 << 30,
-}
+WORLDS = [1, 2, 3, 4, 6]  # the divisors of SETTINGS["lanes"] that are worlds
 PAUSE = 0.02  # seconds of "training" per step, so a kill lands mid-run
 DEADLINE = 180.0  # seconds for one run of all its ranks
-FOREVER = 10**9  # the steps of a run that only a kill ends
 # The exit code of a killed rank: SIGKILL on POSIX; on Windows,
 # multiprocessing reports its TerminateProcess as SIGTERM.
 KILLED = -signal.SIGTERM if sys.platform == "win32" else -signal.SIGKILL
 # The exit code of a gloo rank whose gather failed because a peer died.
 PEER_DIED = 3
-# Steps between the kill step and the end of the run: the slowest rank can
-# save a few more steps (PAUSE each) between the poll and its kill.
+# The run to kill stops at step kill_at + MARGIN - 1 and waits there for
+# the kill. So the resume step is below the end of the run also when the
+# kill comes late, and a kill on time still lands mid-run.
 MARGIN = 6
 
-Stream = dict[tuple[int, int], str]
 Arrays = tuple[npt.NDArray[np.generic], npt.NDArray[np.generic]]
 
 
@@ -65,17 +50,16 @@ class Job:
     """One run of `world` ranks, from step `start` to step `steps`."""
 
     location: str
-    out: str  # this run's logs, checkpoints and barrier files
+    out: str  # this run's logs and checkpoints
     cache: str
     world: int
     start: int
     steps: int
     resume: str | None  # the global checkpoint to resume from
+    hold: bool  # wait for the kill at `steps`, not end
 
 
-def digest(tokens: npt.NDArray[np.generic], length: int) -> str:
-    data = tokens.tobytes() + length.to_bytes(4, "little")
-    return hashlib.sha256(data).hexdigest()[:16]
+Rank = Callable[[int, Job, Barrier], None]
 
 
 def train(
@@ -109,6 +93,8 @@ def train(
             # after the last batch, the start of the next epoch.
             save(step)
         assert taken > 0, "an epoch gave no batch"
+    while job.hold:
+        time.sleep(1)
     os.close(log)
 
 
@@ -131,7 +117,7 @@ def atomic_write(path: Path, data: bytes) -> None:
             time.sleep(0.01 * 2**attempt)
 
 
-def loader_rank(rank: int, job: Job) -> None:
+def loader_rank(rank: int, job: Job, ready: Barrier) -> None:
     """One rank with `plitzer.Loader`: it saves its own part, and the parts
     are merged at the resume."""
     loader = plitzer.Loader(
@@ -139,7 +125,7 @@ def loader_rank(rank: int, job: Job) -> None:
     )
     if job.resume:
         loader.resume(Path(job.resume).read_bytes())
-    barrier(job, rank)
+    ready.wait()
 
     def epoch() -> Iterable[Arrays]:
         for b in loader:
@@ -149,14 +135,6 @@ def loader_rank(rank: int, job: Job) -> None:
         atomic_write(Path(job.out, f"part-{rank}-{step}"), loader.checkpoint())
 
     train(job, rank, loader.lanes, epoch, save)
-
-
-def barrier(job: Job, rank: int) -> None:
-    """Waits for every rank to be ready, so that the kill finds them all
-    running. torch's ranks need none: their gather keeps them in step."""
-    Path(job.out, f"ready-{rank}").touch()
-    while not all(Path(job.out, f"ready-{r}").exists() for r in range(job.world)):
-        time.sleep(0.005)
 
 
 def saved(out: Path, prefix: str) -> set[int]:
@@ -184,13 +162,15 @@ class Ran(NamedTuple):
     codes: list[int | None]  # the exit code of each rank
 
 
-def run(target: Callable[[int, Job], None], job: Job, kill_at: int | None) -> Ran:
+def run(target: Rank, job: Job, kill_at: int | None) -> Ran:
     """Runs every rank of `job`. With `kill_at`, kills them all once each
     has logged that step."""
     Path(job.out).mkdir()
     spawn = multiprocessing.get_context("spawn")
+    # Every rank runs before the kill can come.
+    ready = spawn.Barrier(job.world)
     ranks = [
-        spawn.Process(target=target, args=(r, job), daemon=True)
+        spawn.Process(target=target, args=(r, job, ready), daemon=True)
         for r in range(job.world)
     ]
     killed = False
@@ -236,56 +216,6 @@ def reached(job: Job, step: int) -> bool:
     return True
 
 
-def read(path: Path) -> Stream:
-    """The complete lines of a log; a kill can leave the last one cut."""
-    if not path.exists():
-        return {}
-    text = path.read_text()
-    stream: Stream = {}
-    for line in text[: text.rfind("\n") + 1].splitlines():
-        step, lane, digest = line.split()
-        key = (int(step), int(lane))
-        assert key not in stream, f"{path.name} logs {key} twice"
-        stream[key] = digest
-    return stream
-
-
-def stream(out: Path, world: int) -> Stream:
-    joined: Stream = {}
-    for r in range(world):
-        part = read(out / f"log-{r}")
-        twice = joined.keys() & part.keys()
-        assert not twice, f"two ranks log {min(twice)}"
-        joined.update(part)
-    return joined
-
-
-class Reference(NamedTuple):
-    """One GPU, no stop."""
-
-    ends: list[int]  # the step count at the end of each epoch
-    steps: int  # the steps of the run
-    want: Stream
-
-
-def reference(location: Path, cache: Path, epochs: float) -> Reference:
-    """One GPU, no stop, in this process, for `epochs` epochs."""
-    loader = plitzer.Loader(location, **SETTINGS, cache=str(cache))
-    want: list[dict[int, str]] = []
-    ends = []
-    for _ in range(int(epochs) + 1):
-        for b in loader:
-            tokens, lengths = np.from_dlpack(b.tokens), np.from_dlpack(b.lengths)
-            lanes = range(SETTINGS["lanes"])
-            want.append({i: digest(tokens[i], int(lengths[i])) for i in lanes})
-        ends.append(len(want))
-    whole = int(epochs)
-    last = ends[whole] - (ends[whole - 1] if whole else 0)
-    steps = (ends[whole - 1] if whole else 0) + int(last * (epochs - whole))
-    stream = {(s, i): d for s in range(steps) for i, d in want[s].items()}
-    return Reference(ends, steps, stream)
-
-
 @dataclass(frozen=True)
 class Scenario:
     seed: int
@@ -316,7 +246,7 @@ def scenario(seed: int, ends: list[int], steps: int) -> Scenario:
 
 
 def kill_and_resume(
-    target: Callable[[int, Job], None],
+    target: Rank,
     checkpoint: Callable[[Job, int | None], tuple[int, str]],
     location: Path,
     cache: Path,
@@ -333,7 +263,8 @@ def kill_and_resume(
     base = base / f"seed-{case.seed}"
     base.mkdir()
     at = (str(location), str(cache))
-    old = Job(at[0], str(base / "old"), at[1], case.old, 0, FOREVER, None)
+    hold = case.kill_at + MARGIN - 1
+    old = Job(at[0], str(base / "old"), at[1], case.old, 0, hold, None, True)
     ran = run(target, old, case.kill_at)
     if gloo:
         # A gloo rank that sees a dead peer can end just before its own
@@ -346,17 +277,9 @@ def kill_and_resume(
     start, resume = checkpoint(old, case.kill_at if case.boundary else None)
     assert case.kill_at <= start < steps, f"{case}: resume at {start}"
     print(f"resume at step {start}")
-    new = Job(at[0], str(base / "new"), at[1], case.new, start, steps, resume)
+    new = Job(at[0], str(base / "new"), at[1], case.new, start, steps, resume, False)
     codes = run(target, new, None).codes
     assert codes == [0] * case.new, f"{case}, resumed at {start}: {codes}"
     before = stream(Path(old.out), case.old)
     after = stream(Path(new.out), case.new)
     return {**{k: v for k, v in before.items() if k[0] < start}, **after}
-
-
-def check(want: Stream, got: Stream, steps: int, case: str) -> None:
-    """The streams hold the same batch for each (step, lane) of the run."""
-    keys = [(s, lane) for s in range(steps) for lane in range(SETTINGS["lanes"])]
-    for key in keys:
-        assert got.get(key) == want.get(key), f"{case}: first difference at {key}"
-    assert set(got) == set(keys), f"{case}: steps or lanes outside the run"

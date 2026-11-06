@@ -4,18 +4,20 @@ one global state through the collective `state_dict()`."""
 import io
 import os
 from collections.abc import Iterable
+from multiprocessing.synchronize import Barrier
 from pathlib import Path
 
 import torch
 import torch.distributed as dist
 
 import e2e
+import e2e_stream
 import plitzer.torch as pt
 from e2e import Arrays, Job
 
 
 def settings(job: Job) -> pt.LoaderSettings:
-    s = e2e.SETTINGS
+    s = e2e_stream.SETTINGS
     return pt.LoaderSettings(
         seed=s["seed"],
         lanes=s["lanes"],
@@ -29,13 +31,14 @@ def settings(job: Job) -> pt.LoaderSettings:
     )
 
 
-def torch_rank(rank: int, job: Job) -> None:
+def torch_rank(rank: int, job: Job, ready: Barrier) -> None:
     """One rank: every rank calls `state_dict()`, and rank 0 saves it."""
     store = Path(job.out, "store").as_uri()
     dist.init_process_group("gloo", init_method=store, rank=rank, world_size=job.world)
     ds = pt.Dataset(job.location, **settings(job))
     if job.resume:
         ds.load_state_dict(torch.load(job.resume, weights_only=True))
+    ready.wait()
 
     def epoch() -> Iterable[Arrays]:
         for b in ds:

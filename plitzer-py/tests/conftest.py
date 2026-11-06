@@ -9,7 +9,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-import e2e
+import e2e_stream
 import plitzer
 
 # torch is an optional extra. Find it without importing it, which is slow.
@@ -106,7 +106,7 @@ class E2E(NamedTuple):
 
     data: Path
     cache: Path
-    ref: e2e.Reference
+    ref: e2e_stream.Reference
 
 
 @pytest.fixture(scope="session")
@@ -123,7 +123,7 @@ def e2e_data(tmp_path_factory: pytest.TempPathFactory) -> E2E:
         ]
         table = pa.table({"tokens": pa.array(rows, pa.list_(pa.int32()))})
         pq.write_table(table, data / f"{f}.parquet", row_group_size=5)
-    return E2E(data, base / "cache", e2e.reference(data, base / "cache", 3.5))
+    return E2E(data, base / "cache", e2e_stream.reference(data, base / "cache", 3.5))
 
 
 def e2e_seeds(count: int) -> list[int]:
