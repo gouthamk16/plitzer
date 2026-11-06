@@ -19,7 +19,9 @@ cargo test --features s3   # tests/s3.rs needs PLITZER_S3_ENDPOINT, e.g. a local
 # Python bindings (plitzer-py/), in a virtualenv with maturin, pytest, numpy, pyarrow, and for
 # plitzer.torch (mypy and test_torch.py) the CPU torch: pip install torch --index-url https://download.pytorch.org/whl/cpu
 maturin develop -m plitzer-py/Cargo.toml
-python -m pytest plitzer-py/tests     # test_s3.py runs when PLITZER_S3_ENDPOINT is set; test_torch.py when torch is installed
+python -m pytest plitzer-py/tests     # test_s3.py runs when PLITZER_S3_ENDPOINT is set; test_torch.py and
+                                      # test_e2e_torch.py when torch is installed. The e2e tests kill training
+                                      # at a random step; PLITZER_E2E_SEED=<seed> repeats a failing seed.
 (cd plitzer-py && ruff check python tests && ruff format --check python tests && mypy python tests)
 ```
 
