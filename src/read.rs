@@ -1,6 +1,7 @@
 use std::fmt;
 use std::ops::Range;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::{Bytes, BytesMut};
 use futures::future::try_join_all;
@@ -84,6 +85,8 @@ pub struct Reader {
     store: Arc<dyn ObjectStore>,
     prefix: Path,
     schema: SchemaDescPtr,
+    /// The bytes of every chunk fetched so far.
+    fetched: AtomicU64,
 }
 
 impl Reader {
@@ -93,7 +96,14 @@ impl Reader {
             store,
             prefix,
             schema,
+            fetched: AtomicU64::new(0),
         })
+    }
+
+    /// The bytes of the token chunks fetched from storage so far, also those
+    /// that then failed to decode. A failed fetch adds nothing.
+    pub fn bytes_read(&self) -> u64 {
+        self.fetched.load(Ordering::Relaxed)
     }
 
     /// The tokens of each row of row group `row_group` of `index`.
@@ -110,6 +120,7 @@ impl Reader {
                 path: file.path.clone(),
                 source,
             })?;
+        self.fetched.fetch_add(data.len() as u64, Ordering::Relaxed);
         let path = || file.path.clone();
         let column = decode(&self.schema, rg, range, data).map_err(|source| Error::Decode {
             path: path(),

@@ -1,6 +1,7 @@
 //! `Loader`: one GPU's `Session`, driven from Python.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, TryLockError};
 
 use plitzer::checkpoint::Checkpoint;
@@ -25,6 +26,8 @@ pub struct Loader {
     /// read it without `state`, so a signal handler or another thread can
     /// save a checkpoint while a step waits on a read.
     snapshot: Mutex<Checkpoint>,
+    /// `Session::bytes_read` when the snapshot was taken, read without `state`.
+    bytes_read: AtomicU64,
     seq_len: usize,
     /// The process that made the loader. See `check_process` and `Drop`.
     pid: u32,
@@ -49,6 +52,11 @@ impl State {
             .expect("only Drop takes the session")
             .checkpoint()
     }
+
+    fn bytes_read(&self) -> u64 {
+        let session = self.session.as_ref();
+        session.expect("only Drop takes the session").bytes_read()
+    }
 }
 
 impl Loader {
@@ -60,6 +68,7 @@ impl Loader {
         };
         Loader {
             snapshot: Mutex::new(state.checkpoint()),
+            bytes_read: AtomicU64::new(state.bytes_read()),
             state: Mutex::new(state),
             seq_len,
             pid: std::process::id(),
@@ -86,6 +95,7 @@ impl Loader {
     fn save(&self, state: &State) {
         let checkpoint = state.checkpoint();
         *self.snapshot.lock().unwrap_or_else(|e| e.into_inner()) = checkpoint;
+        self.bytes_read.store(state.bytes_read(), Ordering::Relaxed);
     }
 
     /// The snapshot, refused in a forked child: a parent thread may have
@@ -241,6 +251,14 @@ impl Loader {
     #[getter]
     fn epoch(&self) -> PyResult<u64> {
         Ok(self.snapshot()?.epoch)
+    }
+
+    /// The bytes of token chunks that this loader fetched from storage, up
+    /// to the end of its last call. See `Session::bytes_read`.
+    #[getter]
+    fn bytes_read(&self) -> PyResult<u64> {
+        self.check_process()?;
+        Ok(self.bytes_read.load(Ordering::Relaxed))
     }
 
     #[getter]

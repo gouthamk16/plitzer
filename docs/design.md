@@ -5,7 +5,7 @@
 | Field | Value |
 |---|---|
 | Status | Active. It changes with each feature PR. The code is pre-alpha. |
-| Last change | 2026-11-05, PR #23 |
+| Last change | 2026-11-09, PR #24 |
 | Language standard | ASD-STE100 (Simplified Technical English) |
 | Code | `src/` at the commit of this file |
 
@@ -95,7 +95,7 @@ Each term has only one definition in this document.
 | REQ-3 | Lanes and their slices depend only on `(seed, epoch, B, W)`. They do not depend on world. | `Order` has no world input. `order::gpu_lanes_partition` (property test). | Met |
 | REQ-4 | A resume at step k gives the same tail as a run without a stop. This is also true when world changes. | `pack::resume_matches_tail` and `pack::world_invariant` (property tests). `session::resume_on_another_world_matches_one_run` reads Parquet files through checkpoint bytes. `test_kill_and_resume_on_another_world` and `test_kill_and_resume_with_torch` kill a training run of real processes at a random step and resume it on another number of processes (sections 5.11 and 5.12). | Met |
 | REQ-5 | The output is the same on Linux, macOS and Windows. | CI runs the golden tests on the three systems. | Met |
-| REQ-6 | Read amplification is approximately 1 + world/W or less. | The reader reads no footer (`read::reads_without_footer`). Each GPU reads only its own slices (`load::reads_only_own_row_groups`). Planned: measurement on FineWeb-Edu. | Partly met |
+| REQ-6 | Read amplification is 1 + ⌈n/W⌉(world − 1)/n or less, in row groups, for n row groups: approximately 1 + (world − 1)/W. | The reader reads no footer (`read::reads_without_footer`). Each GPU reads only its own slices (`load::reads_only_own_row_groups`), each one time (`load::each_gpu_reads_its_plan_once`). Measurement on FineWeb-Edu lengths (section 6). | Met |
 | REQ-7 | A dependency upgrade does not change the order without a test failure. | Golden tests pin the shuffle output and the key bytes. | Met |
 | REQ-8 | A start with an unchanged dataset reads no Parquet footers. | `index::open_uses_cache_without_footers`. | Met |
 | REQ-9 | The decoded tokens in memory stay at or below the budget, and a budget that the loader accepts never stops it. | `load::budget_is_checked_and_kept`. | Met |
@@ -132,6 +132,7 @@ flowchart LR
 | Store | `src/store.rs`, `src/store/s3.rs` | Implemented | [5.10](#510-store) |
 | Python bindings | `plitzer-py/` | Implemented | [5.11](#511-python-bindings) |
 | PyTorch dataset | `plitzer-py/python/plitzer/torch.py` | Implemented | [5.12](#512-pytorch-dataset) |
+| Benchmark harness | `plitzer-py/python/plitzer/bench/` | Implemented | [5.13](#513-benchmark-harness) |
 
 ## 5. Component design
 
@@ -534,6 +535,7 @@ pub struct Reader { /* private: store, prefix, schema */ }
 impl Reader {
     pub fn new(store: Arc<dyn ObjectStore>, prefix: Path, index: &Index) -> Result<Reader, Error>;
     pub async fn read(&self, index: &Index, row_group: u32) -> Result<RowGroupTokens, Error>;
+    pub fn bytes_read(&self) -> u64;   // the chunk bytes fetched so far
 }
 
 pub struct RowGroupTokens { /* private: offsets, values */ }
@@ -558,6 +560,8 @@ pub enum Error { Schema(..), Fetch { path, source }, Decode { path, row_group, s
 
 The page reader of `parquet` uses only the codec and the byte range of the chunk from the metadata. It reads all other data from the page headers in the chunk. Thus the metadata that step 4 makes is sufficient.
 
+After step 3, `read` adds the length of the fetched chunk to an atomic counter. `bytes_read` gives the counter. A chunk that the reader fetches but cannot decode counts, because storage sent its bytes. A failed fetch does not count.
+
 `RowGroupTokens` keeps `Int32` and `UInt32` values with no copy. It copies other integer types into `u32`. A null row is empty.
 
 **Rationale:**
@@ -581,6 +585,7 @@ The page reader of `parquet` uses only the codec and the byte range of the chunk
 |---|---|---|
 | `reads_every_variant` | Unit | Each token is correct for 48 files. They have four list types, null rows or not, three codecs, and a dictionary or not. The file name has a space and a percent sign. |
 | `reads_without_footer` | Unit | The reader still gives each token after the footer length and magic of the file are set to zero. |
+| `bytes_read_counts_only_fetched_chunks` | Unit | A read adds the chunk length to `bytes_read`. A fetch of a deleted file gives `Error::Fetch` and adds nothing. |
 | `bad_columns_are_errors` | Unit | A nested list, text, dates, nanosecond timestamps, and an item name with a space each give `Error::Column`. |
 | `missing_or_differing_columns_are_errors` | Unit | A column that is not there, and a column type that differs between files, each give `Error::Column`. |
 | `odd_column_name_reads` | Unit | A column named `input ids` reads correctly. |
@@ -685,6 +690,7 @@ The decoded row group keeps its permits. The loader releases the permits when it
 | `failed_read_stops_the_loader` | Unit | A corrupt chunk gives `Error::Read` one time and then `Error::Stopped`. The lane states stay at the step before the failure. |
 | `prefetches_ahead` | Unit | With a large budget, the loader reads all row groups before `next` needs them. |
 | `reads_only_own_row_groups` | Unit | The plans of all ranks cover all row groups. Ranks share only the row groups at the edges of their slices. |
+| `each_gpu_reads_its_plan_once` | Unit | For three seeds and 1, 2 and 4 GPUs, each GPU fetches the chunk bytes of the row groups of its plan for one epoch, no more. One GPU fetches exactly the dataset. |
 | `plan_matches_lane_streams` | Unit | Each document that a lane takes at step s is in a row group that the plan needs at s. This is also true after a resume, with the plan from the cursor. |
 | `lane_groups_match` | Property | `Order::lane_groups` gives the row groups that `Order::lane` uses. |
 | `next_is_cancel_safe` | Unit | Over a store with 20 ms reads, `next` futures dropped while a read is in flight lose no row group. The test counts these drops and needs at least one. |
@@ -788,6 +794,7 @@ impl Session {
     pub fn ended(&self) -> bool;               // the last step is taken; `next` gives `None` next
     pub fn epoch(&self) -> u64;
     pub fn lanes(&self) -> Range<u32>;
+    pub fn bytes_read(&self) -> u64;           // the chunk bytes fetched since `open`
 }
 
 pub enum Error { Config(String), Index(index::Error), Read(read::Error),
@@ -833,6 +840,7 @@ pub enum Error { Config(String), Index(index::Error), Read(read::Error),
 | `resume_refuses_states_outside_the_epoch` | Unit | A step past the epoch, a leftover past the cursor, and a leftover that starts earlier and goes past the cap each give `checkpoint::Error::Range` at `resume`, not a panic. After a refused resume, `checkpoint()` is unchanged, also on a new session. |
 | `open_refuses_bad_settings` | Unit | A world that does not divide B, a rank out of range, no GPUs, W = 0, D = 0, 2²⁵ lanes, L = 2³² − 1 and C = 2³² − 1 each give `Error::Config`. |
 | `next_retries_after_a_failed_read` | Unit | After a failed read and a repair of the file, the next calls give the same batches as a run with no failure. |
+| `bytes_read_one_gpu_is_the_dataset` | Unit | `bytes_read` is 0 before the first step. One GPU fetches the dataset's chunk bytes once in each of two epochs. |
 
 ### 5.10 Store
 
@@ -902,7 +910,7 @@ class Loader:
     def set_epoch(self, epoch: int) -> None: ...
     def checkpoint(self) -> bytes: ...          # the part of this GPU
     def resume(self, checkpoint: bytes | bytearray) -> None: ...
-    epoch: int; lanes: range                    # read-only properties
+    epoch: int; lanes: range; bytes_read: int   # read-only properties
 class Batch:  tokens: Array                     # shape (lanes, seq_len)
               lengths: Array                    # shape (lanes,): the real tokens of each row
 class Array:  shape; __dlpack__(...); __dlpack_device__(); __arrow_c_array__(...)
@@ -916,6 +924,7 @@ class PlitzerError(Exception); ConfigError, CheckpointError, DataError (PlitzerE
 - Each `Loader` records the PID of the process that made it. In a forked child, a copied `Loader` gives `RuntimeError` for each method and property: a parent thread can have held one of its locks at the fork. A new `Loader` in the child works.
 - The `Loader` is frozen. A lock holds its session for the whole of a step, and a snapshot holds the checkpoint before the next step. `checkpoint()`, `epoch` and `lanes` read only the snapshot, so a signal handler or another thread can read them during a step. A second call that needs the session during a step gets `RuntimeError`, never a deadlock (D-59). No call holds the snapshot lock while Python runs, because Python can release the GIL and `save` takes the lock while it holds the GIL.
 - `epoch` is the epoch of the next step, as in `checkpoint()`. After the last step of an epoch, it is the next epoch.
+- `bytes_read` is `Session::bytes_read` at the end of the last call, such as the last step. Each call that changes the snapshot also stores it, so a thread can read it during a step (D-70).
 - `__next__` releases the GIL and waits on the runtime for 100 ms at a time. Between these waits it checks for signals. Thus Ctrl-C gives `KeyboardInterrupt` in 100 ms or less, and it drops the `next` future. `Loader::next` is cancel safe (D-44), so the next call does the same step again.
 - At the end of an epoch, `__next__` raises `StopIteration`, and it raises it again at each later call, as a Python iterator must. `__iter__` starts the next epoch: a new `for` loop gives it. `__iter__` also moves on a loader whose last step is taken but which did not raise `StopIteration` yet, such as the second loader in a `zip` (D-55).
 - Each step writes into a new `Vec<u32>`. An arrow `Buffer` holds it, and each export holds a clone of that `Buffer`. Thus an exported array stays valid after the batch, the loader and the export call.
@@ -1003,6 +1012,7 @@ An Arrow consumer moves the structs out of the capsules and sets their `release`
 | `test_resume_refuses_other_runs` | pytest | A different L, bad bytes and an incomplete merge give `CheckpointError`. |
 | `test_resume_refuses_a_hand_made_checkpoint` | pytest | Checksummed bytes whose leftover starts at an earlier document give `CheckpointError` at `resume`, and `checkpoint()` is unchanged. |
 | `test_bad_settings` | pytest | Bad settings, `world=-1`, `seed=2**200`, `lanes=4.0`, `docs=True`, a URL with `#` and a cache below a file give `ConfigError`. A missing folder gives `DataError`. |
+| `test_bytes_read_counts_each_epoch` | pytest | `bytes_read` is 0 before the first step, and grows by the dataset's chunk bytes in each epoch. |
 | `test_kill_and_resume_on_another_world` | pytest, end to end | Three times with a new seed: a run of 1 to 6 processes is killed at a random step of 3.5 epochs, one time in three at the end of an epoch. Each rank saves its own part at each step. After the kill, the newest step that all ranks saved is merged and resumed on another number of processes, as a real trainer does. The batch of each step and lane, before and after the kill, is the same as one process with no stop. Each rank must end with the exit code of the kill. `PLITZER_E2E_SEED` repeats a seed. |
 | `test_forked_child_makes_its_own_loader` | pytest | In a child of `os.fork`, the copied loader gives `RuntimeError`. A new loader gives the same first batch as the parent. The child frees the copy with no wait. |
 | `test_s3_matches_local` | pytest | The same files on versitygw and on local disk give the same batches. |
@@ -1074,13 +1084,89 @@ class Dataset(IterableDataset[TokenBatch]):
 | `test_state_dict_gathers_all_ranks` | pytest | Two gloo ranks give the same state. Four ranks and one rank resume from it with the batches of a run with no stop. |
 | `test_kill_and_resume_with_torch` | pytest, end to end | The same kill and resume as `test_kill_and_resume_on_another_world`, over gloo. Each rank calls `state_dict()`, and rank 0 saves it with `torch.save`. The resume reads it with `torch.load(weights_only=True)`. A rank whose gather fails because a peer is killed can end with its own exit code, `PEER_DIED`. Each other end before the kill is a failure. |
 
+### 5.13 Benchmark harness
+
+**Function:** `plitzer.bench` holds the benchmark harnesses. `fineweb` writes a dataset with the shape of FineWeb-Edu. `amplification` measures the bytes that each GPU reads in one epoch. They need the `bench` extra (numpy and pyarrow).
+
+**Interface (`plitzer/bench/`):**
+
+```python
+# fineweb: python -m plitzer.bench.fineweb OUT --files 4 --row-groups 128
+class RangeFile(io.RawIOBase): ...    # a read-only file over HTTP range requests
+def lengths(source: str | Path, row_groups: int) -> Iterator[NDArray[int64]]: ...
+def write(groups: Iterator[NDArray[int64]], path: Path, seed: int) -> None: ...
+def build(sources: Sequence[str | Path], out: Path, row_groups: int, seed: int = 0) -> list[Path]: ...
+
+# amplification: python -m plitzer.bench.amplification DATA --lanes 512 --window 64 --worlds 1,8,64 ...
+class Settings(NamedTuple): lanes; window; seq_len; docs; cap; budget; seed = 0; column = "tokens"
+class World(NamedTuple): window; per_gpu: list[int]; dataset: Dataset   # .amplification, .bound
+class Dataset(NamedTuple): row_groups: int; bytes: int
+def scan(location: Path, column: str) -> Dataset: ...
+def measure(location: Path, settings: Settings, worlds: Sequence[int], cache: Path) -> list[World]: ...
+def table(results: Sequence[World]) -> str: ...   # Markdown
+```
+
+**Design:**
+
+- FineWeb-Edu has a `token_count` column, the GPT-2 tokens of each document, but no token column. `lengths` reads only the footer and the `token_count` chunks of a source file. For a URL, pyarrow reads through `RangeFile`, which makes one HTTP range request for each read. `RangeFile` tries a request again after a connection error or a server error (5xx), up to 4 times. It uses `urllib`, which uses the `HTTPS_PROXY` setting.
+- `write` makes one row group for each source row group, with the same documents and lengths. The tokens are random in [0, 50257), from a seeded generator (D-69). It writes a temporary file and renames it, so a failed build leaves no file. It refuses a row group of 2³¹ tokens or more, which int32 offsets cannot hold.
+- `measure` runs each rank of each world in turn in one process, for epoch 0, and records `Loader.bytes_read`. All ranks use one index cache. The amplification is the sum of the ranks' bytes divided by `Dataset.bytes` from `scan`: the column chunk bytes of each row group that has rows, from the Parquet metadata.
+- `World.bound` is 1 + (world − 1)/W. The lanes of the GPUs split each window into stretches in storage order, and two neighbours share at most the row group at their edge. Thus the GPUs read at most W + world − 1 row groups of a window. The bound counts row groups, not bytes.
+
+**Rationale:** CLAUDE.md puts the harness in the package, with tests, not in a script. A dataset with real lengths gives the real sizes of row groups and chunks, which are the only inputs of the read amplification. A tokenizer run on 10B tokens is not necessary for this.
+
+**Limits:**
+
+- `scan` reads local files only.
+- Random tokens compress worse than real tokens. The chunks are larger, by approximately the same ratio in each row group, so the amplification does not change.
+- `measure` runs the ranks one after the other, so it does not measure time.
+
+**Verification:**
+
+| Test | Type | Checks |
+|---|---|---|
+| `test_measure_one_gpu_reads_the_dataset` | pytest | One GPU has an amplification of exactly 1. Two and four GPUs have 1 or more. |
+| `test_measure_even_row_groups` | pytest | Row groups of equal rows: when world divides W, the amplification is exactly 1. With half a row group for each lane, 4 GPUs read exactly 2 times the dataset. |
+| `test_scan_and_bound` | pytest | `scan` counts the row groups. The bound for 512 row groups, W = 100 and 64 GPUs is 1 + 6 · 63/512. |
+| `test_main_prints_a_row_for_each_run` | pytest | The CLI prints one table row for each W and world. |
+| `test_build_keeps_lengths_and_row_groups` | pytest | A built file has the source's row groups and lengths, and int32 tokens below the vocabulary size. The same seed gives the same file. |
+| `test_build_from_a_url_reads_ranges` | pytest | A build from a local HTTP server that serves only ranges keeps the lengths. No request touches the text chunk of the first row group. |
+| `test_range_file_refuses_a_file_url` | pytest | A `file:` URL gives `OSError`. |
+| `test_build_retries_a_server_error` | pytest | A build succeeds after 3 responses of 503. After 4, `RangeFile` gives the `HTTPError`. |
+| `test_write_refuses_a_row_group_past_int32` | pytest | A row group of 2³¹ tokens gives `ValueError`, and no file. |
+
 ## 6. Read amplification
 
 **Problem:** A naive split gives each GPU a random part of a shuffled batch. Each GPU then needs a document from almost each row group of the window. Each GPU reads approximately world times its own data.
 
 **Fix:** A GPU owns a contiguous block of lanes (section 5.3). Each lane owns a contiguous stretch of the window in storage order. Thus the lanes of one GPU cover one stretch of storage. The GPU reads that stretch and approximately one shared row group at each edge.
 
-**Estimate:** A simulation gives a read amplification of approximately 1 + world/W. At FineWeb-Edu sizes, the value is 1.01 to 1.25. A cache on each node is a fallback only. Plitzer will add it only if a benchmark shows that it is necessary.
+**Bound:** Two neighbour GPUs share at most the row group at their edge. Thus all GPUs read at most world − 1 more row groups than a window holds. An epoch of n row groups has ⌈n/W⌉ windows, so the amplification is 1 + ⌈n/W⌉(world − 1)/n or less, in row groups. This is approximately 1 + (world − 1)/W. The bound counts row groups, not bytes, because an edge row group can be larger than the mean.
+
+**Measurement:** `plitzer.bench` (section 5.13) measured one epoch:
+- The dataset has 512 row groups (the first 64 of FineWeb-Edu `sample/10BT` files 000 to 007). It has 512 000 documents and 1104 MiB of token chunks.
+- The documents have the real lengths, with random tokens (D-69).
+- The settings are B = 512, L = 2048, D = 2 and C = 2048.
+- Each cell is the measured amplification, with the bound in parentheses:
+
+| W | windows | world 8 | world 64 | world 256 |
+|---|---|---|---|---|
+| 16 | 32 | 1.000 (1.438) | 4.000 (4.938) | 16.000 (16.938) |
+| 64 | 8 | 1.000 (1.109) | 1.000 (1.984) | 4.000 (4.984) |
+| 100 | 6 | 1.047 (1.082) | 1.708 (1.738) | 3.969 (3.988) |
+| 256 | 2 | 1.000 (1.027) | 1.000 (1.246) | 1.000 (1.996) |
+| 300 | 2 | 1.016 (1.027) | 1.236 (1.246) | 1.984 (1.996) |
+| 512 | 1 | 1.000 (1.014) | 1.000 (1.123) | 1.000 (1.498) |
+
+**Results:**
+
+- Each measurement is at or below the bound.
+- Each FineWeb-Edu row group has 1000 rows. When world divides W, each GPU's stretch starts and ends at a row-group edge, and no GPU reads a row group of another GPU. The amplification is then exactly 1.
+- When world is larger than W, some GPUs have less than one row group. The amplification is then world/W.
+- When world does not divide W, the amplification is near the bound: 1.016 for 8 GPUs and 1.236 for 64 GPUs at W = 300.
+- This dataset has few windows, so its short last window adds to the bound. With the 10 164 row groups of all of `sample/10BT`, the bound is nearer 1 + (world − 1)/W.
+
+**Decision:** Plitzer does not add a cache on each node (D-71). Set W to a multiple of the largest GPU count that you plan to use. For example, W = 512 is a multiple of each power of 2 up to 512. A checkpoint holds W, so a resume on a different GPU count keeps it.
 
 **Trade-off:** A larger W gives a better mix of documents but uses more memory. A change to the slices changes both the shuffle quality and the I/O. Examine both before you change the slices.
 
@@ -1158,6 +1244,9 @@ class Dataset(IterableDataset[TokenBatch]):
 | D-66 | `Dataset.state_dict()` gathers the parts of all ranks and gives the same global checkpoint on each rank. | A global checkpoint needs each lane, and a rank knows only its own lanes. Lightning makes the checkpoint on each rank, and `torch.distributed.checkpoint` writes an item that all ranks hold only one time. | A part for each rank: a resume then needs the same GPU count, or code that merges the parts. | #21 |
 | D-67 | Each item is a `TokenBatch` `NamedTuple` of int32 tensors for one step. | `DataLoader` with `batch_size=None` keeps it. The tensors share memory with the export. | A dict, which is not typed, or int64 tensors, which need a copy. | #21 |
 | D-68 | `state_dict()` is the position of the next batch that the dataset gives. | A count of fetched batches that the loop did not train is wrong for some loops: at the end of an epoch, for a loop with a step limit, and after a crash during the last batch. | An `ahead` count with heuristics for these cases. | #21 |
+| D-69 | Measure the read amplification on FineWeb-Edu lengths, with random tokens. | The amplification depends only on the row counts and chunk bytes. `token_count` gives the real lengths from a few MB of each file. | Tokenize the text: 10B tokens, which is too much for a benchmark run. | #24 |
+| D-70 | `Loader.bytes_read` is the count at the end of the last call. | A thread can read it during a step, as it can read `checkpoint()`. | A live count, which needs the session lock during a step, or a new shared counter in `Session`. | #24 |
+| D-71 | No cache on each node. | When world divides W, the measured amplification is 1. Otherwise it is near 1 + (world − 1)/W, so a W of several times world keeps it small: 1.016 at W = 300 for 8 GPUs (section 6). | A cache on each node that GPUs share. | #24 |
 | D-22 | The sidecar uses its own binary format and FNV-1a. | No new dependency, and the bytes are fixed by our code. | `serde` with `bincode`, or JSON. | #10 |
 | D-23 | A sidecar that does not exist or is corrupt causes a new build. | The sidecar is only a cache. | An error that the user must correct. | #10 |
 | D-24 | The index keeps the place of each token column chunk, and the reader reads no footer. | A window has row groups from approximately W files. A footer read for each row group costs approximately 1.5 times the data. | Read the footer of each file again, or keep footers in memory (9.4 GB for FineWeb-Edu). | #12 |
@@ -1183,6 +1272,7 @@ class Dataset(IterableDataset[TokenBatch]):
 | 2026-10-26 | #20 | A resume replays leftovers one part at a time, then plans from the cursor (`Epoch::replay`, `Replay`, `src/load/replay.rs`). A resume needs no more budget than a run with no stop. |
 | 2026-10-26 | #21 | Add the PyTorch dataset (`plitzer/torch.py`): `Dataset`, `TokenBatch` and a collective `state_dict()`. torch is the optional extra `plitzer[torch]`. CI installs the CPU build of torch. |
 | 2026-11-05 | #23 | Add the end-to-end tests that kill a training run at a random step and resume it on another number of processes (`plitzer-py/tests/e2e.py`, `e2e_stream.py`, `e2e_torch.py`). |
+| 2026-11-09 | #24 | Add `bytes_read` (`Reader`, `Session`, `Loader`) and `plitzer.bench` (section 5.13). Measure the read amplification on FineWeb-Edu lengths (section 6). Correct the bound to 1 + ⌈n/W⌉(world − 1)/n. |
 
 ## 10. Maintenance
 
