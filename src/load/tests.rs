@@ -13,6 +13,7 @@ use super::plan::{at_cursors, cursors, peak, plan, resume};
 use super::*;
 
 mod budget;
+mod bytes;
 mod cancel;
 mod fail;
 mod plan;

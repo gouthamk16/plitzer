@@ -243,3 +243,23 @@ async fn next_retries_after_a_failed_read() {
     got.extend(run(&mut one, rest).await);
     assert_eq!(got, want);
 }
+
+// The count holds every epoch: one GPU reads each chunk once per epoch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bytes_read_one_gpu_is_the_dataset() {
+    let d = data();
+    let mut one = sessions(&d, 1).await;
+    let index = &one[0].index;
+    let dataset: u64 = (0..index.rows().len() as u32)
+        .map(|g| u64::from(index.row_group(g).1.len))
+        .sum();
+    assert_eq!(
+        one[0].bytes_read(),
+        0,
+        "nothing is read before the first step"
+    );
+    for epoch in 1..=2 {
+        while run(&mut one, 1).await[0].is_some() {}
+        assert_eq!(one[0].bytes_read(), epoch * dataset);
+    }
+}

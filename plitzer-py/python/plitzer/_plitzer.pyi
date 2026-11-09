@@ -98,6 +98,13 @@ class Loader:
         """The epoch of the next step, as in `checkpoint()`."""
     @property
     def lanes(self) -> range: ...
+    @property
+    def bytes_read(self) -> int:
+        """The bytes of token chunks that this loader fetched from storage,
+        in every epoch, up to the end of its last call. It works during a
+        step too. One GPU reads each chunk once per epoch; with more GPUs,
+        the sum over all of them divided by the dataset's chunk bytes is the
+        read amplification."""
 
 def merge(parts: Sequence[bytes | bytearray]) -> bytes:
     """One global checkpoint from the parts of all GPUs, in any order."""

@@ -102,3 +102,26 @@ async fn row_count_must_match_the_footer() {
     let got = reader.read(&index, 0).await;
     assert!(matches!(got, Err(Error::Decode { .. })), "{got:?}");
 }
+
+// The counter holds the bytes that storage gave: a chunk that is fetched
+// counts, a fetch that fails does not.
+#[tokio::test]
+async fn bytes_read_counts_only_fetched_chunks() {
+    let d = data();
+    let p = props(Compression::SNAPPY, false);
+    write(
+        &d.path("x.parquet"),
+        token_column(Kind::ListI32, 20, false),
+        p,
+    );
+    let index = d.index().await.unwrap();
+    let reader = Reader::new(d.store.clone(), d.prefix.clone(), &index).unwrap();
+    assert_eq!(reader.bytes_read(), 0);
+    reader.read(&index, 1).await.unwrap();
+    let len = u64::from(index.row_group(1).1.len);
+    assert_eq!(reader.bytes_read(), len);
+    std::fs::remove_file(d.path("x.parquet")).unwrap();
+    let gone = reader.read(&index, 0).await;
+    assert!(matches!(gone, Err(Error::Fetch { .. })), "{:?}", gone.err());
+    assert_eq!(reader.bytes_read(), len);
+}

@@ -204,6 +204,12 @@ impl Session {
         self.lanes.clone()
     }
 
+    /// The bytes of the token chunks this session fetched from storage since
+    /// `open`, in every epoch, with the replays of a resume.
+    pub fn bytes_read(&self) -> u64 {
+        self.reader.bytes_read()
+    }
+
     /// Whether each of `states` lies inside the epoch of `plan`: no later
     /// than its last step, with its leftover not past the documents it has
     /// taken. A checkpoint from plitzer always passes. The states that this

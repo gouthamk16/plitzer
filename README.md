@@ -76,7 +76,7 @@ The design, its rationale and the decision log are in [docs/design.md](docs/desi
   - [x] bindings: a `plitzer` wheel exporting batches through DLPack and Arrow
   - [x] `plitzer.torch` `IterableDataset` with `state_dict()` and `load_state_dict()`
 - [x] **End-to-end test:** kill training at a random step, resume on a different GPU count, and check the sample-stream hash matches
-- [ ] **Read amplification check:** measure bytes read per GPU on real data. Lane slices simulate at 1.01–1.25×. Add a per-node cache only if it's needed
+- [x] **Read amplification check:** measure bytes read per GPU on real data. Lane slices simulate at 1.01–1.25×. Add a per-node cache only if it's needed. Measured on FineWeb-Edu lengths: exactly 1× when the GPU count divides W, near 1 + (world − 1)/W otherwise, so no cache ([design §6](docs/design.md#6-read-amplification))
 - [ ] **Benchmarks:** publish a comparison table against Mosaic and HF
 - [ ] **Release:** build wheels in CI and publish to PyPI
 - [ ] **Stretch:** in-loader tokenization
