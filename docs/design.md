@@ -1099,24 +1099,25 @@ def build(sources: Sequence[str | Path], out: Path, row_groups: int, seed: int =
 
 # amplification: python -m plitzer.bench.amplification DATA --lanes 512 --window 64 --worlds 1,8,64 ...
 class Settings(NamedTuple): lanes; window; seq_len; docs; cap; budget; seed = 0; column = "tokens"
-class World(NamedTuple): window; per_gpu: list[int]; dataset: int   # .amplification, .bound
-def dataset_bytes(location: Path, column: str) -> int: ...
-def measure(location: Path, settings: Settings, worlds: Sequence[int]) -> list[World]: ...
+class World(NamedTuple): window; per_gpu: list[int]; dataset: Dataset   # .amplification, .bound
+class Dataset(NamedTuple): row_groups: int; bytes: int
+def scan(location: Path, column: str) -> Dataset: ...
+def measure(location: Path, settings: Settings, worlds: Sequence[int], cache: Path) -> list[World]: ...
 def table(results: Sequence[World]) -> str: ...   # Markdown
 ```
 
 **Design:**
 
-- FineWeb-Edu has a `token_count` column, the GPT-2 tokens of each document, but no token column. `lengths` reads only the footer and the `token_count` chunks of a source file. For a URL, pyarrow reads through `RangeFile`, which makes one HTTP range request for each read.
-- `write` makes one row group for each source row group, with the same documents and lengths. The tokens are random in [0, 50257), from a seeded generator (D-69).
-- `measure` runs each rank of each world in turn in one process, for epoch 0, and records `Loader.bytes_read`. The amplification is the sum of the ranks' bytes divided by `dataset_bytes`: the column chunk bytes of each row group that has rows, from the Parquet metadata.
+- FineWeb-Edu has a `token_count` column, the GPT-2 tokens of each document, but no token column. `lengths` reads only the footer and the `token_count` chunks of a source file. For a URL, pyarrow reads through `RangeFile`, which makes one HTTP range request for each read. `RangeFile` tries a request again after a connection error or a server error (5xx), up to 4 times. It uses `urllib`, which uses the `HTTPS_PROXY` setting.
+- `write` makes one row group for each source row group, with the same documents and lengths. The tokens are random in [0, 50257), from a seeded generator (D-69). It writes a temporary file and renames it, so a failed build leaves no file. It refuses a row group of 2³¹ tokens or more, which int32 offsets cannot hold.
+- `measure` runs each rank of each world in turn in one process, for epoch 0, and records `Loader.bytes_read`. All ranks use one index cache. The amplification is the sum of the ranks' bytes divided by `Dataset.bytes` from `scan`: the column chunk bytes of each row group that has rows, from the Parquet metadata.
 - `World.bound` is 1 + (world − 1)/W. The lanes of the GPUs split each window into stretches in storage order, and two neighbours share at most the row group at their edge. Thus the GPUs read at most W + world − 1 row groups of a window. The bound counts row groups, not bytes.
 
 **Rationale:** CLAUDE.md puts the harness in the package, with tests, not in a script. A dataset with real lengths gives the real sizes of row groups and chunks, which are the only inputs of the read amplification. A tokenizer run on 10B tokens is not necessary for this.
 
 **Limits:**
 
-- `dataset_bytes` reads local files only.
+- `scan` reads local files only.
 - Random tokens compress worse than real tokens. The chunks are larger, by approximately the same ratio in each row group, so the amplification does not change.
 - `measure` runs the ranks one after the other, so it does not measure time.
 
@@ -1125,10 +1126,14 @@ def table(results: Sequence[World]) -> str: ...   # Markdown
 | Test | Type | Checks |
 |---|---|---|
 | `test_measure_one_gpu_reads_the_dataset` | pytest | One GPU has an amplification of exactly 1. Two and four GPUs have 1 or more. |
+| `test_measure_even_row_groups` | pytest | Row groups of equal rows: when world divides W, the amplification is exactly 1. With half a row group for each lane, 4 GPUs read exactly 2 times the dataset. |
+| `test_scan_and_bound` | pytest | `scan` counts the row groups. The bound for 512 row groups, W = 100 and 64 GPUs is 1 + 6 · 63/512. |
 | `test_main_prints_a_row_for_each_run` | pytest | The CLI prints one table row for each W and world. |
 | `test_build_keeps_lengths_and_row_groups` | pytest | A built file has the source's row groups and lengths, and int32 tokens below the vocabulary size. The same seed gives the same file. |
 | `test_build_from_a_url_reads_ranges` | pytest | A build from a local HTTP server that serves only ranges keeps the lengths. No request touches the text chunk of the first row group. |
 | `test_range_file_refuses_a_file_url` | pytest | A `file:` URL gives `OSError`. |
+| `test_build_retries_a_server_error` | pytest | A build succeeds after 3 responses of 503. After 4, `RangeFile` gives the `HTTPError`. |
+| `test_write_refuses_a_row_group_past_int32` | pytest | A row group of 2³¹ tokens gives `ValueError`, and no file. |
 
 ## 6. Read amplification
 

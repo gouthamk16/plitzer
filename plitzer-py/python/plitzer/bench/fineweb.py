@@ -14,6 +14,9 @@ real tokens, about equally in each row group.
 import argparse
 import http.client
 import io
+import os
+import time
+import urllib.error
 import urllib.request
 from collections.abc import Iterator, Sequence
 from pathlib import Path
@@ -32,6 +35,7 @@ SOURCE = (
     "sample/10BT/{:03d}_00000.parquet"
 )
 VOCAB = 50257  # GPT-2's vocabulary, the tokenizer of `token_count`
+TRIES = 4  # a build makes hundreds of requests; retry a dropped one
 
 
 class RangeFile(io.RawIOBase):
@@ -44,12 +48,27 @@ class RangeFile(io.RawIOBase):
         self._pos = 0
         # The total size is after the slash of `Content-Range: bytes 0-0/N`.
         with self._get(0, 0) as r:
-            self._size = int(r.headers["Content-Range"].rsplit("/", 1)[1])
+            total = (r.headers["Content-Range"] or "").rpartition("/")[2]
+        if not total.isdigit():
+            raise OSError(f"{url}: no size in the Content-Range of a range")
+        self._size = int(total)
 
     def _get(self, first: int, last: int) -> http.client.HTTPResponse:
+        """The response to one range request. A connection error or a
+        server error is tried again; other errors are not."""
         headers = {"Range": f"bytes={first}-{last}"}
         request = urllib.request.Request(self._url, headers=headers)
-        response = urllib.request.urlopen(request, timeout=60)
+        for attempt in range(TRIES):
+            try:
+                response = urllib.request.urlopen(request, timeout=60)
+                break
+            except urllib.error.HTTPError as e:
+                if e.code < 500 or attempt == TRIES - 1:
+                    raise
+            except (urllib.error.URLError, TimeoutError, ConnectionError):
+                if attempt == TRIES - 1:
+                    raise
+            time.sleep(2**attempt)
         if not isinstance(response, http.client.HTTPResponse):
             raise OSError(f"{self._url}: not an HTTP URL")
         if response.status != 206:
@@ -65,6 +84,8 @@ class RangeFile(io.RawIOBase):
 
     def seek(self, offset: int, whence: int = io.SEEK_SET) -> int:
         base = {io.SEEK_SET: 0, io.SEEK_CUR: self._pos, io.SEEK_END: self._size}
+        if whence not in base or base[whence] + offset < 0:
+            raise ValueError(f"cannot seek to {offset} from {whence}")
         self._pos = base[whence] + offset
         return self._pos
 
@@ -98,15 +119,21 @@ def lengths(source: str | Path, row_groups: int) -> Iterator[npt.NDArray[np.int6
 
 def write(groups: Iterator[npt.NDArray[np.int64]], path: Path, seed: int) -> None:
     """A ``tokens`` column with one row group for each of ``groups``, whose
-    documents have those lengths and random tokens."""
+    documents have those lengths and random tokens. A failed build leaves
+    no file at ``path``."""
     rng = np.random.default_rng(seed)
     schema = pa.schema([("tokens", pa.list_(pa.int32()))])
-    with pq.ParquetWriter(path, schema) as writer:
+    temp = path.with_name(path.name + ".tmp")
+    with pq.ParquetWriter(temp, schema) as writer:
         for counts in groups:
-            offsets = np.concatenate([[0], np.cumsum(counts)]).astype(np.int32)
+            offsets = np.concatenate([[0], np.cumsum(counts)])
+            if offsets[-1] >= 2**31:
+                raise ValueError(f"{path.name}: a row group of 2**31 tokens or more")
             values = rng.integers(0, VOCAB, size=int(offsets[-1]), dtype=np.int32)
-            tokens = pa.ListArray.from_arrays(pa.array(offsets), pa.array(values))
+            array = pa.array(offsets.astype(np.int32))
+            tokens = pa.ListArray.from_arrays(array, pa.array(values))
             writer.write_table(pa.table({"tokens": tokens}, schema=schema))
+    os.replace(temp, path)
 
 
 def build(

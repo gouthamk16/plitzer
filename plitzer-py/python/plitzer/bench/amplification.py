@@ -106,19 +106,20 @@ def rank_bytes(
     return loader.bytes_read
 
 
-def measure(location: Path, settings: Settings, worlds: Sequence[int]) -> list[World]:
-    """One epoch of every rank of each of ``worlds``."""
+def measure(
+    location: Path, settings: Settings, worlds: Sequence[int], cache: Path
+) -> list[World]:
+    """One epoch of every rank of each of ``worlds``, with the index cached
+    at ``cache``."""
     dataset = scan(location, settings.column)
-    with tempfile.TemporaryDirectory() as tmp:
-        cache = Path(tmp, "index")
-        return [
-            World(
-                settings.window,
-                [rank_bytes(location, settings, r, w, cache) for r in range(w)],
-                dataset,
-            )
-            for w in worlds
-        ]
+    return [
+        World(
+            settings.window,
+            [rank_bytes(location, settings, r, w, cache) for r in range(w)],
+            dataset,
+        )
+        for w in worlds
+    ]
 
 
 def table(results: Sequence[World]) -> str:
@@ -152,11 +153,12 @@ def main(argv: Sequence[str] | None = None) -> None:
     p.add_argument("--column", default="tokens")
     a = p.parse_args(argv)
     results = []
-    for window in a.window:
-        s = Settings(
-            a.lanes, window, a.seq_len, a.docs, a.cap, a.budget, a.seed, a.column
-        )
-        results.extend(measure(a.data, s, a.worlds))
+    with tempfile.TemporaryDirectory() as tmp:
+        for window in a.window:
+            s = Settings(
+                a.lanes, window, a.seq_len, a.docs, a.cap, a.budget, a.seed, a.column
+            )
+            results.extend(measure(a.data, s, a.worlds, Path(tmp, "index")))
     print(table(results))
 
 

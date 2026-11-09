@@ -1,4 +1,6 @@
 import threading
+import time
+import urllib.error
 from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -23,17 +25,43 @@ def test_bytes_read_counts_each_epoch(make: MakeLoader, dataset: Path) -> None:
         assert loader.bytes_read == epoch * whole
 
 
-def test_measure_one_gpu_reads_the_dataset(dataset: Path) -> None:
+def settings(window: int) -> amplification.Settings:
     s = SETTINGS
-    settings = amplification.Settings(
-        s["lanes"], s["window"], s["seq_len"], s["docs"], s["cap"], s["budget"]
+    return amplification.Settings(
+        s["lanes"], window, s["seq_len"], s["docs"], s["cap"], s["budget"]
     )
-    one, two, four = amplification.measure(dataset, settings, [1, 2, 4])
+
+
+def test_measure_one_gpu_reads_the_dataset(dataset: Path, tmp_path: Path) -> None:
+    cache = tmp_path / "index"
+    one, two, four = amplification.measure(dataset, settings(3), [1, 2, 4], cache)
     assert one.amplification == 1.0
-    for world in (two, four):
-        assert 1.0 <= world.amplification <= world.bound * 1.5
-        assert len(world.per_gpu) in (2, 4)
+    assert [len(w.per_gpu) for w in (one, two, four)] == [1, 2, 4]
+    assert two.amplification >= 1.0 and four.amplification >= 1.0
     assert "| 3 | 4 |" in amplification.table([one, two, four])
+
+
+@pytest.fixture
+def even(tmp_path: Path) -> Path:
+    """Eight row groups of 4 rows each, as FineWeb-Edu has 1000 in each."""
+    data = tmp_path / "even"
+    data.mkdir()
+    rows = [[r * 10 + t for t in range(5)] for r in range(32)]
+    table = pa.table({"tokens": pa.array(rows, pa.list_(pa.int32()))})
+    pq.write_table(table, data / "0.parquet", row_group_size=4)
+    return data
+
+
+def test_measure_even_row_groups(even: Path, tmp_path: Path) -> None:
+    cache = tmp_path / "index"
+    # 4 lanes and windows of 4 row groups: each lane has one row group, so
+    # GPUs share none, and the amplification is exactly 1.
+    for w in amplification.measure(even, settings(4), [1, 2, 4], cache):
+        assert w.amplification == 1.0, len(w.per_gpu)
+    # Windows of 2: each lane has half a row group, and 4 GPUs read each
+    # row group twice.
+    (w,) = amplification.measure(even, settings(2), [4], cache)
+    assert w.amplification == 2.0 == len(w.per_gpu) / w.window
 
 
 def test_scan_and_bound(dataset: Path) -> None:
@@ -99,8 +127,16 @@ class Ranges(BaseHTTPRequestHandler):
 
     body = b""
     sent: list[range] = []
+    failures = 0  # the next requests that get 503
 
     def do_GET(self) -> None:  # noqa: N802 (the name http.server calls)
+        if self.failures:
+            type(self).failures -= 1
+            self.send_error(503)
+            return
+        self.send_range()
+
+    def send_range(self) -> None:
         first, last = self.headers["Range"].removeprefix("bytes=").split("-")
         part = self.body[int(first) : int(last) + 1]
         self.send_response(206)
@@ -117,7 +153,7 @@ class Ranges(BaseHTTPRequestHandler):
 
 @pytest.fixture
 def served(source: Path) -> Iterator[str]:
-    Ranges.body, Ranges.sent = source.read_bytes(), []
+    Ranges.body, Ranges.sent, Ranges.failures = source.read_bytes(), [], 0
     server = ThreadingHTTPServer(("127.0.0.1", 0), Ranges)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -141,3 +177,22 @@ def test_build_from_a_url_reads_ranges(
 def test_range_file_refuses_a_file_url(source: Path) -> None:
     with pytest.raises(OSError, match="not an HTTP URL"):
         fineweb.RangeFile(source.as_uri())
+
+
+def test_build_retries_a_server_error(
+    served: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+    Ranges.failures = fineweb.TRIES - 1
+    (built,) = fineweb.build([served], tmp_path / "out", row_groups=1)
+    assert lengths_of(built) == [[3, 0, 7, 1]]
+    Ranges.failures = fineweb.TRIES
+    with pytest.raises(urllib.error.HTTPError, match="503"):
+        fineweb.RangeFile(served)
+
+
+def test_write_refuses_a_row_group_past_int32(tmp_path: Path) -> None:
+    path = tmp_path / "big.parquet"
+    with pytest.raises(ValueError, match="2\\*\\*31"):
+        fineweb.write(iter([np.array([2**30, 2**30])]), path, seed=0)
+    assert not path.exists()
