@@ -58,16 +58,16 @@ The design, its rationale and the decision log are in [docs/design.md](docs/desi
 
 ## Benchmarks
 
-plitzer against MosaicML Streaming and Hugging Face `datasets`, all reading the same FineWeb-Edu-shaped Parquet files (512 row groups, 526 M tokens) through one harness, `plitzer.bench.baseline`, on 4 CPU cores with the files in the page cache:
+plitzer against MosaicML Streaming and Hugging Face `datasets`, all reading the same FineWeb-Edu-shaped Parquet files (512 row groups, 526 M tokens) through one harness, `plitzer.bench.baseline`, on 4 CPU cores with the files in the page cache (converted sizes in MiB, tokens lost on a resume at mid-epoch):
 
-| loader | convert (s) | copy (MiB) | Mtokens/s | cores | CPU ns/token | resume (s) | exact resume | tokens lost |
-|---|---|---|---|---|---|---|---|---|
-| **plitzer** | **0.0** | **0** | **280.8** | 3.95 | 14.1 | 0.36 | yes | **0** |
-| mosaic | 28.4 | 1222 | 24.8 | 2.70 | 108.7 | 3.04 | yes | 0 |
-| hf | 5.2 | 2009 | 89.4 | 1.00 | **11.2** | **0.28** | yes | 0 |
-| hf-stream | 0.0 | 0 | 2.2 | 1.13 | 517.1 | 3.89 | no | 10,373,481 |
+| loader | convert (s) | converted (MiB) | docs/s | Mtokens/s | cores | CPU ns/token | resume (s) | exact resume | tokens lost |
+|---|---|---|---|---|---|---|---|---|---|
+| plitzer | 0.0 | 0.0 | — | 298.5 | 3.95 | 13.2 | 0.34 | yes | 0 |
+| mosaic | 27.5 | 1221.8 | 23,475 | 24.1 | 2.66 | 110.5 | 2.79 | yes | 0 |
+| hf | 4.8 | 2008.7 | 82,952 | 85.2 | 0.99 | 11.6 | 0.16 | yes | 0 |
+| hf-stream | 0.0 | 0.0 | 2,329 | 2.4 | 1.12 | 467.0 | 3.54 | no | 10,373,481 |
 
-plitzer reads the Parquet as it is, with no conversion or copy, delivers 3.1× the tokens of `hf` and 11× those of Mosaic, packs every sequence full with no padding, and resumes exactly. `hf` still spends less CPU per token and resumes faster, from the Arrow copy it makes first; both are the next work on speed. Batches are 64 documents for the other loaders and 64 sequences of 2048 tokens for plitzer, so compare tokens. Method and caveats: [design §5.14](docs/design.md#514-baseline-harness).
+plitzer reads the Parquet as it is, with no conversion or copy, delivers 3.5× the tokens of `hf` and 12× those of Mosaic, packs every sequence full with no padding, and resumes exactly. `hf` still spends less CPU per token (11.6 vs 13.2 ns) and resumes faster (0.16 vs 0.34 s), from the Arrow copy it makes first; both are the next work on speed. `--batch` is in documents, and plitzer gets the same tokens in each batch (32 sequences of 2048). Method and caveats: [design §5.14](docs/design.md#514-baseline-harness).
 
 ```sh
 python -m plitzer.bench.baseline DATA --loaders plitzer,mosaic,hf,hf-stream --batch 64 --workers 4
