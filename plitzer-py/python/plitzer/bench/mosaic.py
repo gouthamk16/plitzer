@@ -9,7 +9,7 @@ import pyarrow.parquet as pq
 from streaming import MDSWriter, StreamingDataLoader, StreamingDataset
 from streaming.base.util import clean_stale_shared_memory
 
-from plitzer.bench.baseline import Doc, Run, parquet_files
+from plitzer.bench.phases import Doc, Run, parquet_files
 
 
 def docs(batch: list[dict[str, bytes]]) -> dict[str, list[Doc]]:
