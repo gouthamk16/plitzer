@@ -78,34 +78,16 @@ impl Prefetch {
             loop {
                 let w = seq.next_window();
                 let now = (w.epoch, w.window);
-                let first = w.key(w.used().start);
-                if !self.near(now, first, &mut signals).await {
+                if !self.near(now, w.key(w.used().start), &mut signals).await {
                     return;
                 }
-                for i in w.used() {
-                    if !w.users(i).any(|l| self.starts[l] <= now) {
-                        continue;
-                    }
-                    let g = w.groups[i];
-                    let kib = permits(kib(&self.index, g));
-                    let admitted = admit(&budget, kib, w.key(i), &mut signals.demand).await;
-                    let Some(permit) = admitted else {
-                        return;
-                    };
-                    let Ok(slot) = slots.clone().acquire_owned().await else {
-                        return;
-                    };
-                    let (reader, index) = (self.reader.clone(), self.index.clone());
-                    let read = tokio::spawn(async move {
-                        let tokens = reader.read(&index, g).await;
-                        drop(slot);
-                        Ok((tokens?, permit))
-                    });
-                    let arrival = Arrival {
-                        key: w.key(i),
-                        row_group: g,
-                        read: Abort(read),
-                    };
+                for i in w
+                    .used()
+                    .filter(|&i| w.users(i).any(|l| self.starts[l] <= now))
+                {
+                    let key = (w.key(i), w.groups[i]);
+                    let read = self.read(key, &budget, &slots, &mut signals.demand);
+                    let Some(arrival) = read.await else { return };
                     if tx.send(arrival).is_err() {
                         return;
                     }
@@ -115,14 +97,40 @@ impl Prefetch {
         (rx, Abort(driver))
     }
 
+    /// Starts the read of row group `g` at `key` once the budget and a read
+    /// slot allow it. `None` once the loader is gone.
+    async fn read(
+        &self,
+        (key, g): (Key, u32),
+        budget: &Arc<Semaphore>,
+        slots: &Arc<Semaphore>,
+        demand: &mut watch::Receiver<Key>,
+    ) -> Option<Arrival> {
+        let permit = admit(budget, permits(kib(&self.index, g)), key, demand).await?;
+        let slot = slots.clone().acquire_owned().await.ok()?;
+        let (reader, index) = (self.reader.clone(), self.index.clone());
+        let read = tokio::spawn(async move {
+            let tokens = reader.read(&index, g).await;
+            drop(slot);
+            Ok((tokens?, permit))
+        });
+        Some(Arrival {
+            key,
+            row_group: g,
+            read: Abort(read),
+        })
+    }
+
     /// Waits until window `now` is at most `AHEAD` windows past the slowest
     /// lane, or a step waits for its first read at `first`. False once the
     /// loader is gone.
     async fn near(&self, now: (u64, usize), first: Key, signals: &mut Signals) -> bool {
-        let ordinal = |(e, w): (u64, usize)| e * self.windows + w as u64;
+        // Saturating: a hand-made checkpoint can hold any epoch.
+        let ordinal =
+            |(e, w): (u64, usize)| e.saturating_mul(self.windows).saturating_add(w as u64);
         loop {
             let slowest = *signals.slowest.borrow_and_update();
-            if ordinal(now) <= ordinal(slowest) + AHEAD
+            if ordinal(now) <= ordinal(slowest).saturating_add(AHEAD)
                 || *signals.demand.borrow_and_update() >= first
             {
                 return true;

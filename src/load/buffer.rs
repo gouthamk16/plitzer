@@ -4,8 +4,7 @@ use std::collections::{HashMap, HashSet};
 
 use super::prefetch::{Arrival, Permit};
 use super::sequence::WindowGroups;
-use crate::order::Doc;
-use crate::pack::{Lane, Orders, Tokens};
+use crate::pack::{Lane, Orders, Rows, Tokens};
 use crate::read::RowGroupTokens;
 
 /// A lane that still takes from a row group, in one window: `(lane index,
@@ -29,9 +28,8 @@ pub(super) struct Buffer {
 }
 
 impl Tokens for Buffer {
-    fn tokens(&self, doc: Doc) -> Option<&[u32]> {
-        let held = self.held.get(&doc.row_group)?;
-        Some(held.tokens.row(doc.row as usize))
+    fn row_group(&self, row_group: u32) -> Option<Rows<'_>> {
+        Some(self.held.get(&row_group)?.tokens.view())
     }
 }
 

@@ -10,6 +10,7 @@ use std::collections::{HashMap, HashSet};
 
 use super::*;
 use crate::order::gpu_lanes;
+use crate::pack::Rows;
 use crate::pack::Tokens;
 use crate::read::RowGroupTokens;
 use sequence::WindowGroups;
@@ -57,7 +58,7 @@ async fn data(seed: u64) -> Data {
         .await
         .unwrap();
     let reader = Reader::new(store(&dir), Path::from(""), &index).unwrap();
-    let orders = Orders::new(seed, LANES, 3, SEQ_LEN, &index.rows());
+    let orders = Orders::new(seed, LANES, 3, SEQ_LEN, &index.slots());
     Data {
         dir,
         index: Arc::new(index),
@@ -74,8 +75,8 @@ fn store(dir: &TempDir) -> Arc<LocalFileSystem> {
 struct All(HashMap<u32, RowGroupTokens>);
 
 impl Tokens for All {
-    fn tokens(&self, doc: Doc) -> Option<&[u32]> {
-        Some(self.0[&doc.row_group].row(doc.row as usize))
+    fn row_group(&self, g: u32) -> Option<Rows<'_>> {
+        Some(self.0[&g].view())
     }
 }
 

@@ -19,12 +19,12 @@ def test_bytes_read_counts_each_epoch(make: MakeLoader, dataset: Path) -> None:
     loader = make()
     assert loader.bytes_read == 0, "nothing is read before the first step"
     whole = amplification.scan(dataset, "tokens").bytes
-    # The prefetch reads a few windows ahead, into the next epoch: each epoch
-    # reads one dataset, give or take what is read ahead at its two ends.
+    # Each epoch reads the whole dataset, and the prefetch reads at most a
+    # few windows into the next one, so a second read of the dataset fails.
     for epoch in (1, 2, 3):
         for _ in loader:
             pass
-        assert (epoch - 1) * whole <= loader.bytes_read <= (epoch + 1) * whole
+        assert epoch * whole <= loader.bytes_read < (epoch + 1) * whole
 
 
 def settings(window: int) -> amplification.Settings:
@@ -33,9 +33,8 @@ def settings(window: int) -> amplification.Settings:
 
 
 def test_measure_runs_every_rank(dataset: Path, tmp_path: Path) -> None:
-    # Documents of 0 to 18 tokens in sequences of 8: lanes drift far apart,
-    # and the fastest reads ahead into later epochs, so these amplifications
-    # are not exact. `test_measure_even_row_groups` checks exact values.
+    # GPU edges fall inside row groups, so these amplifications are above 1
+    # but not exact. `test_measure_even_row_groups` checks exact values.
     cache = tmp_path / "index"
     one, two, four = amplification.measure(dataset, settings(3), [1, 2, 4], cache)
     assert [len(w.per_gpu) for w in (one, two, four)] == [1, 2, 4]
@@ -45,7 +44,8 @@ def test_measure_runs_every_rank(dataset: Path, tmp_path: Path) -> None:
 
 @pytest.fixture
 def even(tmp_path: Path) -> Path:
-    """Eight row groups of 4 rows each, as FineWeb-Edu has 1000 in each."""
+    """Eight row groups of 20 tokens each: lane slices are cut by tokens, so
+    with equal row groups, GPU edges fall on row-group edges."""
     data = tmp_path / "even"
     data.mkdir()
     rows = [[r * 10 + t for t in range(5)] for r in range(32)]
@@ -56,11 +56,11 @@ def even(tmp_path: Path) -> Path:
 
 def test_measure_even_row_groups(even: Path, tmp_path: Path) -> None:
     cache = tmp_path / "index"
-    # 4 lanes and windows of 4 row groups: each lane has one row group, so
-    # GPUs share none, and the amplification is exactly 1.
+    # 4 lanes and windows of 4 row groups: each lane has one row group's
+    # tokens, so GPUs share none, and the amplification is exactly 1.
     for w in amplification.measure(even, settings(4), [1, 2, 4], cache):
         assert w.amplification == 1.0, len(w.per_gpu)
-    # Windows of 2: each lane has half a row group, and 4 GPUs read each
+    # Windows of 2: each lane has half a row group's tokens, and 4 GPUs read each
     # row group twice.
     (w,) = amplification.measure(even, settings(2), [4], cache)
     assert w.amplification == 2.0 == len(w.per_gpu) / w.window

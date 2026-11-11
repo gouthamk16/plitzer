@@ -3,35 +3,41 @@ use super::*;
 mod edges;
 use proptest::prelude::*;
 
-/// Documents whose tokens are unique ids, numbered in storage order.
-struct Corpus(Vec<Vec<Vec<u32>>>);
+/// Documents whose tokens are unique ids, numbered in storage order: each
+/// row group's values and row offsets.
+struct Corpus(Vec<(Vec<u32>, Vec<usize>)>);
 
 impl Corpus {
     fn new(lens: &[Vec<usize>]) -> Self {
         let mut id = 0;
-        let mut token = || {
-            id += 1;
-            id - 1
-        };
         let groups = lens
             .iter()
             .map(|g| {
-                g.iter()
-                    .map(|&n| (0..n).map(|_| token()).collect())
-                    .collect()
+                let mut offsets = vec![0];
+                for &n in g {
+                    offsets.push(offsets.last().unwrap() + n);
+                }
+                let values = (id..id + offsets.last().copied().unwrap() as u32).collect();
+                id += *offsets.last().unwrap() as u32;
+                (values, offsets)
             })
             .collect();
         Corpus(groups)
     }
 
-    fn rows(&self) -> Vec<u32> {
-        self.0.iter().map(|g| g.len() as u32).collect()
+    /// `Order::slots`: a slot for each token, and one for each empty row.
+    fn slots(&self) -> Vec<u32> {
+        let slots = |(_, o): &(Vec<u32>, Vec<usize>)| -> u32 {
+            o.windows(2).map(|r| (r[1] - r[0]).max(1) as u32).sum()
+        };
+        self.0.iter().map(slots).collect()
     }
 }
 
 impl Tokens for Corpus {
-    fn tokens(&self, doc: Doc) -> Option<&[u32]> {
-        Some(&self.0[doc.row_group as usize][doc.row as usize])
+    fn row_group(&self, g: u32) -> Option<Rows<'_>> {
+        let (values, offsets) = &self.0[g as usize];
+        Some(Rows { values, offsets })
     }
 }
 
@@ -54,17 +60,12 @@ fn run(
         .collect()
 }
 
-/// The first `n` tokens of lane `lane`'s stream: its documents of epoch 0,
+/// The first `n` tokens of lane `lane`'s stream: its slices of epoch 0,
 /// then of epoch 1, and so on, in the order the lane takes them.
 fn stream(o: &Orders, c: &Corpus, lane: u32, n: usize) -> Vec<u32> {
     let mut tokens = Vec::new();
     for e in 0.. {
-        let epoch = o.epoch(e);
-        for w in epoch.windows() {
-            for d in epoch.order().lane(w, lane) {
-                tokens.extend_from_slice(c.tokens(d).unwrap());
-            }
-        }
+        tokens.extend(stream_of(o, c, lane, e));
         if tokens.len() >= n {
             break;
         }
@@ -92,22 +93,32 @@ fn orders(
     steps: usize,
 ) -> Option<Arc<Orders>> {
     let c = Corpus::new(lens);
-    let o = Orders::new(seed, lanes, window, seq_len, &c.rows());
+    let o = Orders::new(seed, lanes, window, seq_len, &c.slots());
     let need = (steps + 1) * seq_len as usize;
     let fed = (0..lanes).all(|l| {
         let mut got = 0;
         (0..).take(need + 1).any(|e| {
-            let epoch = o.epoch(e);
-            let docs = epoch
-                .windows()
-                .iter()
-                .flat_map(|w| epoch.order().lane(w, l));
-            let n: usize = docs.map(|d| c.tokens(d).unwrap().len()).sum();
+            let n = stream_of(&o, &c, l, e).len();
             got += n;
             n == 0 || got >= need
         }) && got >= need
     });
     fed.then_some(o)
+}
+
+/// Lane `lane`'s tokens of epoch `e`, in the order it takes them.
+fn stream_of(o: &Orders, c: &Corpus, lane: u32, e: u64) -> Vec<u32> {
+    let epoch = o.epoch(e);
+    let mut tokens = Vec::new();
+    for w in epoch.windows() {
+        let Ok(pieces) = pieces::pieces(&epoch.order(), w, lane, c) else {
+            panic!("the corpus has every row group")
+        };
+        for p in pieces {
+            tokens.extend_from_slice(&c.0[p.row_group as usize].0[p.start..p.end]);
+        }
+    }
+    tokens
 }
 
 /// Enough steps for a few epochs of every lane.

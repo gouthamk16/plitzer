@@ -107,6 +107,11 @@ def rank_bytes(
     return settled(loader) - first
 
 
+QUIET = 0.2
+"""Seconds with no new bytes after which the prefetch counts as stopped: far
+longer than one read of a local row group, so a slow read is not missed."""
+
+
 def settled(loader: plitzer.Loader) -> int:
     """`bytes_read` once the prefetch stops: it reads a fixed number of
     windows past the slowest lane, so the count it stops at depends only on
@@ -114,7 +119,7 @@ def settled(loader: plitzer.Loader) -> int:
     last = -1
     while loader.bytes_read != last:
         last = loader.bytes_read
-        time.sleep(0.05)
+        time.sleep(QUIET)
     return last
 
 

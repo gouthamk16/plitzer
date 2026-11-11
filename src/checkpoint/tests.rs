@@ -18,8 +18,8 @@ fn part(first_lane: u32, step: u64, n: usize) -> Checkpoint {
     let lanes = (0..n)
         .map(|i| Position {
             epoch: 2 + i as u64 % 2,
-            doc: 3 * i as u64 + 1,
-            offset: i as u32,
+            window: 3 * i as u32 + 1,
+            token: i as u64,
         })
         .collect();
     Checkpoint {
@@ -40,7 +40,7 @@ fn golden_bytes() {
     let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
     assert_eq!(bytes.len(), 122);
     assert_eq!(&hex[..24], "504c545a434b505402000000");
-    assert_eq!(fnv1a(&bytes), 0xd973_93d1_c21c_24f1);
+    assert_eq!(fnv1a(&bytes), 0xf0ec_5246_e1f9_a518);
 }
 
 #[test]
@@ -140,8 +140,12 @@ fn check_names_the_field() {
 }
 
 fn checkpoints() -> impl Strategy<Value = Checkpoint> {
-    let lane = (any::<u64>(), any::<u64>(), any::<u32>())
-        .prop_map(|(epoch, doc, offset)| Position { epoch, doc, offset });
+    let lane =
+        (any::<u64>(), any::<u32>(), any::<u64>()).prop_map(|(epoch, window, token)| Position {
+            epoch,
+            window,
+            token,
+        });
     let config = (".{0,12}", any::<u64>(), any::<[u32; 3]>()).prop_map(
         |(column, seed, [lanes, window, seq_len])| Config {
             column,

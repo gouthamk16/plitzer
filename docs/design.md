@@ -66,7 +66,8 @@ Each term has only one definition in this document.
 | Step | One global batch. Each lane supplies one sequence per step. |
 | S | The number of steps in an epoch: ⌈T/(B·L)⌉, where T is the number of tokens in the dataset. |
 | Stream | The documents of one lane: its slices of the windows of epoch e, then of epoch e + 1, and so on. |
-| Position | The place of a lane in its stream, as `(epoch, doc, offset)`: token `offset` of its document `doc` of epoch `epoch`. A checkpoint holds one position for each lane. |
+| Slot | One token of a row group, or one row with no token. The slots of a row group are the leaf value count of its token column chunk. |
+| Position | The place of a lane in its stream, as `(epoch, window, token)`: after the first `token` tokens of its slice of that window. A checkpoint holds one position for each lane. |
 | Key | The 32-byte seed of one shuffle. Only `seed::key` makes a key. |
 | Read amplification | The bytes that one GPU reads, divided by the bytes of its own data. |
 | Prefix | The folder or key prefix in the store below which the dataset files are. |
@@ -88,7 +89,7 @@ Each term has only one definition in this document.
 |---|---|---|---|
 | REQ-1 | The order is a pure function of `(seed, epoch)` and the index, and the sequences are a pure function of the order and the tokens. | Golden tests in `shuffle`, `seed`, `order` and `pack`. | Met for the order and the packer |
 | REQ-2 | Each epoch of the order holds each document exactly once. The sequences hold each token of each lane's stream, in order, and no pad token: no token is lost. | `order::exactly_once` and `pack::lossless` (property tests). | Met |
-| REQ-3 | Lanes and their slices depend only on `(seed, epoch, B, W)`. They do not depend on world. | `Order` has no world input. `order::gpu_lanes_partition` (property test). | Met |
+| REQ-3 | Lanes and their slices depend only on `(seed, epoch, B, W)` and the slots of the index. They do not depend on world. | `Order` has no world input. `order::gpu_lanes_partition` (property test). | Met |
 | REQ-4 | A resume at step k gives the same tail as a run without a stop. This is also true when world changes. | `pack::resume_matches_tail` (property test) and `load::resume_matches_tail`. `session::resume_on_another_world_matches_one_run` reads Parquet files through checkpoint bytes. `test_kill_and_resume_on_another_world` and `test_kill_and_resume_with_torch` kill a training run of real processes at a random step and resume it on another number of processes (sections 5.11 and 5.12). | Met |
 | REQ-5 | The output is the same on Linux, macOS and Windows. | CI runs the golden tests on the three systems. | Met |
 | REQ-6 | Read amplification is 1 + ⌈n/W⌉(world − 1)/n or less, in row groups, for n row groups: approximately 1 + (world − 1)/W. | The reader reads no footer (`read::reads_without_footer`). Each GPU reads only the windows that its lanes reach, each one time (`load::each_window_is_read_once`). Measurement on FineWeb-Edu lengths (section 6). | Met |
@@ -207,27 +208,27 @@ pub fn key(seed: u64, epoch: u64, purpose: Purpose) -> Key;
 
 ### 5.3 Order
 
-**Function:** The order module tells each lane which documents to read in an epoch, and in which sequence. It also tells each GPU which lanes it owns.
+**Function:** The order module tells each lane which part of each window to read in an epoch, and in which sequence. It also tells each GPU which lanes it owns.
 
 **Interface:**
 
 ```rust
-pub struct Doc { pub row_group: u32, pub row: u32 }
-
 pub struct Order<'a> {
     pub seed: u64,
     pub epoch: u64,
-    pub lanes: u32,      // B
-    pub window: u32,     // W
-    pub rows: &'a [u32], // row count of each row group
+    pub lanes: u32,       // B
+    pub window: u32,      // W
+    pub slots: &'a [u32], // the slots of each row group: Index::slots
 }
 
-pub struct Window { /* private: index, groups, docs */ }
+pub struct Window { /* private: index, groups, slots */ }
+pub struct Part { pub row_group: u32, pub slots: Range<u64> }
 
 impl Order<'_> {
     pub fn windows(&self) -> Vec<Window>;
-    pub fn lane(&self, window: &Window, lane: u32) -> Vec<Doc>;
-    pub fn lane_len(&self, window: &Window, lane: u32) -> u64;
+    pub fn lane(&self, window: &Window, lane: u32) -> Vec<Part>;   // in storage order
+    pub fn shuffle_lane<T>(&self, window: &Window, lane: u32, pieces: &mut [T]);
+    pub fn lane_len(&self, window: &Window, lane: u32) -> u64;      // in slots
     pub fn lane_groups(&self, window: &Window, lanes: Range<u32>) -> Vec<Range<usize>>;
 }
 impl Window {
@@ -237,56 +238,58 @@ impl Window {
 pub fn gpu_lanes(lanes: u32, world: u32, rank: u32) -> Range<u32>;
 ```
 
-**Design:** The module does these steps for each epoch:
+**Design:** A row group has one slot for each token, and one slot for each row with no token. This is the leaf value count of its token column chunk, which the footer records, so the index gives it with no read. The module does these steps for each epoch:
 
 1. Shuffle the ids of all row groups with `Purpose::RowGroups`.
 2. Cut the result into windows of W row groups. The last window can have fewer.
 3. Sort the row groups of each window into storage order.
-4. Put the documents of the window in a line, in storage order. Call the count N.
-5. Give lane `l` the positions `[l·N/B, (l+1)·N/B)`.
-6. Shuffle the documents of each lane with `Purpose::Lane { window, lane }`.
+4. Put the slots of the window in a line, in storage order. Call the count N.
+5. Give lane `l` the slots `[l·N/B, (l+1)·N/B)`. `lane` gives them as one part for each row group.
+6. The pack module makes the pieces of the slice from the rows (section 5.4). `shuffle_lane` shuffles them with `Purpose::Lane { window, lane }`.
 
 GPU `rank` owns the lanes `[rank·B/world, (rank+1)·B/world)`.
 
-`lane_len` gives the size of a lane slice without the shuffle of step 6. Each `Window` keeps its document count N, so `lane_len` does not add the row counts again.
+A row that crosses the edge of two slices gives its first tokens to one lane and the rest to the next lane. Each `Window` keeps its slot count N, so `lane_len` does not add the counts again.
 
-**Example:** The index has 8 row groups with the row counts `[3, 1, 4, 1, 5, 9, 2, 6]`. W is 3 and B is 2. Seed 7, epoch 0 gives the windows `[1, 5, 6]`, `[2, 4, 7]` and `[0, 3]`. Window 0 has 1 + 9 + 2 = 12 documents. Each lane gets 6 documents:
+**Example:** The index has 8 row groups with the slot counts `[3, 1, 4, 1, 5, 9, 2, 6]`. W is 3 and B is 2. Seed 7, epoch 0 gives the windows `[1, 5, 6]`, `[2, 4, 7]` and `[0, 3]`. Window 0 has 1 + 9 + 2 = 12 slots. Each lane gets 6 slots:
 
 ```text
-position   0    1    2    3    4    5  |  6    7    8    9    10   11
-document  1/0  5/0  5/1  5/2  5/3  5/4 | 5/5  5/6  5/7  5/8  6/0  6/1
-          ---------- lane 0 ---------- | ---------- lane 1 ----------
+slot        0  |  1  2  3  4  5  |  6  7  8  9  |  10  11
+row group   1  |  5  5  5  5  5  |  5  5  5  5  |  6   6
+            ----- lane 0 -------    ----------- lane 1 -----
 ```
 
-A document shows as `row_group/row`. Step 6 then shuffles each lane. Lane 0 reads `5/1, 1/0, 5/0, 5/4, 5/2, 5/3`.
+Lane 0 gets the parts `1: 0..1` and `5: 0..5`. Lane 1 gets `5: 5..9` and `6: 0..2`.
 
 **Rationale:**
 
 - Step 3 is the fix for read amplification. A lane slice covers one stretch of storage. Thus a GPU reads only its own row groups and the row groups at its edges (section 6).
-- The lane slices depend on B and W, but not on world. A change of world changes only which GPU runs a lane (D-7).
+- The lane slices depend on B, W and the slots of the index, but not on world. A change of world changes only which GPU runs a lane (D-7).
 - Only `windows` makes a `Window`, and a `Window` holds its own index. Thus a caller cannot give the row groups of one window with the number of a different window. Two windows never share a lane key (D-8).
-- The bounds of the slices use document counts, not token counts. Token balance is a problem for the Pack stage (D-10).
+- The bounds of the slices use slots, not documents. Each lane takes L tokens at each step, so each lane must get the same share of the tokens. With slices of equal document counts, the tokens of the lanes differed by approximately 25 % on FineWeb-Edu lengths, and the lanes went apart by 3.9 windows in one epoch (D-86).
 - The bounds use `u128` arithmetic, because `l·N` can be larger than `u64`.
 
 **Limits:**
 
 - `Order::windows` panics if `window` is 0. `Order::lane` panics if `lane` is not less than B. `gpu_lanes` panics if world does not divide B, or if `rank` is not less than world (D-11).
 - A lane is empty if N is less than B.
-- A `Window` keeps its document count. Use it only with the `Order` that made it.
-- Row group ids and row numbers are `u32`. FineWeb-Edu has approximately 3 × 10⁶ row groups: approximately 2,900 files of approximately 1,000 row groups.
+- A row with no token has a slot but gives no token. Thus a lane whose slice has many empty rows gets fewer tokens.
+- A `Window` keeps its slot count. Use it only with the `Order` that made it.
+- Row group ids are `u32`. FineWeb-Edu has approximately 3 × 10⁶ row groups: approximately 2,900 files of approximately 1,000 row groups.
 - The documents of a window mix only inside each lane. The mix quality on sorted datasets is not measured yet (section 7).
 
 **Verification:**
 
 | Test | Type | What it shows |
 |---|---|---|
-| `exactly_once` | Property | All lanes of all windows supply each document exactly once. |
+| `exactly_once` | Property | The slices of all lanes, in lane order, are the slots of the window in storage order: each slot is in one slice, and each slice is one stretch. |
 | `windows_partition` | Property | Each row group is in one window. Each window is sorted. All windows have W row groups, except the last. |
-| `slices_contiguous` | Property | The sorted lane slices, in lane order, make the window in storage order. The lane sizes differ by one or less. |
-| `lane_len_matches` | Property | `lane_len` is equal to the length of `lane` for each window and lane. |
+| `slices_balanced` | Property | The slot counts of the lanes of a window differ by one or less. |
+| `lane_len_matches` | Property | `lane_len` is equal to the slots of the parts of `lane`. |
+| `lane_groups_match` | Property | `lane_groups` gives the row groups of the parts of `lane`. |
 | `gpu_lanes_partition` | Property | The lanes of all GPUs cover `0..B` in order, with no overlap. |
 | `gpu_lanes_rejects_uneven_world` | Unit | `gpu_lanes` panics if world does not divide B. |
-| `golden` | Unit | The output above, and a hash over 500 row groups, is the same on each OS. |
+| `golden` | Unit | The parts above, a lane shuffle, and a hash over 500 row groups are the same on each OS. |
 | `epochs_differ` | Unit | The row group shuffle and the lane shuffle both change with the epoch. |
 
 The property tests use small inputs. Thus empty row groups, empty lanes and short last windows occur frequently.
@@ -298,84 +301,91 @@ The property tests use small inputs. Thus empty row groups, empty lanes and shor
 **Interface:**
 
 ```rust
-pub trait Tokens { fn tokens(&self, doc: Doc) -> Option<&[u32]>; }  // None: not in memory
+pub struct Rows<'a> { pub values: &'a [u32], pub offsets: &'a [usize] }
+pub trait Tokens { fn row_group(&self, row_group: u32) -> Option<Rows<'_>>; }  // None: not in memory
 
-pub struct Position { pub epoch: u64, pub doc: u64, pub offset: u32 }
+pub struct Position { pub epoch: u64, pub window: u32, pub token: u64 }
+pub struct Piece { pub row_group: u32, pub start: usize, pub end: usize }   // tokens of `values`
 
-pub struct Orders { pub seed: u64, pub lanes: u32, pub window: u32, pub seq_len: u32, /* rows, epochs */ }
+pub struct Orders { pub seed: u64, pub lanes: u32, pub window: u32, pub seq_len: u32, /* slots, epochs */ }
 pub struct Epoch { pub number: u64, /* the order inputs, windows */ }
-pub struct Lane { /* private: lane, stream, offset */ }
-pub enum Need { Ready, Missing { slice: (u64, usize), doc: Doc }, Bad(String), Empty(String) }
+pub struct Lane { /* private */ }
+pub enum Need { Ready, Missing { slice: (u64, usize), row_group: u32 }, Bad(String), Empty(String) }
 
 impl Orders {
-    pub fn new(seed: u64, lanes: u32, window: u32, seq_len: u32, rows: &[u32]) -> Arc<Orders>;
+    pub fn new(seed: u64, lanes: u32, window: u32, seq_len: u32, slots: &[u32]) -> Arc<Orders>;
     pub fn epoch(&self, number: u64) -> Arc<Epoch>;   // made once, shared by the lanes in it
 }
 impl Epoch {
     pub fn order(&self) -> Order<'_>;
     pub fn windows(&self) -> &[Window];
-    pub fn lane_docs(&self, lane: u32) -> u64;
+    pub fn lane_slots(&self, lane: u32) -> u64;
 }
 impl Lane {
     pub fn new(orders: &Arc<Orders>, lane: u32, at: Position) -> Result<Lane, String>;
     pub fn position(&self) -> Position;
-    pub fn slice(&self) -> (u64, usize);                    // (epoch, window) of the current document
+    pub fn slice(&self) -> (u64, usize);                    // (epoch, window) the lane stands in
     pub fn need(&self, tokens: &impl Tokens) -> Need;       // what the next sequence needs; no change
     pub fn fill(&mut self, tokens: &impl Tokens, out: &mut [u32]);
 }
 ```
 
-**Design:** The stream of a lane is its slices from `Order::lane` in each window of epoch 0, then in each window of epoch 1, and so on. A position `(epoch, doc, offset)` is token `offset` of the `doc`-th document of the stream in `epoch`.
+**Design:** The stream of a lane is its slice of each window of epoch 0, then of each window of epoch 1, and so on. A position `(epoch, window, token)` is after the first `token` tokens of the lane's slice of that window.
+
+The pieces of a slice are the rows of its parts. A row in a part gives one piece: its tokens in the part. A row that crosses an edge of the slice gives the piece of its tokens inside the slice. A row with no token gives no piece. `shuffle_lane` puts the pieces into the reading order. The lane needs the row offsets to make the pieces, so it makes them when all row groups of the slice are in memory, and keeps them while it is in the slice.
 
 `Lane::fill` does these steps:
 
-1. Copy the remaining tokens of the current document into `out`.
-2. Copy the next documents, one after the other, until `out` holds L tokens.
-3. Stop in the last document at the token after the last one copied. That is the new position.
+1. Copy the remaining tokens of the current piece into `out`.
+2. Copy the next pieces, one after the other, until `out` holds L tokens.
+3. Stop in the last piece at the token after the last one copied. That is the new position.
 
-Each token is copied one time, from its row group to `out`, with one copy for each part of a document. A document can end in one sequence and continue in the next. An empty document gives no token, and the lane goes to the next document. At the end of the lane's documents of an epoch, the lane goes on to its first document of the next epoch (D-79).
+Each token is copied one time, from its row group to `out`, with one copy for each piece. A piece can end in one sequence and continue in the next. At the end of a slice, the lane goes to its slice of the next window, and after the last window, to the first window of the next epoch (D-79). It does not stop on a window where its slice has no slots.
 
-`Lane::need` does the same steps without a change to the lane. It gives `Ready` if all tokens of the next sequence are in memory. Else it gives the first document that is not in memory, and its window. The loader uses `need` before `fill`, so `fill` never waits (section 5.7).
+`Lane::need` does the same steps without a change to the lane. It gives `Ready` if all row groups of the slices of the next sequence are in memory. Else it gives the first row group that is not in memory, and its window. The loader uses `need` before `fill`, so `fill` never waits (section 5.7).
 
-`Orders::epoch` makes the windows of an epoch one time and shares them with each lane in that epoch. Lanes cross the end of an epoch at different steps, so two epochs can be in use at the same time.
+`Orders::epoch` makes the windows of an epoch one time and shares them with each lane in that epoch. It also keeps the last 4 epochs, so that the loader does not make an epoch again when it releases a window of an epoch that the lanes left.
 
-**Example:** L is 4. A lane takes documents of 3, 5, 0 and 6 tokens: `a1 a2 a3`, `b1 ... b5`, the empty document, `c1 ... c6`.
+**Example:** L is 4. A slice has the pieces `a1 a2 a3`, `b1 ... b5` and `c1 ... c6` in reading order, 14 tokens.
 
 | Step | Sequence | Position after |
 |---|---|---|
-| 0 | a1 a2 a3 b1 | (e, 1, 1) |
-| 1 | b2 b3 b4 b5 | (e, 3, 0) |
-| 2 | c1 c2 c3 c4 | (e, 3, 4) |
-| 3 | c5 c6, then the first 2 tokens of the next document | ... |
+| 0 | a1 a2 a3 b1 | (e, w, 4) |
+| 1 | b2 b3 b4 b5 | (e, w, 8) |
+| 2 | c1 c2 c3 c4 | (e, w, 12) |
+| 3 | c5 c6, then the first 2 tokens of the next slice | (e, w + 1, 2) |
 
 **Rationale:**
 
 - Each step takes tokens until the sequence is full, not a fixed number of documents. A fixed number of documents cannot give L tokens on average: the leftover then grows or empties as a random walk, so a cap drops tokens or a lane pads. On FineWeb-Edu lengths with D = 2 and C = L = 2048, the fixed packer dropped 19.3 % of the tokens (D-77).
-- The leftover is always the rest of one document. Thus `(doc, offset)` describes it, and a resume reads only the document of each lane, not a replay of many documents (D-78).
+- The position counts tokens in a window. The index gives the slots of each slice, so `Lane::new` checks a position and finds its window with no read, and a resume reads only the slice of each lane (D-78).
 - A lane goes on into the next epoch, so no lane waits or pads at the end of an epoch (D-79).
-- `need` and `fill` are two calls. `need` finds each document that the step needs while the lane does not change, so the loader can wait for reads and be cancel safe (D-80).
+- `need` and `fill` are two calls. `need` finds each row group that the step needs while the lane does not change, so the loader can wait for reads and be cancel safe (D-80).
+- `need` also checks the row groups of the pieces that the lane keeps. A row group can be in memory for a window of another epoch, and leave with that window.
 - The pack module reads tokens through the `Tokens` trait. The loader implements it with the row groups in memory, and the tests use a corpus in memory (D-16).
 
 **Limits:**
 
 - The packer adds no tokens between documents. The `Tokens` source must add an EOS token if the model needs one.
-- A document can have a maximum of `u32::MAX` tokens.
-- A lane that finds no token in two whole epochs gives `Need::Empty`. This occurs only when a dataset has fewer documents or tokens than the lanes need.
+- Each lane takes L tokens at each step, and gets its share of the slots of each window, to one slot. Empty rows and these rounding errors make the lanes move a little apart. This is much less than one window.
+- A lane that finds no token in two whole epochs gives `Need::Empty`. This occurs only when a dataset has fewer tokens than the lanes need.
+- A position with a token count up to the slots of its slice, but past its tokens, gives `Need::Bad` at the first step: the count of empty rows needs the tokens.
 - `Orders::new` panics if B, W or L is 0. `fill` panics if `out` does not have L tokens, or if `need` did not give `Ready` (D-11).
 
 **Verification:**
 
 | Test | Type | What it shows |
 |---|---|---|
-| `lossless` | Property | The sequences of each lane, joined, are its stream: each token of each document, in order, across epoch ends. No token is dropped and no pad token occurs. |
+| `lossless` | Property | The sequences of each lane, joined, are its stream: each token of its slices, in order, across epoch ends. No token is dropped and no pad token occurs. |
 | `resume_matches_tail` | Property | For each lane and step k, a lane made from the position after step k supplies the same sequences as the run without a stop. |
-| `need_names_the_first_missing_document` | Unit | With one row group out of memory, `need` gives the first document of the stream in it, and `Ready` with all row groups. |
-| `a_lane_with_no_tokens_is_an_error` | Unit | A lane with no document, or with only empty documents, gives `Need::Empty`. |
-| `bad_positions_are_refused` | Unit | A document past the lane's documents, an offset at the end of the epoch and a lane out of range give an error. An offset past its document gives `Need::Bad`. |
+| `lanes_stay_together` | Unit | Over row groups of short and long documents, 16 lanes for 2000 steps are always in the same window or the next. |
+| `need_names_the_first_missing_row_group` | Unit | With one row group out of memory, `need` gives it, and `Ready` with all row groups. |
+| `a_lane_with_no_tokens_is_an_error` | Unit | A lane with no slot, or with only empty rows, gives `Need::Empty`. |
+| `bad_positions_are_refused` | Unit | A token count past the slots of the slice, a window past the epoch and a lane out of range give an error. A token count past the tokens of a slice with an empty row gives `Need::Bad`. |
 | `golden` | Unit | Two lanes over a small corpus give their streams. A hash over 60 row groups is the same on each OS. |
 | `wrong_out_len_panics` | Unit | An `out` of the wrong length causes a panic. |
 
-The property tests use small inputs. Thus empty documents, empty lanes, documents longer than L, L = 1 and steps across many epochs occur frequently.
+The property tests use small inputs. Thus empty rows, empty lanes, documents longer than L, L = 1 and steps across many epochs occur frequently.
 
 ### 5.5 Index
 
@@ -404,7 +414,8 @@ impl Index {
     pub fn column(&self) -> &str;
     pub fn schema(&self) -> &str;                              // the token column's schema, as text
     pub fn row_group(&self, row_group: u32) -> (&File, &RowGroup);
-    pub fn rows(&self) -> Vec<u32>;                           // the input of Order::rows
+    pub fn rows(&self) -> Vec<u32>;                           // the row count of each row group
+    pub fn slots(&self) -> Vec<u32>;                          // the input of Order::slots
     pub fn locate(&self, row_group: u32) -> (usize, usize);   // (file, row group in the file)
     pub fn fingerprint(&self) -> u64;
 }
@@ -517,10 +528,13 @@ pub struct RowGroupTokens { /* private: offsets, values */ }
 impl RowGroupTokens {
     pub fn rows(&self) -> usize;
     pub fn row(&self, row: usize) -> &[u32];
+    pub fn slots(&self) -> u64;     // a slot for each token, and one for each row with none
+    pub fn view(&self) -> Rows<'_>; // values and offsets, for the packer
     pub fn bytes(&self) -> usize;   // memory of the tokens, for the prefetch budget
 }
 
-pub enum Error { Schema(..), Fetch { path, source }, Decode { path, row_group, source }, BadToken { path, row_group } }
+pub enum Error { Schema(..), Fetch { path, source }, Decode { path, row_group, source }, BadToken { path, row_group },
+                 Slots { path, row_group } }
 ```
 
 **Design:** `Reader::read` does these steps:
@@ -545,7 +559,8 @@ After step 3, `read` adds the length of the fetched chunk to an atomic counter. 
 - The input of v1 is a column of token lists. Tokenization in the loader is a later item (D-26).
 - `object_store` does not cut a large range, and AWS advises requests of 8 to 16 MB at the same time. Each piece is a separate `get_ranges` call, so that `object_store` does not merge the pieces again (D-27).
 - A negative token, a null token or a token larger than `u32::MAX` gives `Error::BadToken`. A null token would otherwise become token 0.
-- A chunk that decodes to a different number of rows than its footer gives `Error::Decode`. The lanes use the row count of the footer, so a missing row would otherwise cause a panic.
+- A chunk that decodes to a different number of rows than its footer gives `Error::Decode`.
+- A chunk whose rows do not have the slots of its footer gives `Error::Slots`. The order cuts the slices by these slots, so a lane would otherwise find too few tokens.
 
 **Limits:**
 
@@ -566,6 +581,7 @@ After step 3, `read` adds the length of the fetched chunk to an atomic counter. 
 | `schema_text_golden` | Unit | The schema text of a `list<uint32>` column is pinned, so a change of the `parquet` printer shows. |
 | `bad_tokens_are_errors` | Unit | A negative token and a null token each give `Error::BadToken`. |
 | `row_count_must_match_the_footer` | Unit | An index with 5 rows for a chunk of 3 rows gives `Error::Decode`. |
+| `slots_must_match_the_index` | Unit | `RowGroupTokens::slots` is the value count of the index, and an index with one more gives `Error::Slots`. |
 | `fetch_splits_large_ranges`, `pieces_cover_range` | Unit | The pieces cover the range with no gap and no overlap, and each piece is 16 MiB or less. |
 | `index_and_read_over_s3` | Integration | The index, the sidecar and the reader work against versitygw in the `s3` CI job. |
 
@@ -640,7 +656,7 @@ The cost of a row group is its decoded size: `values · 4 + (rows + 1) · 8` byt
 | `passed_windows_are_evicted` | Unit | After each step, each row group in memory is in a window from the slowest lane to 4 windows after the fastest lane. |
 | `each_window_is_read_once` | Unit | The bytes that a GPU reads are at least the windows before its slowest lane and at most the windows to 2 after its fastest lane. |
 | `failed_read_stops_the_loader` | Unit | A corrupt chunk gives `Error::Read` one time and then `Error::Stopped`. The positions stay at the step before the failure. |
-| `a_bad_position_is_an_error` | Unit | An offset past its document gives `Error::State` that names the lane, at the first step. |
+| `a_bad_position_is_an_error` | Unit | A token count past the lane's slots gives `Error::State` that names the lane, when the loader is made. |
 | `next_is_cancel_safe` | Unit | Over a store with 5 ms reads, `next` futures dropped at their first poll lose no row group. |
 | `lane_groups_match` | Property | `Order::lane_groups` gives the row groups that `Order::lane` uses. |
 
@@ -688,7 +704,7 @@ pub enum Error { Bytes(&'static str), Version(u32), Checksum,
 | Fingerprint, epoch, step | 3 × u64 |
 | First lane | u32 |
 | Lane count | u32 |
-| Each lane | epoch u64, doc u64, offset u32 |
+| Each lane | epoch u64, window u32, token u64 |
 | Checksum | u64, FNV-1a of all bytes before it |
 
 Each lane has its own epoch: at the end of an epoch, some lanes are a few documents into the next epoch. Version 1 held the settings and the states of the fixed packer (D, C, pad, a step for each lane), and `from_bytes` refuses it with `Error::Version(1)` (D-84).
@@ -712,7 +728,7 @@ Each GPU gives a checkpoint part for its own lanes. `merge` puts the parts of al
 **Limits:**
 
 - The checksum finds damage, not changes by an attacker.
-- `from_bytes` does not make sure that each position is correct. `Session::resume` refuses a step past the epoch and a document past the lane's documents of its epoch. An offset past its document needs the tokens, so the first step gives that error as `load::Error::State`. Python gives both as `CheckpointError`. No checkpoint causes a panic.
+- `from_bytes` does not make sure that each position is correct. `Session::resume` refuses a step past the epoch, a window past the epoch and a token count past the slots of the slice. A token count past the tokens of a slice with empty rows needs the tokens, so the first step gives that error as `load::Error::State`. Python gives both as `CheckpointError`. Any epoch is a place in the stream, and no checkpoint causes a panic.
 
 **Verification:**
 
@@ -760,8 +776,8 @@ pub enum Error { Config(String), Empty, Index(index::Error), Read(read::Error),
 - An epoch has S = ⌈T/(B·L)⌉ steps, where T is the value count of the token column in the index. All GPUs get the same S from the index (D-79).
 - `open` refuses more than 2²⁴ lanes, and more than 2³⁰ tokens in one step of one GPU. These sizes are far past any real batch, and a larger value could only use all the memory (D-63).
 - `next` makes the loader at the first step, and keeps it across epochs. After S steps, `next` returns false, and the session goes to step 0 of the next epoch. The lanes keep their positions.
-- `set_epoch(e)` right after the last step of epoch e − 1 goes to epoch e, and the lanes go on. A later epoch is a jump: the lanes start at the first document of e. An earlier epoch or the current epoch changes nothing.
-- `resume` takes the positions from a checkpoint after `check`, refuses a step past the epoch, and makes the loader, which refuses a document past the lane's documents. It drops the old loader first and keeps its positions, and changes the session only when the new loader is made.
+- `set_epoch(e)` right after the last step of epoch e − 1 goes to epoch e, and the lanes go on. A later epoch is a jump: the lanes start at the first window of e. An earlier epoch or the current epoch changes nothing.
+- `resume` takes the positions from a checkpoint after `check`, refuses a step past the epoch, and makes the loader, which refuses a position past the lane's slots. It drops the old loader first and keeps its positions, and changes the session only when the new loader is made.
 - If `next` fails, the session keeps the positions of the loader and drops the loader. The next call makes a new loader and tries the same step again.
 - `checkpoint` gives the positions of the loader. After the last step of an epoch, it gives `(epoch + 1, step 0)`, also before the call of `next` that returns false.
 
@@ -791,7 +807,7 @@ pub enum Error { Config(String), Empty, Index(index::Error), Read(read::Error),
 | `resume_refuses_other_runs` | Unit | A different L, a different seed and an added file each give `Mismatch` with the name of the field. |
 | `refused_resume_keeps_the_epoch_end` | Unit | After the last step, a refused `resume` leaves `ended` true, and the next `next` gives false. |
 | `resume_needs_this_ranks_lanes` | Unit | A part resumes the rank that holds its lanes, and another rank refuses it. |
-| `resume_refuses_positions_outside_the_run` | Unit | A step past the epoch and a document past the lane's documents give `checkpoint::Error::Range` that names the lane, and `checkpoint()` is unchanged, also on a new session. An offset past its document gives `load::Error::State` at the first step. |
+| `resume_refuses_positions_outside_the_run` | Unit | A step past the epoch and a token count past the lane's slots give `checkpoint::Error::Range` that names the lane, and `checkpoint()` is unchanged, also on a new session. |
 | `open_refuses_bad_settings` | Unit | A world that does not divide B, a rank out of range, no GPUs, W = 0, L = 0, 2²⁵ lanes and L = 2³² − 1 each give `Error::Config`. |
 | `next_retries_after_a_failed_read` | Unit | After a failed read and a repair of the file, the next calls give the same batches as a run with no failure. |
 | `bytes_read_one_gpu_is_about_the_dataset_an_epoch` | Unit | `bytes_read` is 0 before the first step, and after e epochs it is between e − 1 and e + 1 datasets. |
@@ -961,7 +977,7 @@ An Arrow consumer moves the structs out of the capsules and sets their `release`
 | `test_arrow_export` | pytest | pyarrow reads `tokens` as a `FixedShapeTensorArray`. |
 | `test_resume_on_another_world` | pytest | Parts from world 2, merged, resume on world 4 with the same tail as one run. |
 | `test_resume_refuses_other_runs` | pytest | A different L, bad bytes and an incomplete merge give `CheckpointError`. |
-| `test_resume_refuses_a_hand_made_checkpoint` | pytest | Checksummed bytes with a document past the lane's documents give `CheckpointError` at `resume`, and `checkpoint()` is unchanged. An offset past its document gives `CheckpointError` at the next step. |
+| `test_resume_refuses_a_hand_made_checkpoint` | pytest | Checksummed bytes with a token count or a window past the lane's slots give `CheckpointError` at `resume`, and `checkpoint()` is unchanged. A lane at epoch 2⁶⁴ − 1 gives no panic. |
 | `test_bad_settings` | pytest | Bad settings, `world=-1`, `seed=2**200`, `lanes=4.0`, `seq_len=True`, a URL with `#` and a cache below a file give `ConfigError`. A missing folder gives `DataError`. |
 | `test_kill_and_resume_on_another_world` | pytest, end to end | Three times with a new seed: a run of 1 to 6 processes is killed at a random step of 3.5 epochs, one time in three at the end of an epoch. Each rank saves its own part at each step. After the kill, the newest step that all ranks saved is merged and resumed on another number of processes, as a real trainer does. The batch of each step and lane, before and after the kill, is the same as one process with no stop. Each rank must end with the exit code of the kill. `PLITZER_E2E_SEED` repeats a seed. |
 | `test_resume_with_the_fresh_budget` | pytest | On world 1 and 2, a resume at each step runs with the smallest budget of a fresh run, and 1 KiB less gives `ConfigError`. |
@@ -1143,7 +1159,7 @@ def table(results: Sequence[World]) -> str: ...   # Markdown
 | D-7 | Lanes depend only on B, never on world. | A resume with a different GPU count gives the same sequences. | A split of the batch by GPU. | #4 |
 | D-8 | `Window` holds its own index, and only `Order::windows` makes one. | A caller cannot mix the number of one window with the row groups of a different window. | Separate `index` and `&[u32]` inputs to `lane`. | #6 |
 | D-9 | Use `proptest` for the properties of the order. | The inputs (row counts, W, B, seed) have a real input space. | Fixed loops over a few cases. | #6 |
-| D-10 | Lane slices have equal document counts, not equal token counts. | Simple and exact. Token balance is a Pack problem. | Slices by token count. | #6 |
+| D-10 | Lane slices have equal document counts, not equal token counts. | Simple and exact. Token balance is a Pack problem. D-86 replaces this: lanes cut by documents went apart. | Slices by token count. | #6 |
 | D-11 | Invalid configuration causes a panic. | It is a programmer error until the Python bindings exist. D-41 changes this for `Session`. | `Result` errors now. | #6 |
 | D-12 | The cap removes the oldest leftover tokens. | The leftover is one run to the cursor, so `(doc, offset)` is the full lane state. D-78 replaces this: there is no cap. | Remove the newest tokens: documents stay whole, but the leftover gets gaps and the state becomes a list of ranges. | #8 |
 | D-13 | Each epoch ends with `ceil(C / L)` steps that empty the leftovers. | Only the cap drops tokens, and the epoch length is known before the read. D-79 replaces this: there are no flush steps. | Drop the leftover at the end of the epoch. | #8 |
@@ -1198,14 +1214,16 @@ def table(results: Sequence[World]) -> str: ...   # Markdown
 | D-70 | `Loader.bytes_read` is the count at the end of the last call. | A thread can read it during a step, as it can read `checkpoint()`. D-85 replaces this. | A live count, which needs the session lock during a step, or a new shared counter in `Session`. | #24 |
 | D-71 | No cache on each node. | When world divides W, the measured amplification is 1. Otherwise it is near 1 + (world − 1)/W, so a W of several times world keeps it small: 1.016 at W = 300 for 8 GPUs (section 6). | A cache on each node that GPUs share. | #24 |
 | D-77 | Each step takes tokens until the sequence is full: the rest of the current document, then whole documents, cut at exactly L. There is no D, no cap and no pad token. | A fixed D gives L tokens only on average, so the leftover is a random walk: it hits the cap and drops tokens, or it empties and pads. On FineWeb-Edu lengths with D = 2 and C = 2048, 19.3 % of the tokens were lost. | A fixed D with a larger cap: 1.6 % lost at C = 128k, more memory, and the walk grows with the dataset. | #26 |
-| D-78 | A lane position is `(epoch, doc, offset)`, and `fill` copies from the row group into `out`, one copy for each piece of a document. | The leftover is always the rest of one document, so a resume reads only that document. Pack time went from 1.17 to 0.53 ns for each token. | A leftover buffer, and a replay of it at a resume. | #26 |
+| D-78 | A lane position is `(epoch, window, token)`, and `fill` copies from the row group into `out`, one copy for each piece. | The index gives the slots of each slice, so a position is checked and found with no read, and a resume reads only the slice of each lane. Pack time went from 1.17 to 0.53 ns for each token. | A leftover buffer, and a replay of it at a resume. | #26 |
 | D-79 | The stream of a lane goes on into the next epoch. An epoch is S = ⌈T/(B·L)⌉ steps. | No lane waits or pads at the end of an epoch. Each GPU gets S from the index. | Flush steps with pad tokens at each epoch end. | #26 |
 | D-80 | `Lane::need` finds the missing documents of a step, and `fill` runs only when all are in memory. | The loader waits for reads before a lane changes, so `next` stays cancel safe. | A `fill` that waits for reads part way through the lanes. | #26 |
 | D-81 | The loader reads in window order across epochs, with keys `(epoch, window, position)`, and no step plan. | The step at which a lane gets to a document depends on token counts, so a plan by step is not known. Window order is the order in which the lanes use row groups. | A plan of step ranges from estimated token counts. | #26 |
 | D-82 | The budget caps the reads ahead. A step that waits for a read adds the permits for it, and a budget below one window is refused. | Lanes can be a window apart, so a fixed budget can hold the next window while a slow lane waits. The added permits stop a wait for itself. | A reserve of the budget for the current slice of each lane. | #26 |
 | D-83 | The users of a row group are `(lane, epoch, window)`, and the release is after all lanes filled. | At an epoch end, a row group can be in a window of each epoch. Users by lane only freed a row group that another lane still needed in the same step. | Users by lane. | #26 |
-| D-84 | Checkpoint version 2: one step, and `(epoch, doc, offset)` for each lane. Version 1 gives `Error::Version(1)`. | Lanes are in different epochs at an epoch end. Version 1 is from the fixed packer, so its batches cannot continue. | Convert version 1. | #26 |
+| D-84 | Checkpoint version 2: one step, and `(epoch, window, token)` for each lane. Version 1 gives `Error::Version(1)`. | Lanes are in different epochs at an epoch end. Version 1 is from the fixed packer, so its batches cannot continue. | Convert version 1. | #26 |
 | D-85 | `Loader.bytes_read` reads the shared counter of the reader, with no lock. | The benchmark must count the reads ahead while they arrive. A thread can read it during a step. | The count at the end of the last call (D-70). | #26 |
+| D-86 | Cut the lane slices by slots, the tokens and empty rows that the footer counts, and cut a row at a slice edge. | Each lane takes L tokens a step, so each needs the same share of the tokens. With slices of equal document counts, lanes went apart by 3.9 windows in one epoch and 11.8 in six on FineWeb-Edu lengths, and an epoch took 20 s, not 1.6 s. | Slices by documents (D-10), or slice edges at the nearest document, which need the rows before the slices are known. | #26 |
+| D-87 | The reader refuses a chunk whose rows do not have the slots of the index. | The slices are cut by these slots, so a lane would find too few tokens with no clear error. | Trust the footer. | #26 |
 | D-22 | The sidecar uses its own binary format and FNV-1a. | No new dependency, and the bytes are fixed by our code. | `serde` with `bincode`, or JSON. | #10 |
 | D-23 | A sidecar that does not exist or is corrupt causes a new build. | The sidecar is only a cache. | An error that the user must correct. | #10 |
 | D-24 | The index keeps the place of each token column chunk, and the reader reads no footer. | A window has row groups from approximately W files. A footer read for each row group costs approximately 1.5 times the data. | Read the footer of each file again, or keep footers in memory (9.4 GB for FineWeb-Edu). | #12 |
@@ -1232,7 +1250,7 @@ def table(results: Sequence[World]) -> str: ...   # Markdown
 | 2026-10-26 | #21 | Add the PyTorch dataset (`plitzer/torch.py`): `Dataset`, `TokenBatch` and a collective `state_dict()`. torch is the optional extra `plitzer[torch]`. CI installs the CPU build of torch. |
 | 2026-11-05 | #23 | Add the end-to-end tests that kill a training run at a random step and resume it on another number of processes (`plitzer-py/tests/e2e.py`, `e2e_stream.py`, `e2e_torch.py`). |
 | 2026-11-09 | #24 | Add `bytes_read` (`Reader`, `Session`, `Loader`) and `plitzer.bench` (section 5.13). Measure the read amplification on FineWeb-Edu lengths (section 6). Correct the bound to 1 + ⌈n/W⌉(world − 1)/n. |
-| 2026-11-11 | #26 | Lossless packing: each step fills the sequence from the rest of the current document and whole documents, and lanes go on across epochs (`src/pack/stream.rs`). Remove D, C, the pad token and `Batch.lengths`. The loader reads in window order with a budget for the reads ahead (`src/load/sequence.rs`, `prefetch.rs`, `buffer.rs`), and the replay is removed. Checkpoint version 2. `bytes_read` is live. |
+| 2026-11-11 | #26 | Lossless packing: lane slices are cut by slots (tokens and empty rows), so lanes take the same share of the tokens and stay together. Each step fills the sequence from the rest of the current piece and whole pieces, and lanes go on across epochs (`src/pack/lane.rs`, `src/pack/pieces.rs`). The reader checks the slots of each row group. Remove D, C, the pad token and `Batch.lengths`. The loader reads in window order with a budget for the reads ahead (`src/load/sequence.rs`, `prefetch.rs`, `buffer.rs`), and the replay is removed. Checkpoint version 2. `bytes_read` is live. |
 
 ## 10. Maintenance
 

@@ -38,7 +38,7 @@ async fn resume_refuses_positions_outside_the_run() {
     bad.step = 1_000_000;
     assert!(range(one[0].resume(&bad).await), "step past the epoch");
     let mut bad = good.clone();
-    bad.lanes[0].doc = 1_000_000;
+    bad.lanes[0].token = 1_000_000;
     match one[0].resume(&bad).await {
         Err(Error::Checkpoint(checkpoint::Error::Range(why))) => {
             assert!(why.starts_with("lane 0: "), "{why}")
@@ -50,21 +50,11 @@ async fn resume_refuses_positions_outside_the_run() {
         good,
         "a refused resume changes nothing"
     );
-    // An offset past its document is found at the first step, with the tokens.
-    let mut bad = good.clone();
-    bad.lanes[0].offset = 1_000_000;
-    one[0].resume(&bad).await.unwrap();
-    let mut seq = vec![0; (4 * config().seq_len) as usize];
-    let got = one[0].next(&mut seq).await;
-    assert!(
-        matches!(&got, Err(Error::Load(load::Error::State(_)))),
-        "{got:?}"
-    );
     // Also a session with no loader yet keeps its position.
     let mut fresh = sessions(&d, 1).await;
     let before = fresh[0].checkpoint();
     let mut bad = good.clone();
-    bad.lanes[0].doc = 1_000_000;
+    bad.lanes[0].token = 1_000_000;
     assert!(range(fresh[0].resume(&bad).await));
     assert_eq!(fresh[0].checkpoint(), before);
     one[0].resume(&good).await.unwrap();
@@ -83,7 +73,7 @@ async fn refused_resume_keeps_the_epoch_end() {
     let mut one = sessions(&d, 1).await;
     run(&mut one, 2).await;
     let mut bad = one[0].checkpoint();
-    bad.lanes[0].doc = 1_000_000;
+    bad.lanes[0].token = 1_000_000;
     run(&mut one, end - 2).await;
     assert!(one[0].ended());
     let before = one[0].checkpoint();

@@ -7,7 +7,6 @@ use tokio::sync::watch;
 use tokio::task::{JoinError, JoinHandle};
 
 use crate::index::Index;
-use crate::order::Doc;
 use crate::pack::{Lane, Need, Orders, Position};
 use crate::read::{self, Reader};
 
@@ -205,7 +204,7 @@ impl Loader {
         for lane in &self.lanes {
             match lane.need(&self.buffer) {
                 Need::Ready => {}
-                Need::Missing { slice, doc } => return Ok(Some(self.key(slice, doc))),
+                Need::Missing { slice, row_group } => return Ok(Some(self.key(slice, row_group))),
                 Need::Bad(why) => return Err(Error::State(why)),
                 Need::Empty(why) => return Err(Error::Empty(why)),
             }
@@ -213,12 +212,12 @@ impl Loader {
         Ok(None)
     }
 
-    fn key(&self, (epoch, window): (u64, usize), doc: Doc) -> Key {
+    fn key(&self, (epoch, window): (u64, usize), row_group: u32) -> Key {
         let e = self.orders.epoch(epoch);
         let groups = e.windows()[window].groups();
         let i = groups
-            .binary_search(&doc.row_group)
-            .expect("a lane's document is in its window");
+            .binary_search(&row_group)
+            .expect("a lane's row group is in its window");
         (epoch, window, i)
     }
 

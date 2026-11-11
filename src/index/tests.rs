@@ -11,7 +11,6 @@ use tempfile::TempDir;
 
 use super::sidecar::tests::{file, index};
 use super::*;
-use crate::order::Order;
 
 const SCHEMA: &str = "message m {
     required int32 id;
@@ -95,21 +94,8 @@ async fn build_reads_row_groups() {
     let located: Vec<_> = (0..6).map(|rg| index.locate(rg)).collect();
     assert_eq!(located, [(0, 0), (1, 0), (1, 1), (3, 0), (3, 1), (3, 2)]);
 
-    let rows = index.rows();
-    let order = Order {
-        seed: 7,
-        epoch: 0,
-        lanes: 2,
-        window: 2,
-        rows: &rows,
-    };
-    let docs: usize = order
-        .windows()
-        .iter()
-        .flat_map(|w| [order.lane(w, 0), order.lane(w, 1)])
-        .map(|l| l.len())
-        .sum();
-    assert_eq!(docs, 15);
+    let values: Vec<u32> = (0..6).map(|g| index.row_group(g).1.values).collect();
+    assert_eq!(index.slots(), values);
 }
 
 #[test]

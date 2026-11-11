@@ -203,25 +203,27 @@ def test_resume_refuses_a_hand_made_checkpoint(make: MakeLoader) -> None:
     for _ in range(3):
         next(loader)
     good = loader.checkpoint()
-    # The last lane is 20 bytes (epoch u64, doc u64, offset u32) before the
-    # 8-byte checksum.
+    # The last lane is 20 bytes (epoch u64, window u32, token u64) before
+    # the 8-byte checksum.
     at = len(good) - 8 - 20
 
-    def with_lane(doc: int, offset: int) -> bytes:
+    def with_lane(epoch: int, window: int, token: int) -> bytes:
         body = bytearray(good[:-8])
-        body[at + 8 : at + 20] = doc.to_bytes(8, "little") + offset.to_bytes(
-            4, "little"
+        body[at : at + 20] = (
+            epoch.to_bytes(8, "little")
+            + window.to_bytes(4, "little")
+            + token.to_bytes(8, "little")
         )
         return bytes(body) + fnv1a(bytes(body)).to_bytes(8, "little")
 
-    with pytest.raises(plitzer.CheckpointError, match="past its"):
-        loader.resume(with_lane(10**6, 0))
-    assert loader.checkpoint() == good, "a refused resume changes nothing"
-    # An offset past its document is found at the next step, with its tokens.
-    doc = int.from_bytes(good[at + 8 : at + 16], "little")
-    loader.resume(with_lane(doc, 10**6))
-    with pytest.raises(plitzer.CheckpointError, match="past its document"):
-        next(loader)
+    epoch = int.from_bytes(good[at : at + 8], "little")
+    with pytest.raises(plitzer.CheckpointError, match="past the lane's slots"):
+        loader.resume(with_lane(epoch, 0, 10**6))
+    with pytest.raises(plitzer.CheckpointError, match="past the lane's slots"):
+        loader.resume(with_lane(epoch, 10**6, 0))
+    # Any epoch is a place in the stream, and none gives a panic.
+    loader.resume(with_lane(2**64 - 1, 0, 0))
+    assert loader.checkpoint() != good
     loader.resume(good)
     assert loader.checkpoint() == good
 

@@ -107,8 +107,8 @@ impl Checkpoint {
         out.extend(len(self.lanes.len()).to_le_bytes());
         for p in &self.lanes {
             out.extend(p.epoch.to_le_bytes());
-            out.extend(p.doc.to_le_bytes());
-            out.extend(p.offset.to_le_bytes());
+            out.extend(p.window.to_le_bytes());
+            out.extend(p.token.to_le_bytes());
         }
         out.extend(fnv1a(&out).to_le_bytes());
         out
@@ -237,8 +237,12 @@ fn fields(r: &mut Reader) -> Option<Checkpoint> {
     // The count comes from the bytes, so nothing is preallocated from it.
     let mut lanes = Vec::new();
     for _ in 0..r.u32()? {
-        let (epoch, doc, offset) = (r.u64()?, r.u64()?, r.u32()?);
-        lanes.push(Position { epoch, doc, offset });
+        let (epoch, window, token) = (r.u64()?, r.u32()?, r.u64()?);
+        lanes.push(Position {
+            epoch,
+            window,
+            token,
+        });
     }
     Some(Checkpoint {
         config,

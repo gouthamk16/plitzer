@@ -92,15 +92,14 @@ impl Session {
             .await
             .map_err(Error::Index)?;
         let reader = Reader::new(store, prefix, &index).map_err(Error::Read)?;
-        let tokens: u64 = (0..index.rows().len() as u32)
-            .map(|g| u64::from(index.row_group(g).1.values))
-            .sum();
+        let slots = index.slots();
+        let tokens: u64 = slots.iter().map(|&v| u64::from(v)).sum();
         if tokens == 0 {
             return Err(Error::Empty);
         }
         let per_step = u64::from(config.lanes) * u64::from(config.seq_len);
         let c = &config;
-        let orders = Orders::new(c.seed, c.lanes, c.window, c.seq_len, &index.rows());
+        let orders = Orders::new(c.seed, c.lanes, c.window, c.seq_len, &slots);
         let lanes = gpu_lanes(config.lanes, world, rank);
         Ok(Session {
             fingerprint: index.fingerprint(),
@@ -133,8 +132,7 @@ impl Session {
         } else if epoch > self.epoch {
             let start = Position {
                 epoch,
-                doc: 0,
-                offset: 0,
+                ..Position::default()
             };
             (self.epoch, self.step) = (epoch, 0);
             self.start = vec![start; self.lanes.len()];

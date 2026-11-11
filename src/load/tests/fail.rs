@@ -35,16 +35,14 @@ async fn failed_read_stops_the_loader() {
     assert!(matches!(loader.next(&mut out).await, Err(Error::Stopped)));
 }
 
-// A position past its document is found at the first step, with the tokens.
+// A position past the lane's slots is refused when the loader is made.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_bad_position_is_an_error() {
     let d = data(17).await;
     let mut at = vec![Position::default(); LANES as usize];
-    at[1].offset = 100_000;
+    at[1].token = 100_000;
     let (o, r, i) = (d.orders.clone(), d.reader.clone(), d.index.clone());
-    let mut loader = Loader::new(o, r, i, 0..LANES, &at, PLENTY).unwrap();
-    let mut out = vec![0; (LANES * SEQ_LEN) as usize];
-    let got = loader.next(&mut out).await;
+    let got = Loader::new(o, r, i, 0..LANES, &at, PLENTY).map(|_| ());
     assert!(
         matches!(&got, Err(Error::State(why)) if why.contains("lane 1")),
         "{got:?}"

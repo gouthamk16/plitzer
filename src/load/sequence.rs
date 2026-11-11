@@ -55,7 +55,7 @@ impl Sequence {
     /// From window `start.1` of epoch `start.0`. The dataset must have row
     /// groups, or the order would have no windows to give.
     pub fn new(orders: &Arc<Orders>, lanes: Range<u32>, start: (u64, usize)) -> Self {
-        assert!(!orders.rows().is_empty(), "the dataset has row groups");
+        assert!(orders.row_groups() > 0, "the dataset has row groups");
         Sequence {
             orders: orders.clone(),
             lanes,
@@ -66,7 +66,7 @@ impl Sequence {
 
     pub fn next_window(&mut self) -> WindowGroups {
         if self.window >= self.epoch.windows().len() {
-            self.epoch = self.orders.epoch(self.epoch.number + 1);
+            self.epoch = self.orders.epoch(self.epoch.number.saturating_add(1));
             self.window = 0;
         }
         let w = &self.epoch.windows()[self.window];
