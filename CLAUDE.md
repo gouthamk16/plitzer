@@ -74,7 +74,7 @@ These are enforced with tests: golden outputs pinned in CI on all 3 OSes, and `p
 
 ### Known hard problem
 
-Read amplification. If a shuffled batch is split across GPUs naively, every GPU downloads almost every row group in the window, about `world`× the data. Lane slices fix this. A GPU's lanes cover one contiguous stretch of storage, so it reads that stretch and roughly one shared row group at each edge. The cost is at most 1 + ⌈n/W⌉(world − 1)/n in row groups (about 1 + (world − 1)/W). Measured on FineWeb-Edu lengths (`plitzer.bench`, design §6), it is exactly 1 when world divides W, because every row group holds 1000 rows, and world/W when world > W. So there is no per-node cache. Treat any change to slicing as a trade-off between shuffle quality and I/O.
+Read amplification. If a shuffled batch is split across GPUs naively, every GPU downloads almost every row group in the window, about `world`× the data. Lane slices fix this. A GPU's lanes cover one contiguous stretch of storage, so it reads that stretch and roughly one shared row group at each edge. The cost is at most 1 + ⌈n/W⌉(world − 1)/n in row groups (about 1 + (world − 1)/W). Measured on FineWeb-Edu lengths (`plitzer.bench`, design §6), it sits at that bound: slices are cut by tokens, so each GPU edge falls inside a row group (1.013 at W = 512 on 8 GPUs, 1.122 on 64), and about world/W when world > W. So there is no per-node cache; pick W many times the GPU count. Treat any change to slicing as a trade-off between shuffle quality and I/O.
 
 ## Code standards
 

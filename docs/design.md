@@ -1113,27 +1113,27 @@ def table(results: Sequence[World]) -> str: ...   # Markdown
 **Measurement:** `plitzer.bench` (section 5.13) measured one epoch:
 - The dataset has 512 row groups (the first 64 of FineWeb-Edu `sample/10BT` files 000 to 007). It has 512 000 documents and 1104 MiB of token chunks.
 - The documents have the real lengths, with random tokens (D-69).
-- The settings are B = 512, L = 2048, D = 2 and C = 2048.
+- The settings are B = 512 and L = 2048. The lane slices are cut by slots (section 5.3).
+- `measure` counts epoch 1 of each rank.
 - Each cell is the measured amplification, with the bound in parentheses:
 
 | W | windows | world 8 | world 64 | world 256 |
 |---|---|---|---|---|
-| 16 | 32 | 1.000 (1.438) | 4.000 (4.938) | 16.000 (16.938) |
-| 64 | 8 | 1.000 (1.109) | 1.000 (1.984) | 4.000 (4.984) |
-| 100 | 6 | 1.047 (1.082) | 1.708 (1.738) | 3.969 (3.988) |
-| 256 | 2 | 1.000 (1.027) | 1.000 (1.246) | 1.000 (1.996) |
-| 300 | 2 | 1.016 (1.027) | 1.236 (1.246) | 1.984 (1.996) |
-| 512 | 1 | 1.000 (1.014) | 1.000 (1.123) | 1.000 (1.498) |
+| 16 | 32 | 1.442 (1.438) | 4.955 (4.938) | 17.001 (16.938) |
+| 64 | 8 | 1.111 (1.109) | 1.994 (1.984) | 5.008 (4.984) |
+| 100 | 6 | 1.083 (1.082) | 1.748 (1.738) | 4.025 (3.988) |
+| 256 | 2 | 1.027 (1.027) | 1.248 (1.246) | 2.003 (1.996) |
+| 300 | 2 | 1.028 (1.027) | 1.247 (1.246) | 2.001 (1.996) |
+| 512 | 1 | 1.013 (1.014) | 1.122 (1.123) | 1.502 (1.498) |
 
 **Results:**
 
-- Each measurement is at or below the bound.
-- Each FineWeb-Edu row group has 1000 rows. When world divides W, each GPU's stretch starts and ends at a row-group edge, and no GPU reads a row group of another GPU. The amplification is then exactly 1.
-- When world is larger than W, some GPUs have less than one row group. The amplification is then world/W.
-- When world does not divide W, the amplification is near the bound: 1.016 for 8 GPUs and 1.236 for 64 GPUs at W = 300.
+- Each measurement is at the bound, in row groups. Some are a little above it in bytes, by 1.3 % or less: an edge row group can be larger than the mean, and a row group in the last window of an epoch and the first window of the next is read two times.
+- The slices are cut by tokens, so the edge of a GPU is in a row group, also when world divides W. Thus two neighbour GPUs share one row group in each window. With the slices of equal document counts (#24), each FineWeb-Edu row group had 1000 rows, so the edges were on row groups when world divided W, and the amplification was exactly 1. That cut made the lanes go apart (D-86).
+- When world is larger than W, some GPUs have less than one row group. The amplification is then near world/W.
 - This dataset has few windows, so its short last window adds to the bound. With the 10 164 row groups of all of `sample/10BT`, the bound is nearer 1 + (world − 1)/W.
 
-**Decision:** Plitzer does not add a cache on each node (D-71). Set W to a multiple of the largest GPU count that you plan to use. For example, W = 512 is a multiple of each power of 2 up to 512. A checkpoint holds W, so a resume on a different GPU count keeps it.
+**Decision:** Plitzer does not add a cache on each node (D-71). Set W to many times the largest GPU count that you plan to use: the cost is approximately (world − 1)/W. For example, W = 512 costs 1.4 % on 8 GPUs and 12 % on 64 GPUs. A checkpoint holds W, so a resume on a different GPU count keeps it.
 
 **Trade-off:** A larger W gives a better mix of documents but uses more memory. A change to the slices changes both the shuffle quality and the I/O. Examine both before you change the slices.
 
@@ -1212,7 +1212,7 @@ def table(results: Sequence[World]) -> str: ...   # Markdown
 | D-68 | `state_dict()` is the position of the next batch that the dataset gives. | A count of fetched batches that the loop did not train is wrong for some loops: at the end of an epoch, for a loop with a step limit, and after a crash during the last batch. | An `ahead` count with heuristics for these cases. | #21 |
 | D-69 | Measure the read amplification on FineWeb-Edu lengths, with random tokens. | The amplification depends only on the row counts and chunk bytes. `token_count` gives the real lengths from a few MB of each file. | Tokenize the text: 10B tokens, which is too much for a benchmark run. | #24 |
 | D-70 | `Loader.bytes_read` is the count at the end of the last call. | A thread can read it during a step, as it can read `checkpoint()`. D-85 replaces this. | A live count, which needs the session lock during a step, or a new shared counter in `Session`. | #24 |
-| D-71 | No cache on each node. | When world divides W, the measured amplification is 1. Otherwise it is near 1 + (world − 1)/W, so a W of several times world keeps it small: 1.016 at W = 300 for 8 GPUs (section 6). | A cache on each node that GPUs share. | #24 |
+| D-71 | No cache on each node. | When world divides W, the measured amplification is 1. Otherwise it is near 1 + (world − 1)/W, so a W of several times world keeps it small: 1.016 at W = 300 for 8 GPUs (section 6). With slices cut by slots (D-86), it is near 1 + (world − 1)/W also when world divides W: 1.013 at W = 512 for 8 GPUs. | A cache on each node that GPUs share. | #24 |
 | D-77 | Each step takes tokens until the sequence is full: the rest of the current document, then whole documents, cut at exactly L. There is no D, no cap and no pad token. | A fixed D gives L tokens only on average, so the leftover is a random walk: it hits the cap and drops tokens, or it empties and pads. On FineWeb-Edu lengths with D = 2 and C = 2048, 19.3 % of the tokens were lost. | A fixed D with a larger cap: 1.6 % lost at C = 128k, more memory, and the walk grows with the dataset. | #26 |
 | D-78 | A lane position is `(epoch, window, token)`, and `fill` copies from the row group into `out`, one copy for each piece. | The index gives the slots of each slice, so a position is checked and found with no read, and a resume reads only the slice of each lane. Pack time went from 1.17 to 0.53 ns for each token. | A leftover buffer, and a replay of it at a resume. | #26 |
 | D-79 | The stream of a lane goes on into the next epoch. An epoch is S = ⌈T/(B·L)⌉ steps. | No lane waits or pads at the end of an epoch. Each GPU gets S from the index. | Flush steps with pad tokens at each epoch end. | #26 |
