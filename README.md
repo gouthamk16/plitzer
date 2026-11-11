@@ -109,6 +109,21 @@ python -m plitzer.bench.baseline DATA --loaders plitzer,mosaic,hf,hf-stream --ba
 - CPU per token and the time to the first batch after a resume are still behind Hugging Face `datasets`' memory-mapped Arrow copy; both are the next work on speed.
 - Input is pre-tokenized text only; tokenization, images and dataset mixing are out of scope for 0.1.
 
+## Contributing
+
+Contributions are welcome: bug reports, benchmarks on your own data, and pull requests.
+
+- **Issues:** report a bug with the plitzer version, the OS, a minimal Parquet file or the code that makes one, and the full error. For a wrong order or a wrong resume, give the seed and the settings.
+- **Branches:** one branch per change, from `main`, named `feat/<name>` or `fix/<name>`. Every change lands through a pull request with green CI; nobody commits to `main` directly.
+- **CI must pass on all three OSes.** The order must be bit-identical on Linux, macOS and Windows, so CI runs fmt, clippy (`-D warnings`), ruff, `mypy --strict`, and the Rust and Python tests on each OS, plus the S3 and baseline jobs. Run the same checks locally first (see Development; [CLAUDE.md](https://github.com/gouthamk16/plitzer/blob/main/CLAUDE.md) lists them all).
+- **Do not break the invariants.** Every shuffle goes through `shuffle::shuffle` with `rand_chacha`, never `StdRng` or `rand`'s range sampling. Each epoch gives every token once, a resume reproduces the tail of an uninterrupted run, and the golden outputs match on every OS. A change to the order or the packer keeps the golden and property tests passing; an intended change to a golden value says why in the PR.
+- **Tests come with the change.** A bug fix adds the test that fails without it. Prefer a property test where the input space is real.
+- **Docs come with the change.** A PR that changes a feature, a design or an interface updates [docs/design.md](https://github.com/gouthamk16/plitzer/blob/main/docs/design.md) in the same PR (status table, component section, decision log, change log), written in ASD-STE100; section 10 of that document gives the rules. Tick the TODO item below in the PR that completes it, and add user-facing changes to [CHANGELOG.md](https://github.com/gouthamk16/plitzer/blob/main/CHANGELOG.md).
+- **Code style:** the simplest correct code; files under about 300 lines and functions under about 30; typed structs across module and Rust↔Python boundaries (no `Any` in Python); comments only for what the code cannot say.
+- **Licence:** a contribution is licensed under MIT OR Apache-2.0, as the project is, unless you say otherwise.
+
+`main` is protected by the ruleset in [.github/rulesets/main.json](https://github.com/gouthamk16/plitzer/blob/main/.github/rulesets/main.json): pull requests only, with CI green and up to date with `main`, review threads resolved, merge commits, and no force-push or deletion.
+
 ## Development
 
 ```sh

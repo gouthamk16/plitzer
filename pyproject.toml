@@ -5,7 +5,7 @@ build-backend = "maturin"
 [project]
 name = "plitzer"
 description = "Deterministic, resumable dataloader for Parquet on local disk and S3"
-readme = "README.md"
+readme = "DESCRIPTION.md"  # the PyPI page; README.md is the repository front page
 requires-python = ">=3.11"
 license = "MIT OR Apache-2.0"
 license-files = ["LICENSE-MIT", "LICENSE-APACHE"]
