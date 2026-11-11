@@ -543,30 +543,32 @@ pub enum Error { Schema(..), Fetch { path, source }, Decode { path, row_group, s
 1. Get the chunk record of the row group from the index: `start`, `len`, `codec` and `rows`.
 2. Fetch the bytes `start..start + len`. Cut a chunk larger than 16 MiB into pieces of 16 MiB or less.
 3. Fetch the pieces at the same time.
-4. Make a `ParquetMetaData` with one row group and one column from the record and the schema in the index.
-5. Decode the chunk with `ParquetPushDecoder` into one list array.
-6. Make `RowGroupTokens` from the list offsets and the values.
+4. Make the metadata of the column chunk from the record and the schema in the index, with the chunk at offset 0 of the fetched bytes.
+5. Decode the chunk with the column reader of `parquet` (`ColumnReaderImpl`). The values, the definition levels and the repetition levels go into buffers that have the size of the slots of the record.
+6. Make the row offsets from the levels. A repetition level of 0 starts a row. A definition level at its maximum is a token.
+7. Make `RowGroupTokens` from the offsets and the values.
 
 The page reader of `parquet` uses only the codec and the byte range of the chunk from the metadata. It reads all other data from the page headers in the chunk. Thus the metadata that step 4 makes is sufficient.
 
 After step 3, `read` adds the length of the fetched chunk to an atomic counter. `bytes_read` gives the counter. A chunk that the reader fetches but cannot decode counts, because storage sent its bytes. A failed fetch does not count.
 
-`RowGroupTokens` keeps `Int32` and `UInt32` values with no copy. It copies other integer types into `u32`. A null row is empty.
+`RowGroupTokens` keeps the values of an INT32 column (`int32`, `uint32` and the smaller integer types) with no copy. It copies INT64 values into `u32`. A null row and an empty list are empty rows.
 
 **Rationale:**
 
 - A window has row groups from approximately W different files. A new read of a 3.1 MiB footer for each 2 MB row group costs approximately 1.5 times the data. The index records each chunk, so the reader reads no footer (D-24).
-- `ParquetPushDecoder` does no I/O of its own. The reader controls each request and knows its size before the fetch, which the prefetch budget needs (D-25).
+- The decoder does no I/O of its own. The reader controls each request and knows its size before the fetch, which the prefetch budget needs (D-25).
+- The column reader makes no Arrow list: no validity bitmap, no record batch and no buffer that grows. The index gives the slots, so each buffer has its full size before the decode. On the data of section 6, this took the decode from 8.4–8.9 to 3.7 ns for each token, and the loader from 13.2 to 9.6–10.1 ns (D-94).
 - The input of v1 is a column of token lists. Tokenization in the loader is a later item (D-26).
 - `object_store` does not cut a large range, and AWS advises requests of 8 to 16 MB at the same time. Each piece is a separate `get_ranges` call, so that `object_store` does not merge the pieces again (D-27).
 - A negative token, a null token or a token larger than `u32::MAX` gives `Error::BadToken`. A null token would otherwise become token 0.
-- A chunk that decodes to a different number of rows than its footer gives `Error::Decode`.
+- A chunk that decodes to a different number of rows than its footer gives `Error::Decode`. A level count that is not the slots of the record gives `Error::Slots`.
 - A chunk whose rows do not have the slots of its footer gives `Error::Slots`. The order cuts the slices by these slots, so a lane would otherwise find too few tokens.
 
 **Limits:**
 
 - The reader reads one row group at a time. The loader reads many row groups at the same time (section 5.7).
-- A list column has 32-bit offsets after the decode, also for a `large_list` column. One row group never has 2³¹ tokens.
+- The levels take 4 bytes for each slot while a chunk decodes, and the reader frees them after the decode.
 - A column of more than one list level, or a column that is not a list of plain integers, gives an index error.
 
 **Verification:**
@@ -583,6 +585,7 @@ After step 3, `read` adds the length of the fetched chunk to an atomic counter. 
 | `bad_tokens_are_errors` | Unit | A negative token and a null token each give `Error::BadToken`. |
 | `row_count_must_match_the_footer` | Unit | An index with 5 rows for a chunk of 3 rows gives `Error::Decode`. |
 | `slots_must_match_the_index` | Unit | `RowGroupTokens::slots` is the value count of the index, and an index with one more gives `Error::Slots`. |
+| `reads_what_was_written` | Property | Random `list<int32>` and `list<uint32>` columns, with null and empty rows, a dictionary or not, and data pages of 1 to 63 rows, read back as written. A wrong row start or a null token read as a token fails it. |
 | `fetch_splits_large_ranges`, `pieces_cover_range` | Unit | The pieces cover the range with no gap and no overlap, and each piece is 16 MiB or less. |
 | `index_and_read_over_s3` | Integration | The index, the sidecar and the reader work against versitygw in the `s3` CI job. |
 
@@ -1385,10 +1388,11 @@ git tag v0.1.0 && git push --tags   # a release: the tag must be the Cargo versi
 | D-89 | The baseline counts lost tokens, and gives no documents per second for plitzer. | plitzer gives sequences, and the other loaders give documents. Tokens are the unit that all of them give. | A plitzer that gives documents: it would not measure the packer. | #27 |
 | D-90 | `pyproject.toml` is at the root of the repository, and points maturin to `plitzer-py/Cargo.toml`. | The README and the licence files are at the root, and PEP 639 refuses a licence path with `..`. `pip install` of the repository needs a `pyproject.toml` at its root. | Copies of the README and the licences in `plitzer-py/`. | #28 |
 | D-91 | Publish from a `v*` tag with PyPI trusted publishing, after each wheel passes its tests on its own system. | No token is in the repository. A wheel that does not import fails before PyPI gets it. | A PyPI token as a secret, and a publish with no test of the wheels. | #28 |
+| D-94 | Decode the token chunk with the column reader of `parquet`, into buffers of the size of its slots, and make the offsets from the levels. | The Arrow list reader builds validity bitmaps, a record batch and buffers that grow. It took 8.4–8.9 ns for each token; the column reader takes 3.7. | `ParquetPushDecoder` to an Arrow list (D-25), or a decoder of our own for the pages. | #30 |
 | D-22 | The sidecar uses its own binary format and FNV-1a. | No new dependency, and the bytes are fixed by our code. | `serde` with `bincode`, or JSON. | #10 |
 | D-23 | A sidecar that does not exist or is corrupt causes a new build. | The sidecar is only a cache. | An error that the user must correct. | #10 |
 | D-24 | The index keeps the place of each token column chunk, and the reader reads no footer. | A window has row groups from approximately W files. A footer read for each row group costs approximately 1.5 times the data. | Read the footer of each file again, or keep footers in memory (9.4 GB for FineWeb-Edu). | #12 |
-| D-25 | Decode with `ParquetPushDecoder` and metadata that the reader makes. | No I/O in the decoder, so the reader knows each request and its size. | `ParquetRecordBatchStreamBuilder` with an `AsyncFileReader`: it needs the footer metadata. | #12 |
+| D-25 | Decode with `ParquetPushDecoder` and metadata that the reader makes. | No I/O in the decoder, so the reader knows each request and its size. D-94 replaces the push decoder with the column reader. | `ParquetRecordBatchStreamBuilder` with an `AsyncFileReader`: it needs the footer metadata. | #12 |
 | D-26 | The input of v1 is a column of token lists. | The simplest correct input. The reader takes `Int32` and `UInt32` with no copy. | Text with tokenization in the loader: a large dependency and more CPU load. It is a later item. | #12 |
 | D-27 | Fetch a chunk in separate pieces of 16 MiB or less. | `object_store` does not cut a large range, and its default timeout is 30 s. AWS advises 8 to 16 MB requests at the same time. | One request for each chunk. | #12 |
 | D-28 | Test S3 against versitygw in a Linux CI job. | MinIO stopped its images in October 2025. versitygw is Apache-2.0, active, and checks request signatures. | MinIO, LocalStack (needs a token since 2026), moto (no signature check). | #12 |
