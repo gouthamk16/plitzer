@@ -35,9 +35,6 @@ class Settings(TypedDict):
     lanes: int
     window: int
     seq_len: int
-    docs: int
-    cap: int
-    pad: int
     budget: int
 
 
@@ -52,9 +49,6 @@ class Overrides(Extras, total=False):
     lanes: int
     window: int
     seq_len: int
-    docs: int
-    cap: int
-    pad: int
     budget: int
 
 
@@ -63,9 +57,6 @@ SETTINGS: Settings = {
     "lanes": 4,
     "window": 3,
     "seq_len": 8,
-    "docs": 2,
-    "cap": 10,
-    "pad": 2**32 - 1,
     "budget": 1 << 30,
 }
 

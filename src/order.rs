@@ -3,15 +3,14 @@ use std::ops::Range;
 use crate::seed::{Purpose, key};
 use crate::shuffle::shuffle;
 
-/// One document: row `row` of row group `row_group`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Doc {
-    pub row_group: u32,
-    pub row: u32,
-}
-
 /// One epoch's order over a dataset. Everything is recomputed from these
 /// fields, so a checkpoint never stores the order itself.
+///
+/// The order works in slots: each row group has `slots[g]` of them, one per
+/// token and one per row with no tokens, which is the leaf value count
+/// that Parquet records in the footer. Slices are cut by slots, so each
+/// lane gets the same share of every window's tokens, and lanes that each
+/// take L tokens a step stay together.
 pub struct Order<'a> {
     pub seed: u64,
     pub epoch: u64,
@@ -19,18 +18,18 @@ pub struct Order<'a> {
     pub lanes: u32,
     /// W: row groups per window.
     pub window: u32,
-    /// Row count of each row group. A row group's id is its index.
-    pub rows: &'a [u32],
+    /// The slots of each row group. A row group's id is its index.
+    pub slots: &'a [u32],
 }
 
 /// One window of an epoch. Only `Order::windows` builds one, so a window's
 /// number always matches its row groups and no two windows share a lane key.
-/// It caches its document count, so use it only with the `Order` that built it.
+/// It caches its slot count, so use it only with the `Order` that built it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Window {
     index: u64,
     groups: Vec<u32>,
-    docs: u64,
+    slots: u64,
 }
 
 impl Window {
@@ -38,6 +37,14 @@ impl Window {
     pub fn groups(&self) -> &[u32] {
         &self.groups
     }
+}
+
+/// The part of one row group in a lane's slice: slots `slots` of row group
+/// `row_group`, counted from the row group's first slot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Part {
+    pub row_group: u32,
+    pub slots: Range<u64>,
 }
 
 impl Order<'_> {
@@ -49,20 +56,17 @@ impl Order<'_> {
     /// its own share instead of the whole window.
     pub fn windows(&self) -> Vec<Window> {
         assert!(self.window > 0, "window must be positive");
-        let n = u32::try_from(self.rows.len()).expect("more than u32::MAX row groups");
+        let n = u32::try_from(self.slots.len()).expect("more than u32::MAX row groups");
         let mut ids: Vec<u32> = (0..n).collect();
         shuffle(&mut ids, key(self.seed, self.epoch, Purpose::RowGroups));
         let window = |(i, chunk): (usize, &[u32])| {
             let mut groups = chunk.to_vec();
             groups.sort_unstable();
-            let docs = groups
-                .iter()
-                .map(|&g| u64::from(self.rows[g as usize]))
-                .sum();
+            let slots = groups.iter().map(|&g| self.size(g)).sum();
             Window {
                 index: i as u64,
                 groups,
-                docs,
+                slots,
             }
         };
         ids.chunks(self.window as usize)
@@ -71,21 +75,42 @@ impl Order<'_> {
             .collect()
     }
 
-    /// Lane `lane`'s documents in `window`, in reading order.
+    /// The row groups of lane `lane`'s slice of `window`, in storage order,
+    /// with the slots of each that the slice holds.
     ///
-    /// Lane `l` owns rows `[l·N/B, (l+1)·N/B)` of the window, so lane sizes
-    /// differ by at most one and lanes are empty when N < B.
-    pub fn lane(&self, window: &Window, lane: u32) -> Vec<Doc> {
-        let mut docs = slice(&window.groups, self.rows, self.bounds(window, lane));
+    /// Lane `l` owns slots `[l·N/B, (l+1)·N/B)` of the window's N, so lane
+    /// sizes differ by at most one slot, and lanes are empty when N < B. A
+    /// row that crosses an edge gives its first tokens to one lane and the
+    /// rest to the next.
+    pub fn lane(&self, window: &Window, lane: u32) -> Vec<Part> {
+        let r = self.bounds(window, lane);
+        let mut parts = Vec::new();
+        let mut start = 0;
+        for &g in &window.groups {
+            let end = start + self.size(g);
+            let (from, to) = (r.start.max(start), r.end.min(end));
+            if from < to {
+                let slots = from - start..to - start;
+                parts.push(Part {
+                    row_group: g,
+                    slots,
+                });
+            }
+            start = end;
+        }
+        parts
+    }
+
+    /// Puts lane `lane`'s pieces of `window` into its reading order.
+    pub fn shuffle_lane<T>(&self, window: &Window, lane: u32, pieces: &mut [T]) {
         let purpose = Purpose::Lane {
             window: window.index,
             lane,
         };
-        shuffle(&mut docs, key(self.seed, self.epoch, purpose));
-        docs
+        shuffle(pieces, key(self.seed, self.epoch, purpose));
     }
 
-    /// The number of documents `lane` gets from `window`, without the shuffle.
+    /// The number of slots `lane` gets from `window`.
     pub fn lane_len(&self, window: &Window, lane: u32) -> u64 {
         let r = self.bounds(window, lane);
         r.end - r.start
@@ -94,12 +119,12 @@ impl Order<'_> {
     /// For each lane in `lanes`, the positions in `window.groups()` of the row
     /// groups its slice touches. Empty for an empty slice.
     pub fn lane_groups(&self, window: &Window, lanes: Range<u32>) -> Vec<Range<usize>> {
-        // ends[i]: the window's documents up to the end of its i-th row group.
+        // ends[i]: the window's slots up to the end of its i-th row group.
         let ends: Vec<u64> = window
             .groups
             .iter()
             .scan(0, |end, &g| {
-                *end += u64::from(self.rows[g as usize]);
+                *end += self.size(g);
                 Some(*end)
             })
             .collect();
@@ -116,6 +141,10 @@ impl Order<'_> {
         lanes.map(groups).collect()
     }
 
+    fn size(&self, g: u32) -> u64 {
+        u64::from(self.slots[g as usize])
+    }
+
     fn bounds(&self, window: &Window, lane: u32) -> Range<u64> {
         assert!(
             lane < self.lanes,
@@ -124,24 +153,9 @@ impl Order<'_> {
         );
         // `l · N` can exceed u64; the quotient never does.
         let bound =
-            |l: u32| (u128::from(l) * u128::from(window.docs) / u128::from(self.lanes)) as u64;
+            |l: u32| (u128::from(l) * u128::from(window.slots) / u128::from(self.lanes)) as u64;
         bound(lane)..bound(lane + 1)
     }
-}
-
-/// The documents at positions `range` of the window's rows laid end to end.
-fn slice(window: &[u32], rows: &[u32], range: Range<u64>) -> Vec<Doc> {
-    let mut docs = Vec::with_capacity((range.end - range.start) as usize);
-    let mut start = 0;
-    for &g in window {
-        let end = start + u64::from(rows[g as usize]);
-        for pos in range.start.max(start)..range.end.min(end) {
-            let row = (pos - start) as u32;
-            docs.push(Doc { row_group: g, row });
-        }
-        start = end;
-    }
-    docs
 }
 
 /// The lanes GPU `rank` of `world` owns. Lanes depend only on B, so changing

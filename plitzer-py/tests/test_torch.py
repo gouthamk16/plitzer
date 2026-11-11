@@ -25,9 +25,6 @@ def settings(tmp_path: Path) -> pt.LoaderSettings:
         lanes=s["lanes"],
         window=s["window"],
         seq_len=s["seq_len"],
-        docs=s["docs"],
-        cap=s["cap"],
-        pad=s["pad"],
         budget=s["budget"],
         cache=str(tmp_path / "index"),
     )
@@ -56,9 +53,8 @@ def test_matches_the_loader(dataset: Path, tmp_path: Path) -> None:
         got = list(ds)
         assert same(tokens(got), epoch)
         b = got[0]
-        assert b.tokens.dtype == torch.int32 and b.lengths.dtype == torch.int32
+        assert b.tokens.dtype == torch.int32
         assert b.tokens.shape == (SETTINGS["lanes"], SETTINGS["seq_len"])
-        assert b.lengths.shape == (SETTINGS["lanes"],)
     assert ds.epoch == 2
 
 

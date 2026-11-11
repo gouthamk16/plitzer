@@ -26,7 +26,7 @@ async fn next_is_cancel_safe() {
         .await
         .unwrap();
     // Poll each call once; if it is not ready, drop it and do the step again.
-    let mut seq = vec![0; (4 * config().packing.seq_len) as usize];
+    let mut seq = vec![0; (4 * config().seq_len) as usize];
     let mut got = Vec::new();
     let mut cancelled = 0;
     while got.len() < want.len() {
@@ -37,51 +37,44 @@ async fn next_is_cancel_safe() {
                 one.next(&mut seq).await
             }
         };
-        got.push(real.unwrap().map(|_| seq.clone()));
+        got.push(real.unwrap().then(|| seq.clone()));
     }
     assert!(cancelled > 0, "no call was cancelled");
     assert_eq!(got, want);
 }
 
-// A `resume` dropped while it reads leaves the session where it was: its
-// checkpoint and its next batches are those of a run with no resume.
+// After a resume, the first step reads; dropping it at its first poll loses
+// nothing, and the run goes on as one with no stop.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn resume_is_cancel_safe() {
+async fn first_step_after_a_resume_is_cancel_safe() {
     let d = data();
     let want = reference(&d).await;
     let throttle = ThrottleConfig {
         wait_get_per_call: Duration::from_millis(20),
         ..ThrottleConfig::default()
     };
+    let mut two = open(&d, config(), 0, 1).await.unwrap();
+    let mut seq = vec![0; (4 * config().seq_len) as usize];
+    let mut got = Vec::new();
+    for _ in 0..5 {
+        two.next(&mut seq).await.unwrap();
+        got.push(Some(seq.clone()));
+    }
+    let saved = two.checkpoint();
     let local = LocalFileSystem::new_with_prefix(d.files.path()).unwrap();
     let store = Arc::new(ThrottledStore::new(local, throttle));
     let cache = d.cache.path().join("index");
     let mut one = Session::open(store, Path::from(""), &cache, config(), 0, 1, PLENTY)
         .await
         .unwrap();
-    let mut seq = vec![0; (4 * config().packing.seq_len) as usize];
-    let mut got = Vec::new();
-    for _ in 0..3 {
-        got.push(one.next(&mut seq).await.unwrap().map(|_| seq.clone()));
-    }
-    let before = one.checkpoint();
-    // A state with leftovers, so the resume reads row groups to replay them.
-    let mut two = open(&d, config(), 0, 1).await.unwrap();
-    for _ in 0..5 {
-        two.next(&mut seq).await.unwrap();
-    }
-    let leftovers = two.checkpoint();
-    // And one with none, where the resume reads only the first step.
-    let mut start = before.clone();
-    start.epoch = 1;
-    start.lanes.fill(LaneState::default());
-    for elsewhere in [leftovers, start] {
-        // Its reads take 20 ms, so one poll never finishes the resume.
-        assert!(one.resume(&elsewhere).now_or_never().is_none());
-        assert_eq!(one.checkpoint(), before);
-    }
+    one.resume(&saved).await.unwrap();
+    assert!(
+        one.next(&mut seq).now_or_never().is_none(),
+        "its reads take 20 ms"
+    );
+    assert_eq!(one.checkpoint(), saved);
     while got.len() < want.len() {
-        got.push(one.next(&mut seq).await.unwrap().map(|_| seq.clone()));
+        got.push(one.next(&mut seq).await.unwrap().then(|| seq.clone()));
     }
     assert_eq!(got, want);
 }

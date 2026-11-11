@@ -29,6 +29,20 @@ impl RowGroupTokens {
         self.offsets.len().saturating_sub(1)
     }
 
+    /// One slot for each token, and one for each row with none: the leaf
+    /// value count of the column chunk.
+    pub fn slots(&self) -> u64 {
+        let rows = self.offsets.windows(2);
+        rows.map(|r| (r[1] - r[0]).max(1) as u64).sum()
+    }
+
+    pub fn view(&self) -> crate::pack::Rows<'_> {
+        crate::pack::Rows {
+            values: &self.values,
+            offsets: &self.offsets,
+        }
+    }
+
     pub fn row(&self, row: usize) -> &[u32] {
         &self.values[self.offsets[row]..self.offsets[row + 1]]
     }

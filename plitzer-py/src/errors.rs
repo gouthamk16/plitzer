@@ -36,10 +36,14 @@ pub fn session_error(e: session::Error) -> PyErr {
         session::Error::Config(_)
         | session::Error::Load(load::Error::Budget { .. })
         | session::Error::Index(index::Error::Cache(_)) => ConfigError::new_err(message),
-        session::Error::Checkpoint(_) => CheckpointError::new_err(message),
-        session::Error::Index(_) | session::Error::Read(_) | session::Error::Load(_) => {
-            DataError::new_err(message)
+        // Only a resumed checkpoint gives a position that no run makes.
+        session::Error::Checkpoint(_) | session::Error::Load(load::Error::State(_)) => {
+            CheckpointError::new_err(message)
         }
+        session::Error::Empty
+        | session::Error::Index(_)
+        | session::Error::Read(_)
+        | session::Error::Load(_) => DataError::new_err(message),
     }
 }
 

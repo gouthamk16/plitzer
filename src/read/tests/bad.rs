@@ -103,6 +103,26 @@ async fn row_count_must_match_the_footer() {
     assert!(matches!(got, Err(Error::Decode { .. })), "{got:?}");
 }
 
+// The order cuts slices by the slots of the index, so tokens that do not
+// fill them are an error, not a panic in a lane.
+#[tokio::test]
+async fn slots_must_match_the_index() {
+    let d = data();
+    let p = props(Compression::SNAPPY, false);
+    write(
+        &d.path("x.parquet"),
+        token_column(Kind::ListI32, 3, false),
+        p,
+    );
+    let mut index = d.index().await.unwrap();
+    let reader = Reader::new(d.store.clone(), d.prefix.clone(), &index).unwrap();
+    let tokens = reader.read(&index, 0).await.unwrap();
+    assert_eq!(tokens.slots(), u64::from(index.row_group(0).1.values));
+    index.files_mut()[0].row_groups[0].values += 1;
+    let got = reader.read(&index, 0).await;
+    assert!(matches!(got, Err(Error::Slots { .. })), "{got:?}");
+}
+
 // The counter holds the bytes that storage gave: a chunk that is fetched
 // counts, a fetch that fails does not.
 #[tokio::test]

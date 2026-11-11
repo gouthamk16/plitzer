@@ -143,7 +143,16 @@ impl Index {
         &self.files
     }
 
-    /// The row count of each row group, by id. This is `Order::rows`.
+    /// The slots of each row group, by id: its leaf value count, one for
+    /// each token and one for each row with none. This is `Order::slots`.
+    pub fn slots(&self) -> Vec<u32> {
+        self.files
+            .iter()
+            .flat_map(|f| f.row_groups.iter().map(|g| g.values))
+            .collect()
+    }
+
+    /// The row count of each row group, by id.
     pub fn rows(&self) -> Vec<u32> {
         self.files
             .iter()

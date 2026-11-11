@@ -9,7 +9,6 @@ use super::*;
 
 mod cancel;
 mod refuse;
-use crate::pack::Packing;
 
 fn config() -> Config {
     Config {
@@ -17,12 +16,7 @@ fn config() -> Config {
         seed: 11,
         lanes: 4,
         window: 3,
-        packing: Packing {
-            seq_len: 8,
-            docs: 2,
-            cap: 10,
-            pad: u32::MAX,
-        },
+        seq_len: 8,
     }
 }
 
@@ -85,8 +79,8 @@ async fn run(sessions: &mut [Session], steps: usize) -> Vec<Option<Vec<u32>>> {
         let mut batch = Vec::new();
         let mut ended = Vec::new();
         for s in sessions.iter_mut() {
-            let mut seq = vec![0; s.lanes().len() * config().packing.seq_len as usize];
-            ended.push(s.next(&mut seq).await.unwrap().is_none());
+            let mut seq = vec![0; s.lanes().len() * config().seq_len as usize];
+            ended.push(!s.next(&mut seq).await.unwrap());
             batch.extend(seq);
         }
         assert!(ended.iter().all(|&e| e == ended[0]), "ranks end together");
@@ -148,21 +142,24 @@ async fn epochs_roll_over() {
     let want = reference(&d).await;
     let end = want.iter().position(Option::is_none).unwrap();
     assert_ne!(want[..end], want[end + 1..2 * end + 1], "epochs differ");
-    let next_epoch =
-        |c: Checkpoint| c.epoch == 1 && c.lanes.iter().all(|&s| s == LaneState::default());
+    let next_epoch = |c: Checkpoint| (c.epoch, c.step) == (1, 0);
     let mut two = sessions(&d, 2).await;
     run(&mut two, end).await;
+    // The lanes run on: their positions do not go back to the epoch's start.
+    let at_end = global(&two).lanes;
+    assert!(at_end.iter().any(|p| *p != Position::default()));
     assert!(two[0].ended() && two[1].ended());
     assert!(
         next_epoch(two[0].checkpoint()),
         "before the call that gives None"
     );
-    let mut seq = vec![0; (2 * config().packing.seq_len) as usize];
-    assert_eq!(two[0].next(&mut seq).await.unwrap(), None);
+    let mut seq = vec![0; (2 * config().seq_len) as usize];
+    assert!(!two[0].next(&mut seq).await.unwrap());
     assert_eq!((two[0].epoch(), two[1].epoch()), (1, 0));
     assert!(!two[0].ended() && two[1].ended());
-    // One rank saw `None` and one did not: their parts still agree.
+    // One rank saw the end and one did not: their parts still agree.
     assert!(next_epoch(global(&two)));
+    assert_eq!(global(&two).lanes, at_end);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -170,12 +167,22 @@ async fn set_epoch_starts_that_epoch() {
     let d = data();
     let want = reference(&d).await;
     let end = want.iter().position(Option::is_none).unwrap();
+    // A jump starts each lane at the first document of epoch 1, as a fresh
+    // session that jumps at once does.
+    let mut fresh = sessions(&d, 1).await;
+    fresh[0].set_epoch(1);
+    let jumped = run(&mut fresh, end + 1).await;
+    assert_ne!(
+        jumped[..end],
+        want[end + 1..2 * end + 1],
+        "a run arrives with its lanes on"
+    );
     let mut two = sessions(&d, 2).await;
     run(&mut two, 3).await;
     for s in &mut two {
         s.set_epoch(1);
     }
-    assert_eq!(run(&mut two, end + 1).await, want[end + 1..2 * end + 2]);
+    assert_eq!(run(&mut two, end + 1).await, jumped);
 }
 
 // A trainer that saved after an epoch's last step resumes into the next
@@ -227,11 +234,11 @@ async fn next_retries_after_a_failed_read() {
     bad[4..good.len() / 2].fill(0xAB);
     std::fs::write(&path, &bad).unwrap();
     // Some later steps may still be served from memory before the failure.
-    let mut seq = vec![0; (4 * config().packing.seq_len) as usize];
+    let mut seq = vec![0; (4 * config().seq_len) as usize];
     loop {
         assert!(got.len() < want.len(), "the damaged file was never read");
         match one[0].next(&mut seq).await {
-            Ok(real) => got.push(real.map(|_| seq.clone())),
+            Ok(step) => got.push(step.then(|| seq.clone())),
             Err(e) => {
                 assert!(matches!(e, Error::Load(load::Error::Read(_))), "{e}");
                 break;
@@ -244,9 +251,10 @@ async fn next_retries_after_a_failed_read() {
     assert_eq!(got, want);
 }
 
-// The count holds every epoch: one GPU reads each chunk once per epoch.
+// One GPU reads each row group about once an epoch: the prefetch reads
+// only a few windows ahead of its lanes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn bytes_read_one_gpu_is_the_dataset() {
+async fn bytes_read_one_gpu_is_about_the_dataset_an_epoch() {
     let d = data();
     let mut one = sessions(&d, 1).await;
     let index = &one[0].index;
@@ -258,8 +266,12 @@ async fn bytes_read_one_gpu_is_the_dataset() {
         0,
         "nothing is read before the first step"
     );
-    for epoch in 1..=2 {
+    for epoch in 1..=3u64 {
         while run(&mut one, 1).await[0].is_some() {}
-        assert_eq!(one[0].bytes_read(), epoch * dataset);
+        let read = one[0].bytes_read();
+        assert!(
+            read >= (epoch - 1) * dataset && read <= (epoch + 1) * dataset,
+            "{read}"
+        );
     }
 }

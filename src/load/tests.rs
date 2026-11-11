@@ -1,6 +1,3 @@
-use std::cell::RefCell;
-use std::time::Duration;
-
 use arrow_array::builder::{GenericListBuilder, Int32Builder};
 use arrow_array::{ArrayRef, RecordBatch};
 use object_store::local::LocalFileSystem;
@@ -9,30 +6,27 @@ use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
 use tempfile::TempDir;
 
-use super::plan::{at_cursors, cursors, peak, plan, resume};
-use super::*;
+use std::collections::{HashMap, HashSet};
 
-mod budget;
+use super::*;
+use crate::order::gpu_lanes;
+use crate::pack::Rows;
+use crate::pack::Tokens;
+use crate::read::RowGroupTokens;
+use sequence::WindowGroups;
+
 mod bytes;
-mod cancel;
 mod fail;
-mod plan;
-use crate::order::{Order, gpu_lanes};
-use crate::pack::Packing;
 
 const LANES: u32 = 4;
-const PACKING: Packing = Packing {
-    seq_len: 8,
-    docs: 2,
-    cap: 10,
-    pad: u32::MAX,
-};
+const SEQ_LEN: u32 = 8;
+const PLENTY: u64 = 1 << 30;
 
 struct Data {
     dir: TempDir,
     index: Arc<Index>,
     reader: Arc<Reader>,
-    epoch: Arc<Epoch>,
+    orders: Arc<Orders>,
 }
 
 /// Six files of row groups of 5 rows; row `r` of file `f` has
@@ -60,195 +54,197 @@ async fn data(seed: u64) -> Data {
         w.write(&batch).unwrap();
         w.close().unwrap();
     }
-    let store = Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
-    let index = Index::build(&*store, &Path::from(""), "tokens")
+    let index = Index::build(&*store(&dir), &Path::from(""), "tokens")
         .await
         .unwrap();
-    let reader = Reader::new(store, Path::from(""), &index).unwrap();
-    let rows = index.rows();
-    let order = Order {
-        seed,
-        epoch: 0,
-        lanes: LANES,
-        window: 3,
-        rows: &rows,
-    };
-    let epoch = Arc::new(Epoch::new(order, PACKING));
+    let reader = Reader::new(store(&dir), Path::from(""), &index).unwrap();
+    let orders = Orders::new(seed, LANES, 3, SEQ_LEN, &index.slots());
     Data {
         dir,
         index: Arc::new(index),
         reader: Arc::new(reader),
-        epoch,
+        orders,
     }
 }
 
-/// One global batch for each step, run without the loader over every row
-/// group in memory. `log` records the row group of each document taken.
-struct All {
-    groups: HashMap<u32, RowGroupTokens>,
-    log: RefCell<Vec<u32>>,
+fn store(dir: &TempDir) -> Arc<LocalFileSystem> {
+    Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap())
 }
 
+/// Every row group in memory, for the packer run without the loader.
+struct All(HashMap<u32, RowGroupTokens>);
+
 impl Tokens for All {
-    fn tokens(&self, doc: Doc) -> &[u32] {
-        self.log.borrow_mut().push(doc.row_group);
-        self.groups[&doc.row_group].row(doc.row as usize)
+    fn row_group(&self, g: u32) -> Option<Rows<'_>> {
+        Some(self.0[&g].view())
     }
 }
 
 async fn all(d: &Data) -> All {
     let mut groups = HashMap::new();
-    for rg in 0..d.index.rows().len() as u32 {
-        let tokens = d.reader.read(&d.index, rg).await.unwrap();
-        // The budget cost from the index is never below the real size.
-        assert!(tokens.bytes() as u64 <= d.index.row_group(rg).1.decoded_bytes());
-        groups.insert(rg, tokens);
+    for g in 0..d.index.rows().len() as u32 {
+        groups.insert(g, d.reader.read(&d.index, g).await.unwrap());
     }
-    All {
-        groups,
-        log: RefCell::default(),
-    }
+    All(groups)
 }
 
-fn direct(d: &Data, all: &All) -> Vec<Vec<u32>> {
+/// The global batch of each of `steps` steps, from the packer alone.
+fn direct(d: &Data, all: &All, steps: usize) -> Vec<Vec<u32>> {
     let mut lanes: Vec<Lane> = (0..LANES)
-        .map(|l| d.epoch.lane(l, LaneState::default(), all).unwrap())
+        .map(|l| Lane::new(&d.orders, l, Position::default()).unwrap())
         .collect();
-    let mut seq = vec![0; PACKING.seq_len as usize];
-    (0..d.epoch.steps())
+    let mut seq = vec![0; SEQ_LEN as usize];
+    (0..steps)
         .map(|_| {
-            lanes
-                .iter_mut()
-                .flat_map(|l| {
-                    l.fill(all, &mut seq);
-                    seq.clone()
-                })
-                .collect()
+            let mut batch = Vec::new();
+            for lane in &mut lanes {
+                assert_eq!(lane.need(all), Need::Ready);
+                lane.fill(all, &mut seq);
+                batch.extend_from_slice(&seq);
+            }
+            batch
         })
         .collect()
 }
 
-/// Runs the loaders of a `world`-GPU job from `states` (one per lane) for at
-/// most `steps` steps. Returns the global batch of each step and the states
-/// after the last.
+/// About three epochs of steps: lanes cross two epoch ends.
+fn steps(d: &Data) -> usize {
+    let tokens: u64 = (0..d.index.rows().len() as u32)
+        .map(|g| u64::from(d.index.row_group(g).1.values))
+        .sum();
+    (3 * tokens / u64::from(LANES * SEQ_LEN)) as usize
+}
+
+/// Runs a `world`-GPU job from `at` (one position per lane) for `steps`
+/// steps. Returns each step's global batch and the positions after.
 async fn run(
     d: &Data,
     world: u32,
-    states: &[LaneState],
-    steps: u64,
+    at: &[Position],
+    steps: usize,
     budget: u64,
-) -> (Vec<Vec<u32>>, Vec<LaneState>) {
-    let mut batches: Vec<Vec<u32>> = Vec::new();
+) -> (Vec<Vec<u32>>, Vec<Position>) {
+    let mut batches = vec![Vec::new(); steps];
     let mut after = Vec::new();
     for rank in 0..world {
         let lanes = gpu_lanes(LANES, world, rank);
-        let own = &states[lanes.start as usize..lanes.end as usize];
-        let mut loader = Loader::new(
-            d.epoch.clone(),
-            d.reader.clone(),
-            d.index.clone(),
-            lanes.clone(),
-            own,
-            budget,
-        )
-        .await
-        .unwrap();
-        let mut out = vec![0; lanes.len() * PACKING.seq_len as usize];
-        for step in 0..steps {
-            let Some(_) = loader.next(&mut out).await.unwrap() else {
-                break;
-            };
-            assert!(loader.resident_bytes() as u64 <= budget);
-            if batches.len() <= step as usize {
-                batches.push(Vec::new());
-            }
-            batches[step as usize].extend_from_slice(&out);
+        let own = &at[lanes.start as usize..lanes.end as usize];
+        let (o, r, i) = (d.orders.clone(), d.reader.clone(), d.index.clone());
+        let mut loader = Loader::new(o, r, i, lanes.clone(), own, budget).unwrap();
+        let mut out = vec![0; lanes.len() * SEQ_LEN as usize];
+        for batch in &mut batches {
+            loader.next(&mut out).await.unwrap();
+            batch.extend_from_slice(&out);
         }
-        after.extend(loader.states());
+        after.extend(loader.positions());
     }
     (batches, after)
 }
-
-const PLENTY: u64 = 1 << 30;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn loader_matches_direct() {
     for seed in [1, 2, 3] {
         let d = data(seed).await;
-        let want = direct(&d, &all(&d).await);
-        assert!(!want.is_empty());
-        let fresh = vec![LaneState::default(); LANES as usize];
+        let n = steps(&d);
+        let want = direct(&d, &all(&d).await, n);
+        let fresh = vec![Position::default(); LANES as usize];
         for world in [1, 2, 4] {
-            let (got, _) = run(&d, world, &fresh, u64::MAX, PLENTY).await;
+            let (got, _) = run(&d, world, &fresh, n, PLENTY).await;
             assert_eq!(got, want, "seed {seed}, world {world}");
         }
     }
 }
 
+// A run stopped at any step and resumed on another GPU count, from the
+// positions alone, gives the rest of a run with no stop.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn resume_matches_tail() {
     let d = data(5).await;
-    let want = direct(&d, &all(&d).await);
-    let fresh = vec![LaneState::default(); LANES as usize];
+    let n = steps(&d);
+    let want = direct(&d, &all(&d).await, n);
+    let fresh = vec![Position::default(); LANES as usize];
     for (a, b) in [(1, 2), (2, 4), (4, 1)] {
-        for k in [0, 1, want.len() as u64 / 2, want.len() as u64] {
-            let (head, states) = run(&d, a, &fresh, k, PLENTY).await;
-            let (tail, _) = run(&d, b, &states, u64::MAX, PLENTY).await;
+        for k in [0, 1, n / 3, n / 2, n - 1] {
+            let (head, at) = run(&d, a, &fresh, k, PLENTY).await;
+            let (tail, _) = run(&d, b, &at, n - k, PLENTY).await;
             let joined: Vec<_> = head.into_iter().chain(tail).collect();
             assert_eq!(joined, want, "world {a} then {b}, resume at {k}");
         }
     }
 }
 
+// A budget of exactly one window works: lanes a window apart get the reads
+// they wait for past the budget, and the run never waits for itself.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn evicts_everything() {
-    let d = data(9).await;
-    let fresh = vec![LaneState::default(); LANES as usize];
-    let mut loader = Loader::new(
-        d.epoch.clone(),
-        d.reader.clone(),
-        d.index.clone(),
-        0..LANES,
-        &fresh,
-        PLENTY,
-    )
-    .await
-    .unwrap();
-    let mut out = vec![0; (LANES * PACKING.seq_len) as usize];
-    while loader.next(&mut out).await.unwrap().is_some() {}
-    assert_eq!(loader.resident_bytes(), 0);
-    assert!(loader.buffer.0.is_empty());
-    assert_eq!(loader.next, loader.needs.len());
+async fn one_window_of_budget_is_enough() {
+    let d = data(7).await;
+    let n = steps(&d);
+    let want = direct(&d, &all(&d).await, n);
+    let fresh = vec![Position::default(); LANES as usize];
+    for world in [1, 2] {
+        let ranks = 0..world;
+        let window = |r| sequence::window_kib(&d.orders, &d.index, gpu_lanes(LANES, world, r), 0);
+        let budget = ranks.map(window).max().unwrap() * 1024;
+        let run = run(&d, world, &fresh, n, budget);
+        let got = tokio::time::timeout(std::time::Duration::from_secs(20), run).await;
+        assert_eq!(got.expect("no deadlock").0, want, "world {world}");
+    }
 }
 
-// With room for everything, the prefetch reads every row group ahead of
-// use, without any call to `next`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn prefetches_ahead() {
-    let d = data(15).await;
-    let total: usize = all(&d)
-        .await
-        .groups
-        .values()
-        .map(RowGroupTokens::bytes)
-        .sum();
-    let fresh = vec![LaneState::default(); LANES as usize];
-    let loader = Loader::new(
-        d.epoch.clone(),
-        d.reader.clone(),
-        d.index.clone(),
-        0..LANES,
-        &fresh,
-        PLENTY,
-    )
-    .await
-    .unwrap();
-    let full = async {
-        while loader.resident_bytes() < total {
-            tokio::time::sleep(Duration::from_millis(5)).await;
+async fn a_budget_below_one_window_is_refused() {
+    let d = data(7).await;
+    let needed = sequence::window_kib(&d.orders, &d.index, 0..LANES, 0) * 1024;
+    let fresh = vec![Position::default(); LANES as usize];
+    let (o, r, i) = (d.orders.clone(), d.reader.clone(), d.index.clone());
+    let got = Loader::new(o, r, i, 0..LANES, &fresh, needed - 1024);
+    assert!(matches!(got, Err(Error::Budget { .. })), "{:?}", got.err());
+}
+
+/// The windows from `from` to `to`, both included, for lanes `lanes`.
+fn windows(d: &Data, lanes: Range<u32>, from: (u64, usize), to: (u64, usize)) -> Vec<WindowGroups> {
+    let mut seq = Sequence::new(&d.orders, lanes, from);
+    let mut out = Vec::new();
+    loop {
+        let w = seq.next_window();
+        if (w.epoch, w.window) > to {
+            return out;
         }
-    };
-    tokio::time::timeout(Duration::from_secs(10), full)
-        .await
-        .expect("every row group prefetched");
+        out.push(w);
+    }
+}
+
+/// `n` windows after `slice`, across the epoch's end.
+fn after(d: &Data, (e, w): (u64, usize), n: usize) -> (u64, usize) {
+    let per = d.orders.epoch(e).windows().len();
+    let ordinal = e as usize * per + w + n;
+    ((ordinal / per) as u64, ordinal % per)
+}
+
+// Each row group in memory is in a window that some lane has not passed:
+// once every lane has passed a window, its row groups are evicted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn passed_windows_are_evicted() {
+    for seed in [9, 10] {
+        let d = data(seed).await;
+        let fresh = vec![Position::default(); LANES as usize];
+        let (o, r, i) = (d.orders.clone(), d.reader.clone(), d.index.clone());
+        let mut loader = Loader::new(o, r, i, 0..LANES, &fresh, PLENTY).unwrap();
+        let mut out = vec![0; (LANES * SEQ_LEN) as usize];
+        for _ in 0..steps(&d) {
+            loader.next(&mut out).await.unwrap();
+            let slices: Vec<_> = loader.lanes.iter().map(Lane::slice).collect();
+            let (slowest, fastest) = (*slices.iter().min().unwrap(), *slices.iter().max().unwrap());
+            let live: HashSet<u32> = windows(&d, 0..LANES, slowest, after(&d, fastest, 4))
+                .iter()
+                .flat_map(|w| w.used().map(|i| w.groups[i]).collect::<Vec<_>>())
+                .collect();
+            for g in loader.buffer.row_groups() {
+                assert!(
+                    live.contains(g),
+                    "seed {seed}: row group {g} outlives its windows"
+                );
+            }
+        }
+    }
 }

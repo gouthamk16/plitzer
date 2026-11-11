@@ -44,6 +44,10 @@ pub enum Error {
     },
     /// A token is null, negative, or does not fit in `u32`.
     BadToken { path: String, row_group: u32 },
+    /// The rows do not have the slots that the index records: a token for
+    /// each slot, and one slot for each row with none. The order cuts
+    /// slices by these slots.
+    Slots { path: String, row_group: u32 },
 }
 
 impl fmt::Display for Error {
@@ -65,6 +69,10 @@ impl fmt::Display for Error {
                 f,
                 "row group {row_group} of {path} has a null, negative or too large token"
             ),
+            Error::Slots { path, row_group } => write!(
+                f,
+                "row group {row_group} of {path} does not have the tokens that its footer records"
+            ),
         }
     }
 }
@@ -74,7 +82,7 @@ impl std::error::Error for Error {
         match self {
             Error::Schema(e) | Error::Decode { source: e, .. } => Some(e),
             Error::Fetch { source, .. } => Some(source),
-            Error::BadToken { .. } => None,
+            Error::BadToken { .. } | Error::Slots { .. } => None,
         }
     }
 }
@@ -85,8 +93,8 @@ pub struct Reader {
     store: Arc<dyn ObjectStore>,
     prefix: Path,
     schema: SchemaDescPtr,
-    /// The bytes of every chunk fetched so far.
-    fetched: AtomicU64,
+    /// The bytes of every chunk fetched so far, shared with those who watch.
+    fetched: Arc<AtomicU64>,
 }
 
 impl Reader {
@@ -96,7 +104,7 @@ impl Reader {
             store,
             prefix,
             schema,
-            fetched: AtomicU64::new(0),
+            fetched: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -104,6 +112,11 @@ impl Reader {
     /// that then failed to decode. A failed fetch adds nothing.
     pub fn bytes_read(&self) -> u64 {
         self.fetched.load(Ordering::Relaxed)
+    }
+
+    /// The counter of `bytes_read`, to read at any time, also during a read.
+    pub fn bytes_counter(&self) -> Arc<AtomicU64> {
+        self.fetched.clone()
     }
 
     /// The tokens of each row of row group `row_group` of `index`.
@@ -127,10 +140,17 @@ impl Reader {
             row_group,
             source,
         })?;
-        RowGroupTokens::new(&column).ok_or_else(|| Error::BadToken {
+        let tokens = RowGroupTokens::new(&column).ok_or_else(|| Error::BadToken {
             path: path(),
             row_group,
-        })
+        })?;
+        if tokens.slots() != u64::from(rg.values) {
+            return Err(Error::Slots {
+                path: path(),
+                row_group,
+            });
+        }
+        Ok(tokens)
     }
 
     fn location(&self, path: &str) -> Result<Path, Error> {

@@ -13,7 +13,7 @@ import torch.distributed as dist
 import e2e
 import e2e_stream
 import plitzer.torch as pt
-from e2e import Arrays, Job
+from e2e import Job, Tokens
 
 
 def settings(job: Job) -> pt.LoaderSettings:
@@ -23,9 +23,6 @@ def settings(job: Job) -> pt.LoaderSettings:
         lanes=s["lanes"],
         window=s["window"],
         seq_len=s["seq_len"],
-        docs=s["docs"],
-        cap=s["cap"],
-        pad=s["pad"],
         budget=s["budget"],
         cache=job.cache,
     )
@@ -40,9 +37,9 @@ def torch_rank(rank: int, job: Job, ready: Barrier) -> None:
         ds.load_state_dict(torch.load(job.resume, weights_only=True))
     ready.wait()
 
-    def epoch() -> Iterable[Arrays]:
+    def epoch() -> Iterable[Tokens]:
         for b in ds:
-            yield b.tokens.numpy(), b.lengths.numpy()
+            yield b.tokens.numpy()
 
     def save(step: int) -> None:
         try:
