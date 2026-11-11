@@ -21,7 +21,7 @@ torch = ["torch>=2.5"]
 # plitzer.bench: the benchmark harnesses.
 bench = ["numpy>=2.1", "pyarrow>=18"]
 # plitzer.bench.baseline: the loaders that plitzer is measured against.
-baseline = ["numpy>=2.1", "pyarrow>=18", "torch>=2.5", "mosaicml-streaming>=0.13", "datasets>=3"]
+baseline = ["plitzer[bench,torch]", "mosaicml-streaming>=0.13", "datasets>=3"]
 
 [project.urls]
 Repository = "https://github.com/gouthamk16/plitzer"

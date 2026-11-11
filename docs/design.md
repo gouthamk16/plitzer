@@ -1170,26 +1170,32 @@ def table(results: Sequence[Result]) -> str: ...
 - `hf`: `load_dataset("parquet")` converts the files to an Arrow cache. `shuffle(seed)` gives a random order, and each batch is a slice of the shuffled dataset. The state is the index of the next document, as `accelerate.skip_first_batches` uses for a map-style sampler.
 - `hf-stream`: `load_dataset(..., streaming=True)` reads the files with no conversion, through a shuffle buffer of 10 000 documents. The state is `state_dict()`, which does not hold the buffer.
 - The HF loaders iterate in the main process: `IterableDataset.state_dict()` counts only what the main process takes (D-76).
-- Each phase (conversion, epoch, resume) runs in a new `spawn` process (D-73). The process times its own work, so imports and the start of the process do not count. The CPU time is `os.times()` of the process, with the workers that it joined. Cores is CPU time divided by wall time.
-- The epoch saves the state after `resume_at` batches and a digest of all batches after it. The resume runs to the end of the epoch. `exact` is true if its digest is the same. `lost` is the documents of the uninterrupted rest minus the documents of the resumed rest (D-74).
+- Each phase runs in a new `spawn` process (D-73). The phases are the conversion, the timed epoch, the tail and the resume. The process times its own work, so imports and the start of the process do not count.
+- The CPU time is `os.times()` of the process, with the workers that it joined. Cores is CPU time divided by wall time. Cores is unknown when `os.times()` cannot count the workers: on Windows, and when the start method is `forkserver` (the Linux default from Python 3.14), whose workers are not children of the phase process.
+- The timed epoch counts documents and tokens, and saves the state after `resume_at` batches. It makes no digest, so the time is only the loader's work. Its clock starts after `open`: it measures the pace of the loader. The clock of the resume starts before `open`, because a resume waits for the loader to start.
+- The tail phase runs an uninterrupted epoch again, with no clock, and makes a digest of all batches after the first `resume_at`. The resume runs to the end of the epoch, with the same digest. `exact` is true if the two digests are the same. `lost` is the documents of the uninterrupted rest minus the documents of the resumed rest (D-74).
+- `measure` refuses an unknown loader and a `resume_at` below 1. The epoch refuses a `resume_at` with no batch after it. The CLI refuses an unknown or repeated loader name before it starts.
 
 **Rationale:** The same files, seed, batch size (in documents), worker count and epoch feed each loader. The input is the FineWeb-Edu-shaped dataset of section 5.13 (D-72). The loaders iterate documents, which is the unit that each loader gives.
 
 **Limits:**
 
 - The numbers depend on the computer. Compare rows of one table, not tables from different computers.
-- `cores` is unknown on Windows, because `os.times()` gives no time for child processes there.
+- `cores` is unknown on Windows and with the `forkserver` start method.
 - The `hf` rows use no DataLoader workers (D-76).
-- The time of the first batch of a resume includes the start of the loader: for Mosaic, the dataset and its workers; for `hf`, the cache and the shuffle.
+- The time of the first batch of a resume includes the start of the loader: for Mosaic, the dataset and its workers; for `hf`, the cache and the shuffle. The shuffle of `hf` uses the index file that the earlier phases wrote, as a resumed job uses the file of its first run.
+- Each loader reads the data three times after the conversion: the timed epoch, the tail and the resume.
 
 **Verification:**
 
 | Test | Type | Checks |
 |---|---|---|
 | `test_an_epoch_gives_each_document_once` | pytest | For each loader, one epoch gives each document of the source one time, also the empty ones. |
-| `test_resume_is_exact` | pytest | Mosaic and `hf` resume at batch 5 with the rest of the epoch of an uninterrupted run, and lose no document. The other fields are positive, and `cores` is unknown only on Windows. |
+| `test_resume_is_exact` | pytest | Mosaic and `hf` resume at batch 5 with the rest of the epoch of an uninterrupted run, and lose no document. The other fields are positive, and `cores` is unknown only where `workers_counted()` is false. |
 | `test_a_streaming_resume_loses_the_shuffle_buffer` | pytest | `hf-stream` needs no conversion. Its resume is not exact, and it loses the 80 documents that its buffer held. |
-| `test_cpu_counts_this_process` | pytest | `cpu()` counts 0.2 s of work in this process. |
+| `test_cpu_counts_this_process` | pytest | `cpu()` grows by 0.1 s while this process works, within 30 s of wall time. |
+| `test_resume_at_must_be_inside_the_epoch` | pytest | A resume after the last batch, or at 0, gives an error. |
+| `test_main_refuses_unknown_or_repeated_loaders` | pytest | The CLI refuses `hf,hf_stream` and `hf,hf` before it starts. |
 | `test_main_prints_a_row_for_each_loader` | pytest | The CLI prints one table row for each loader. |
 
 These tests run in a CI job of their own (`baseline`, on Linux), which installs the loaders. `mosaicml-streaming` pins numpy below 2.2, and the other tests run with the newest numpy. Other jobs skip these tests.
@@ -1201,13 +1207,14 @@ These tests run in a CI job of their own (`baseline`, on Linux), which installs 
 
 | loader | convert (s) | converted (MiB) | docs/s | Mtokens/s | cores | resume (s) | exact resume | docs lost |
 |---|---|---|---|---|---|---|---|---|
-| mosaic | 53.5 | 1222 | 27 024 | 27.8 | 2.72 | 2.81 | yes | 0 |
-| hf | 4.3 | 2009 | 69 017 | 70.9 | 0.99 | 0.17 | yes | 0 |
-| hf-stream | 0.0 | 0 | 2 917 | 3.0 | 1.10 | 3.18 | no | 10 000 |
+| mosaic | 22.3 | 1222 | 28 014 | 28.8 | 2.68 | 2.89 | yes | 0 |
+| hf | 4.5 | 2009 | 86 357 | 88.7 | 1.00 | 0.18 | yes | 0 |
+| hf-stream | 0.0 | 0 | 2 949 | 3.0 | 1.10 | 3.06 | no | 10 000 |
 
-- Mosaic needs a conversion of 54 s, and a second copy of the data. It uses 2.7 cores for 27 000 documents each second. Its resume is exact.
+- The computer is a shared cloud computer. An earlier run timed the digest inside the epoch, so its `hf` speed was 20 % lower. Its Mosaic and `hf-stream` values were the same within 5 %, but its Mosaic conversion took 53.5 s. Thus the conversion time of Mosaic is 22 to 54 s.
+- Mosaic needs a conversion, and a second copy of the data. It uses 2.7 cores for 28 000 documents each second. Its resume is exact.
 - `hf` makes a second copy of 2 GiB, 1.8 times the Parquet chunks, because the Arrow cache is not compressed. All of the cache fits in the page cache of this computer, so its random access does not wait for the disk. On a dataset larger than RAM, each batch reads from random positions of the disk.
-- `hf-stream` needs no copy, but it gives 3000 documents each second, and its resume loses the 10 000 documents of its buffer. Thus it is neither fast nor resumable without loss.
+- `hf-stream` needs no copy, but it gives 2900 documents each second, and its resume loses the 10 000 documents of its buffer. Thus it is neither fast nor resumable without loss.
 - Section 7 keeps the comparison with plitzer as an open question. The next PR adds plitzer to this table.
 
 ## 6. Read amplification

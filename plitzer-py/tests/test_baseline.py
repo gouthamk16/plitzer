@@ -1,5 +1,4 @@
 import hashlib
-import sys
 import time
 from pathlib import Path
 
@@ -53,15 +52,28 @@ def test_resume_is_exact(name: str, data: Path, tmp_path: Path) -> None:
     assert r.exact and r.lost == 0
     assert r.convert_bytes > 0 and r.docs_per_s > 0 and r.tokens_per_s > 0
     assert r.resume_s > 0
-    assert (r.cores is None) == (sys.platform == "win32")
+    assert (r.cores is None) == (not baseline.workers_counted())
 
 
 def test_cpu_counts_this_process() -> None:
-    start = baseline.cpu()
-    deadline = time.perf_counter() + 0.2
-    while time.perf_counter() < deadline:
-        pass
-    assert baseline.cpu() - start > 0.1
+    # Until 0.1 s of CPU, not of wall time: a busy runner can deschedule us.
+    start, deadline = baseline.cpu(), time.perf_counter() + 30
+    while baseline.cpu() - start < 0.1:
+        assert time.perf_counter() < deadline, "cpu() never grew"
+
+
+def test_resume_at_must_be_inside_the_epoch(data: Path, tmp_path: Path) -> None:
+    # 120 documents in batches of 8: 15 batches, the last with none after it.
+    with pytest.raises(RuntimeError, match="hf epoch failed"):
+        baseline.measure("hf", data, tmp_path / "a", RUN, resume_at=15)
+    with pytest.raises(ValueError, match="1 or more"):
+        baseline.measure("hf", data, tmp_path / "b", RUN, resume_at=0)
+
+
+def test_main_refuses_unknown_or_repeated_loaders(data: Path) -> None:
+    for loaders in ("hf,hf_stream", "hf,hf"):
+        with pytest.raises(SystemExit):
+            baseline.main([str(data), "--loaders", loaders])
 
 
 def test_a_streaming_resume_loses_the_shuffle_buffer(

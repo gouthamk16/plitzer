@@ -65,18 +65,19 @@ class Loader(Protocol):
 
 
 class Job(NamedTuple):
-    phase: str  # "convert", "epoch" or "resume"
+    phase: str  # "convert", "epoch", "tail" or "resume"
     loader: str
     data: Path
     work: Path
     run: Run
-    resume_at: int  # the batch at which the resume starts
-    state: object  # the state to resume from
+    resume_at: int  # the batches before the resume, 1 or more
+    prepared: Path | None = None  # from the conversion
+    state: object = None  # the state to resume from
 
 
 class Phase(NamedTuple):
     seconds: float  # to the end; for a resume, to its first batch
-    cpu: float  # CPU seconds of the process and its joined workers
+    cpu: float | None  # CPU seconds of the process and its workers, if known
     docs: int = 0
     tokens: int = 0
     tail: str = ""  # digest of the batches from `resume_at`, or of a resume
@@ -130,48 +131,72 @@ def loader(name: str) -> Loader:
     return made
 
 
+def workers_counted() -> bool:
+    """Whether ``os.times()`` counts the CPU time of the workers: only for
+    joined children of this process. Windows gives no child times, and a
+    forkserver (Linux's default from Python 3.14) is the workers' parent."""
+    return (
+        sys.platform != "win32" and multiprocessing.get_start_method() != "forkserver"
+    )
+
+
 def epoch(opened: Opened, resume_at: int) -> Phase:
-    """One epoch: counts, the state after ``resume_at`` batches, and the
-    digest of the batches after it."""
+    """One timed epoch: counts, and the state after ``resume_at`` batches.
+    It digests nothing, so that only the loader's work is timed."""
     t0, c0 = time.perf_counter(), cpu()
-    docs = tokens = 0
+    docs = tokens = batches = 0
     state = None
-    tail = Tail()
-    for i, batch in enumerate(opened):
+    for batch in opened:
         docs += len(batch)
         tokens += sum(len(d) for d in batch)
-        if i >= resume_at:
-            tail.add(batch)
-        if i == resume_at - 1:
+        batches += 1
+        if batches == resume_at:
             state = opened.state()
+    if state is None or batches == resume_at:
+        raise ValueError(f"resume_at {resume_at} is not inside {batches} batches")
     seconds, used = time.perf_counter() - t0, cpu() - c0
-    return Phase(seconds, used, docs, tokens, tail.digest(), tail.docs, state)
+    return Phase(
+        seconds, used if workers_counted() else None, docs, tokens, state=state
+    )
 
 
-def resume(opened: Opened, t0: float, c0: float) -> Phase:
+def tail(opened: Opened, resume_at: int) -> Phase:
+    """The digest of the batches after the first ``resume_at``, untimed."""
+    digest = Tail()
+    for i, batch in enumerate(opened):
+        if i >= resume_at:
+            digest.add(batch)
+    return Phase(0.0, None, tail=digest.digest(), tail_docs=digest.docs)
+
+
+def resume(opened: Opened, t0: float) -> Phase:
     """The rest of an epoch from a state, timed to its first batch."""
-    first: tuple[float, float] | None = None
-    tail = Tail()
+    first: float | None = None
+    digest = Tail()
     for batch in opened:
-        first = first or (time.perf_counter() - t0, cpu() - c0)
-        tail.add(batch)
-    seconds, used = first or (time.perf_counter() - t0, cpu() - c0)
-    return Phase(seconds, used, tail=tail.digest(), tail_docs=tail.docs)
+        first = first or time.perf_counter() - t0
+        digest.add(batch)
+    seconds = first or time.perf_counter() - t0
+    return Phase(seconds, None, tail=digest.digest(), tail_docs=digest.docs)
 
 
 def child(conn: Connection, job: Job) -> None:
     load = loader(job.loader)
-    prepared = job.work / "prepared"
     t0, c0 = time.perf_counter(), cpu()
     if job.phase == "convert":
         out = load.convert(job.data, job.work)
         conn.send(Phase(time.perf_counter() - t0, cpu() - c0, prepared=out))
         return
-    where = Path(prepared.read_text())
+    assert job.prepared is not None, "the conversion runs first"
+    # The epoch's clock starts after `open`, the resume's before it: a
+    # resume waits for the loader to start, and an epoch measures its pace.
+    opened = load.open(job.data, job.prepared, job.run, job.state)
     if job.phase == "epoch":
-        conn.send(epoch(load.open(job.data, where, job.run, None), job.resume_at))
-        return
-    conn.send(resume(load.open(job.data, where, job.run, job.state), t0, c0))
+        conn.send(epoch(opened, job.resume_at))
+    elif job.phase == "tail":
+        conn.send(tail(opened, job.resume_at))
+    else:
+        conn.send(resume(opened, t0))
 
 
 def phase(job: Job) -> Phase:
@@ -196,29 +221,28 @@ def dir_bytes(path: Path) -> int:
 
 
 def measure(name: str, data: Path, work: Path, run: Run, resume_at: int) -> Result:
-    """The three phases of loader ``name`` over ``data``, using ``work``."""
-    job = Job("convert", name, data, work, run, resume_at, None)
-    convert = phase(job)
-    assert convert.prepared is not None
-    (work / "prepared").write_text(str(convert.prepared))
-    size = 0 if convert.prepared == data else dir_bytes(convert.prepared)
-    run_ = phase(job._replace(phase="epoch"))
-    back = phase(job._replace(phase="resume", state=run_.state))
-    s = run_.seconds
-    # Windows gives no CPU time of child processes.
-    cores = None if sys.platform == "win32" else run_.cpu / s
-    exact = back.tail == run_.tail
-    lost = run_.tail_docs - back.tail_docs
+    """The phases of loader ``name`` over ``data``, using ``work``."""
+    if name not in LOADERS:
+        raise ValueError(f"no loader {name!r}; the loaders are {', '.join(LOADERS)}")
+    if resume_at < 1:
+        raise ValueError("resume_at is a count of batches, 1 or more")
+    convert = phase(Job("convert", name, data, work, run, resume_at))
+    job = Job("epoch", name, data, work, run, resume_at, convert.prepared)
+    size = 0 if convert.prepared == data else dir_bytes(work)
+    timed = phase(job)
+    want = phase(job._replace(phase="tail"))
+    back = phase(job._replace(phase="resume", state=timed.state))
+    s = timed.seconds
     return Result(
-        name,
-        convert.seconds,
-        size,
-        run_.docs / s,
-        run_.tokens / s,
-        cores,
-        back.seconds,
-        exact,
-        lost,
+        loader=name,
+        convert_s=convert.seconds,
+        convert_bytes=size,
+        docs_per_s=timed.docs / s,
+        tokens_per_s=timed.tokens / s,
+        cores=None if timed.cpu is None else timed.cpu / s,
+        resume_s=back.seconds,
+        exact=back.tail == want.tail,
+        lost=want.tail_docs - back.tail_docs,
     )
 
 
@@ -241,24 +265,35 @@ def table(results: Sequence[Result]) -> str:
 def main(argv: Sequence[str] | None = None) -> None:
     p = argparse.ArgumentParser(description=(__doc__ or "").split("\n\n")[0])
     p.add_argument("data", type=Path)
-    p.add_argument("--loaders", default=",".join(LOADERS))
+    p.add_argument("--loaders", type=loader_names, default=list(LOADERS))
     p.add_argument("--batch", type=int, default=64)
     p.add_argument("--workers", type=int, default=os.cpu_count() or 1)
     p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--resume-at", type=int, help="batch; default mid-epoch")
+    p.add_argument("--resume-at", type=int, help="batches before; default half")
     p.add_argument(
         "--work", type=Path, help="for converted data; default a temp folder"
     )
     a = p.parse_args(argv)
     run = Run(a.seed, a.batch, a.workers)
-    resume_at = a.resume_at or max(1, count_docs(a.data) // a.batch // 2)
+    half = max(1, count_docs(a.data) // a.batch // 2)
+    resume_at = half if a.resume_at is None else a.resume_at
     results = []
     with tempfile.TemporaryDirectory(dir=a.work) as tmp:
-        for name in a.loaders.split(","):
+        for name in a.loaders:
             work = Path(tmp, name)
             work.mkdir()
             results.append(measure(name, a.data, work, run, resume_at))
     print(table(results))
+
+
+def loader_names(value: str) -> list[str]:
+    names = value.split(",")
+    unknown = [n for n in names if n not in LOADERS]
+    if unknown or len(set(names)) != len(names):
+        raise argparse.ArgumentTypeError(
+            f"names from {', '.join(LOADERS)}, each once; not {value!r}"
+        )
+    return names
 
 
 def count_docs(data: Path) -> int:
