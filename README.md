@@ -2,18 +2,20 @@
 
 A deterministic, resumable dataloader for ML training that reads Parquet directly from local disk or S3. The core is written in Rust and exposed to Python.
 
-Batch order is a pure function of `(seed, epoch, step)`. Documents are packed into fixed-length sequences by *lanes*, which depend on the batch size and never on the GPU count. Resuming mid-epoch is exact, and the sequences stay identical when the GPU count changes.
+The order is a pure function of `(seed, epoch)` and the dataset. Documents are packed into fixed-length sequences by *lanes*, which depend on the batch size and never on the GPU count: every sequence is full, with no token dropped and no padding. Resuming mid-epoch is exact, and the sequences stay identical when the GPU count changes.
 
-> **Status:** pre-alpha. The Python package builds from source; there is no PyPI release yet.
+> **Status:** alpha, 0.1.0. The API and the checkpoint format can still change between minor versions; a checkpoint from another version is refused with a clear error, never misread.
+
+## Install
+
+```sh
+pip install plitzer            # wheels for Linux (x86_64, aarch64), macOS and Windows, CPython 3.11+
+pip install "plitzer[torch]"   # with the PyTorch IterableDataset
+```
 
 ## Quick start
 
 The input is a Parquet dataset with a pre-tokenized `list<int32>` (or `uint32`) column.
-
-```sh
-pip install maturin
-maturin develop -m plitzer-py/Cargo.toml   # into the active virtualenv
-```
 
 ```python
 import numpy as np
@@ -54,7 +56,7 @@ The state is the position of the next batch the dataset gives, so a loop that pr
 
 S3 credentials come from the usual `AWS_*` variables, or from `storage_options={"endpoint": ..., "region": ...}`.
 
-The design, its rationale and the decision log are in [docs/design.md](docs/design.md).
+The design, its rationale and the decision log are in [docs/design.md](https://github.com/gouthamk16/plitzer/blob/main/docs/design.md).
 
 ## Benchmarks
 
@@ -67,7 +69,7 @@ plitzer against MosaicML Streaming and Hugging Face `datasets`, all reading the 
 | hf | 4.8 | 2008.7 | 82,952 | 85.2 | 0.99 | 11.6 | 0.16 | yes | 0 |
 | hf-stream | 0.0 | 0.0 | 2,329 | 2.4 | 1.12 | 467.0 | 3.54 | no | 10,373,481 |
 
-plitzer reads the Parquet as it is, with no conversion or copy, delivers 3.5× the tokens of `hf` and 12× those of Mosaic, packs every sequence full with no padding, and resumes exactly. `hf` still spends less CPU per token (11.6 vs 13.2 ns) and resumes faster (0.16 vs 0.34 s), from the Arrow copy it makes first; both are the next work on speed. `--batch` is in documents, and plitzer gets the same tokens in each batch (32 sequences of 2048). Method and caveats: [design §5.14](docs/design.md#514-baseline-harness).
+plitzer reads the Parquet as it is, with no conversion or copy, delivers 3.5× the tokens of `hf` and 12× those of Mosaic, packs every sequence full with no padding, and resumes exactly. `hf` still spends less CPU per token (11.6 vs 13.2 ns) and resumes faster (0.16 vs 0.34 s), from the Arrow copy it makes first; both are the next work on speed. `--batch` is in documents, and plitzer gets the same tokens in each batch (32 sequences of 2048). Method and caveats: [design §5.14](https://github.com/gouthamk16/plitzer/blob/main/docs/design.md#514-baseline-harness).
 
 ```sh
 python -m plitzer.bench.baseline DATA --loaders plitzer,mosaic,hf,hf-stream --batch 64 --workers 4
@@ -75,7 +77,7 @@ python -m plitzer.bench.baseline DATA --loaders plitzer,mosaic,hf,hf-stream --ba
 
 ## TODO
 
-- [x] **Benchmark baseline:** measure MosaicML Streaming and HF `datasets` on a FineWeb-Edu Parquet sample (conversion time, samples/s, CPU cores used, resume time) (`plitzer.bench.baseline`, [design §5.14](docs/design.md#514-baseline-harness))
+- [x] **Benchmark baseline:** measure MosaicML Streaming and HF `datasets` on a FineWeb-Edu Parquet sample (conversion time, samples/s, CPU cores used, resume time) (`plitzer.bench.baseline`, [design §5.14](https://github.com/gouthamk16/plitzer/blob/main/docs/design.md#514-baseline-harness))
 - [x] **Ordering core:** shuffle row groups per epoch, split each window into lane slices, and shuffle each slice (`rand_chacha`). Property tests:
   - [x] each epoch yields every sample exactly once
   - [x] each lane's slice is one contiguous stretch of storage
@@ -93,11 +95,30 @@ python -m plitzer.bench.baseline DATA --loaders plitzer,mosaic,hf,hf-stream --ba
   - [x] bindings: a `plitzer` wheel exporting batches through DLPack and Arrow
   - [x] `plitzer.torch` `IterableDataset` with `state_dict()` and `load_state_dict()`
 - [x] **End-to-end test:** kill training at a random step, resume on a different GPU count, and check the sample-stream hash matches
-- [x] **Read amplification check:** measure bytes read per GPU on real data. Lane slices simulate at 1.01–1.25×. Add a per-node cache only if it's needed. Measured on FineWeb-Edu lengths: at the bound 1 + (world − 1)/W (1.013× at W = 512 on 8 GPUs), so no cache ([design §6](docs/design.md#6-read-amplification))
+- [x] **Read amplification check:** measure bytes read per GPU on real data. Lane slices simulate at 1.01–1.25×. Add a per-node cache only if it's needed. Measured on FineWeb-Edu lengths: at the bound 1 + (world − 1)/W (1.013× at W = 512 on 8 GPUs), so no cache ([design §6](https://github.com/gouthamk16/plitzer/blob/main/docs/design.md#6-read-amplification))
 - [x] **Benchmarks:** publish a comparison table against Mosaic and HF ([Benchmarks](#benchmarks))
 - [ ] **Release:** build wheels in CI and publish to PyPI
+  - [x] wheels for Linux, macOS and Windows and an sdist, each tested on its own OS, published by a `v*` tag (`.github/workflows/release.yml`)
+  - [ ] publish 0.1.0 to PyPI
 - [ ] **Stretch:** in-loader tokenization
+
+## Known limits
+
+- One `Loader` per GPU process, with `num_workers=0` in PyTorch: the parallelism is in Rust, and forking a process with a running runtime is unsafe.
+- Read amplification is about 1 + (GPUs − 1)/W: set the window W to many times your GPU count (for example W = 512 costs 1.4 % on 8 GPUs).
+- CPU per token and the time to the first batch after a resume are still behind Hugging Face `datasets`' memory-mapped Arrow copy; both are the next work on speed.
+- Input is pre-tokenized text only; tokenization, images and dataset mixing are out of scope for 0.1.
+
+## Development
+
+```sh
+pip install maturin
+maturin develop --release        # build the extension into the active virtualenv
+cargo test && python -m pytest plitzer-py/tests
+```
+
+[CLAUDE.md](https://github.com/gouthamk16/plitzer/blob/main/CLAUDE.md) lists every check that CI runs. A release is a `v*` tag: CI builds the wheels and the sdist, tests each wheel on its own OS, and publishes them to PyPI ([CHANGELOG.md](https://github.com/gouthamk16/plitzer/blob/main/CHANGELOG.md)).
 
 ## License
 
-Licensed under either [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.
+Licensed under either [MIT](https://github.com/gouthamk16/plitzer/blob/main/LICENSE-MIT) or [Apache-2.0](https://github.com/gouthamk16/plitzer/blob/main/LICENSE-APACHE), at your option.

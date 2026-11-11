@@ -23,7 +23,7 @@ python -m pytest plitzer-py/tests     # test_s3.py runs when PLITZER_S3_ENDPOINT
                                       # test_e2e_torch.py when torch is installed. The e2e tests kill training
                                       # at a random step; PLITZER_E2E_SEED=<seed> repeats a failing seed.
                                       # test_baseline.py runs when mosaicml-streaming and datasets are installed.
-(cd plitzer-py && ruff check python tests && ruff format --check python tests && mypy python tests)
+ruff check plitzer-py/python plitzer-py/tests && ruff format --check plitzer-py/python plitzer-py/tests && mypy plitzer-py/python plitzer-py/tests
 
 # Read amplification on FineWeb-Edu shapes (needs huggingface.co and its CDN us.aws.cdn.hf.co)
 python -m plitzer.bench.fineweb OUT --files 8 --row-groups 64
@@ -32,6 +32,8 @@ python -m plitzer.bench.amplification OUT --lanes 512 --window 16 64 256 512 --w
 # The baseline loaders (CPU torch and torchvision first, from download.pytorch.org/whl/cpu)
 python -m plitzer.bench.baseline OUT --loaders plitzer,mosaic,hf,hf-stream --batch 64 --workers 4  # release build only
 ```
+
+`pyproject.toml` is at the repository root and points maturin at `plitzer-py/Cargo.toml`, so `maturin develop`, `maturin sdist` and `pip install .` work from the root. A release is a `v*` tag matching the Cargo version: `.github/workflows/release.yml` builds abi3 wheels (Linux x86_64 and aarch64, macOS universal2, Windows x64) and an sdist, tests each wheel on its own OS, and publishes to PyPI with trusted publishing. Add the version's entry to `CHANGELOG.md` first.
 
 `cargo test` at the root tests only the core crate; the bindings are tested through pytest. Lint with `cargo clippy --workspace --all-targets --all-features` and `cargo fmt --all`.
 

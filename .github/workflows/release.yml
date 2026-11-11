@@ -1,0 +1,111 @@
+name: Release
+
+# Wheels and an sdist for PyPI. One abi3 wheel per platform covers every
+# CPython from 3.11. A pull request that changes the packaging builds and
+# tests them all; a v* tag also publishes them.
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - pyproject.toml
+      - Cargo.toml
+      - Cargo.lock
+      - plitzer-py/Cargo.toml
+      - plitzer-py/python/**
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  version:
+    # First and cheap: the versions agree, and the changelog has an entry.
+    # On a tag, the tag must be that version too.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Versions
+        run: |
+          core=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          py=$(grep -m1 '^version' plitzer-py/Cargo.toml | cut -d'"' -f2)
+          [ "$core" = "$py" ] || { echo "plitzer $core, plitzer-py $py"; exit 1; }
+          grep -qx "## $py" CHANGELOG.md || { echo "CHANGELOG.md has no '## $py'"; exit 1; }
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "v$py" ]; then
+            echo "tag $GITHUB_REF_NAME, version $py"; exit 1
+          fi
+
+  wheels:
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # aarch64 builds on an arm runner: aws-lc-sys, the TLS of the S3
+          # client, does not cross-compile reliably.
+          - { os: ubuntu-latest, target: x86_64, manylinux: "2_28" }
+          - { os: ubuntu-24.04-arm, target: aarch64, manylinux: "2_28" }
+          # One wheel for arm64 and x86_64 Macs, tested on arm64.
+          - { os: macos-latest, target: universal2-apple-darwin }
+          - { os: windows-latest, target: x64 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          args: --release --out dist -m plitzer-py/Cargo.toml
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux || 'auto' }}
+      - name: Test the wheel
+        shell: bash
+        run: |
+          python -m venv "$RUNNER_TEMP/smoke"
+          py="$RUNNER_TEMP/smoke/bin/python"
+          [ -f "$RUNNER_TEMP/smoke/Scripts/python.exe" ] && py="$RUNNER_TEMP/smoke/Scripts/python.exe"
+          "$py" -m pip install --no-index --find-links dist plitzer
+          "$py" -m pip install pytest numpy pyarrow
+          # Out of the source tree, so the tests import the installed wheel.
+          cp -r plitzer-py/tests "$RUNNER_TEMP/tests"
+          cd "$RUNNER_TEMP/tests" && "$py" -m pytest test_loader.py test_export.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.os }}-${{ matrix.target }}
+          path: dist
+
+  sdist:
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist -m plitzer-py/Cargo.toml
+      - name: Build a wheel from the sdist
+        run: |
+          python -m venv /tmp/fromsdist
+          /tmp/fromsdist/bin/pip install dist/*.tar.gz
+          /tmp/fromsdist/bin/python -c "import plitzer; print(plitzer.__version__)"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [wheels, sdist]
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write  # trusted publishing: PyPI trusts this workflow, no token
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: pypa/gh-action-pypi-publish@release/v1
