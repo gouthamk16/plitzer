@@ -10,6 +10,7 @@ on:
     paths:
       - .github/workflows/release.yml
       - pyproject.toml
+      - DESCRIPTION.md
       - Cargo.toml
       - Cargo.lock
       - plitzer-py/Cargo.toml
