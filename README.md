@@ -59,7 +59,7 @@ The design, its rationale and the decision log are in [docs/design.md](docs/desi
 
 ## TODO
 
-- [ ] **Benchmark baseline:** measure MosaicML Streaming and HF `datasets` on a FineWeb-Edu Parquet sample (conversion time, samples/s, CPU cores used, resume time)
+- [x] **Benchmark baseline:** measure MosaicML Streaming and HF `datasets` on a FineWeb-Edu Parquet sample (conversion time, samples/s, CPU cores used, resume time) (`plitzer.bench.baseline`, [design §5.14](docs/design.md#514-baseline-harness))
 - [x] **Ordering core:** shuffle row groups per epoch, split each window into lane slices, and shuffle each slice (`rand_chacha`). Property tests:
   - [x] each epoch yields every sample exactly once
   - [x] each lane's slice is one contiguous stretch of storage
