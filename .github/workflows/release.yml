@@ -1,20 +1,43 @@
 name: Release
 
 # Wheels and an sdist for PyPI. One abi3 wheel per platform covers every
-# CPython from 3.11. A pull request that changes this file builds and tests
-# them all; a v* tag also publishes them.
+# CPython from 3.11. A pull request that changes the packaging builds and
+# tests them all; a v* tag also publishes them.
 on:
   push:
     tags: ["v*"]
   pull_request:
-    paths: [".github/workflows/release.yml"]
+    paths:
+      - .github/workflows/release.yml
+      - pyproject.toml
+      - Cargo.toml
+      - Cargo.lock
+      - plitzer-py/Cargo.toml
+      - plitzer-py/python/**
   workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
+  version:
+    # First and cheap: the versions agree, and the changelog has an entry.
+    # On a tag, the tag must be that version too.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Versions
+        run: |
+          core=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          py=$(grep -m1 '^version' plitzer-py/Cargo.toml | cut -d'"' -f2)
+          [ "$core" = "$py" ] || { echo "plitzer $core, plitzer-py $py"; exit 1; }
+          grep -qx "## $py" CHANGELOG.md || { echo "CHANGELOG.md has no '## $py'"; exit 1; }
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "v$py" ]; then
+            echo "tag $GITHUB_REF_NAME, version $py"; exit 1
+          fi
+
   wheels:
+    needs: version
     strategy:
       fail-fast: false
       matrix:
@@ -55,6 +78,7 @@ jobs:
           path: dist
 
   sdist:
+    needs: version
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -80,11 +104,6 @@ jobs:
     permissions:
       id-token: write  # trusted publishing: PyPI trusts this workflow, no token
     steps:
-      - uses: actions/checkout@v4
-      - name: The tag is the Cargo version
-        run: |
-          want="v$(grep -m1 '^version' plitzer-py/Cargo.toml | cut -d'"' -f2)"
-          [ "$GITHUB_REF_NAME" = "$want" ] || { echo "tag $GITHUB_REF_NAME, Cargo $want"; exit 1; }
       - uses: actions/download-artifact@v4
         with:
           path: dist

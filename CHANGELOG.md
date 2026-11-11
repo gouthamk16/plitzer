@@ -2,7 +2,7 @@
 
 All notable changes to plitzer. The project follows [Semantic Versioning](https://semver.org/); until 1.0, a minor version can change the API or the checkpoint format. A checkpoint from another format version is refused with `CheckpointError`, never misread.
 
-## 0.1.0 (unreleased)
+## 0.1.0
 
 The first release.
 

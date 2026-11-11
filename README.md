@@ -81,6 +81,8 @@ The design, its rationale and the decision log are in [docs/design.md](https://g
 - [x] **Read amplification check:** measure bytes read per GPU on real data. Lane slices simulate at 1.01–1.25×. Add a per-node cache only if it's needed. Measured on FineWeb-Edu lengths: at the bound 1 + (world − 1)/W (1.013× at W = 512 on 8 GPUs), so no cache ([design §6](https://github.com/gouthamk16/plitzer/blob/main/docs/design.md#6-read-amplification))
 - [ ] **Benchmarks:** publish a comparison table against Mosaic and HF
 - [ ] **Release:** build wheels in CI and publish to PyPI
+  - [x] wheels for Linux, macOS and Windows and an sdist, each tested on its own OS, published by a `v*` tag (`.github/workflows/release.yml`)
+  - [ ] publish 0.1.0 to PyPI
 - [ ] **Stretch:** in-loader tokenization
 
 ## Known limits

@@ -4,7 +4,7 @@
 
 | Field | Value |
 |---|---|
-| Status | Active. It changes with each feature PR. The code is pre-alpha. |
+| Status | Active. It changes with each feature PR. The code is alpha, version 0.1.0. |
 | Last change | 2026-11-11, PR #28 |
 | Language standard | ASD-STE100 (Simplified Technical English) |
 | Code | `src/` at the commit of this file |
@@ -1211,7 +1211,8 @@ git tag v0.1.0 && git push --tags   # a release: the tag must be the Cargo versi
   - a wheel for Windows x64;
   - the sdist.
 - Each wheel goes into a new virtualenv on its own system, with no Rust and no source tree. `test_loader.py` and `test_export.py` then run against it. A wheel is also built from the sdist.
-- A pull request that changes the workflow runs the builds and the tests. A `v*` tag also runs the publish job. That job refuses a tag that is not the Cargo version, and publishes with PyPI trusted publishing, in the `pypi` environment (D-91).
+- The first job makes sure that the two crates have the same version and that `CHANGELOG.md` has a heading for it. On a tag, the tag must be `v` and that version. The builds start only after this check.
+- A pull request that changes the packaging (the workflow, `pyproject.toml`, the Cargo manifests, `Cargo.lock` or the Python source) runs the builds and the tests. A `v*` tag also runs the publish job, which publishes with PyPI trusted publishing, in the `pypi` environment (D-91).
 
 **Rationale:**
 
@@ -1229,6 +1230,7 @@ git tag v0.1.0 && git push --tags   # a release: the tag must be the Cargo versi
 
 | Check | Type | What it shows |
 |---|---|---|
+| `version` job | CI | The versions agree, the changelog has an entry, and a tag is that version. |
 | `wheels` job | CI | Each of the 4 wheels builds, installs into a new virtualenv, and passes `test_loader.py` and `test_export.py` on its own system. |
 | `sdist` job | CI | The sdist builds, and a wheel built from it imports and gives `plitzer.__version__`. |
 | `twine check` | Manual | The wheel and the sdist have valid metadata. The README renders, and both licence files are in the wheel. |
@@ -1391,7 +1393,7 @@ git tag v0.1.0 && git push --tags   # a release: the tag must be the Cargo versi
 | 2026-11-09 | #24 | Add `bytes_read` (`Reader`, `Session`, `Loader`) and `plitzer.bench` (section 5.13). Measure the read amplification on FineWeb-Edu lengths (section 6). Correct the bound to 1 + ⌈n/W⌉(world − 1)/n. |
 | 2026-11-11 | #25 | Add `plitzer.bench.baseline`, with adapters for MosaicML Streaming and HF `datasets` (section 5.14), and measure the baseline. |
 | 2026-11-11 | #26 | Lossless packing: lane slices are cut by slots (tokens and empty rows), so lanes take the same share of the tokens and stay together. Each step fills the sequence from the rest of the current piece and whole pieces, and lanes go on across epochs (`src/pack/lane.rs`, `src/pack/pieces.rs`). The reader checks the slots of each row group. Remove D, C, the pad token and `Batch.lengths`. The loader reads in window order with a budget for the reads ahead (`src/load/sequence.rs`, `prefetch.rs`, `buffer.rs`), and the replay is removed. Checkpoint version 2. `bytes_read` is live. |
-| 2026-11-11 | #28 | Add the release workflow (section 5.15): wheels for 4 platforms and an sdist, a test of each wheel on its own system, and PyPI trusted publishing on a `v*` tag. Move `pyproject.toml` to the root, with the README, the licences and the package metadata. Add `plitzer.__version__` and `CHANGELOG.md`. |
+| 2026-11-11 | #28 | Add the release workflow (section 5.15): a check of the versions and the changelog, wheels for 4 platforms and an sdist, a test of each wheel on its own system, and PyPI trusted publishing on a `v*` tag. Move `pyproject.toml` to the root, with the README, the licences and the package metadata. Add `plitzer.__version__` and `CHANGELOG.md`. |
 
 ## 10. Maintenance
 
