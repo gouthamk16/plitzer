@@ -19,25 +19,27 @@ def test_bytes_read_counts_each_epoch(make: MakeLoader, dataset: Path) -> None:
     loader = make()
     assert loader.bytes_read == 0, "nothing is read before the first step"
     whole = amplification.scan(dataset, "tokens").bytes
-    for epoch in (1, 2):
+    # The prefetch reads a few windows ahead, into the next epoch: each epoch
+    # reads one dataset, give or take what is read ahead at its two ends.
+    for epoch in (1, 2, 3):
         for _ in loader:
             pass
-        assert loader.bytes_read == epoch * whole
+        assert (epoch - 1) * whole <= loader.bytes_read <= (epoch + 1) * whole
 
 
 def settings(window: int) -> amplification.Settings:
     s = SETTINGS
-    return amplification.Settings(
-        s["lanes"], window, s["seq_len"], s["docs"], s["cap"], s["budget"]
-    )
+    return amplification.Settings(s["lanes"], window, s["seq_len"], s["budget"])
 
 
-def test_measure_one_gpu_reads_the_dataset(dataset: Path, tmp_path: Path) -> None:
+def test_measure_runs_every_rank(dataset: Path, tmp_path: Path) -> None:
+    # Documents of 0 to 18 tokens in sequences of 8: lanes drift far apart,
+    # and the fastest reads ahead into later epochs, so these amplifications
+    # are not exact. `test_measure_even_row_groups` checks exact values.
     cache = tmp_path / "index"
     one, two, four = amplification.measure(dataset, settings(3), [1, 2, 4], cache)
-    assert one.amplification == 1.0
     assert [len(w.per_gpu) for w in (one, two, four)] == [1, 2, 4]
-    assert two.amplification >= 1.0 and four.amplification >= 1.0
+    assert all(w.amplification >= 1.0 for w in (one, two, four))
     assert "| 3 | 4 |" in amplification.table([one, two, four])
 
 
@@ -77,7 +79,7 @@ def test_scan_and_bound(dataset: Path) -> None:
 def test_main_prints_a_row_for_each_run(
     dataset: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    args = "--lanes 4 --window 1 3 --worlds 1,2 --seq-len 8 --docs 2 --cap 10"
+    args = "--lanes 4 --window 1 3 --worlds 1,2 --seq-len 8"
     amplification.main([str(dataset), *args.split()])
     rows = capsys.readouterr().out.strip().splitlines()
     assert len(rows) == 2 + 4

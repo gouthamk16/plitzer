@@ -7,7 +7,6 @@ use std::sync::Arc;
 use object_store::ObjectStore;
 use object_store::path::Path;
 use plitzer::checkpoint::Config;
-use plitzer::pack::Packing;
 use pyo3::conversion::FromPyObjectOwned;
 use pyo3::exceptions::PyOverflowError;
 use pyo3::prelude::*;
@@ -81,35 +80,17 @@ pub struct Ints<'a, 'py> {
     pub lanes: &'a Bound<'py, PyAny>,
     pub window: &'a Bound<'py, PyAny>,
     pub seq_len: &'a Bound<'py, PyAny>,
-    pub docs: &'a Bound<'py, PyAny>,
-    pub cap: &'a Bound<'py, PyAny>,
-    pub pad: &'a Bound<'py, PyAny>,
 }
 
 /// The config from Python integers, each checked to fit.
 pub fn config(column: String, i: Ints<'_, '_>) -> PyResult<Config> {
-    let packing = Packing {
-        seq_len: int("seq_len", i.seq_len)?,
-        docs: int("docs", i.docs)?,
-        cap: int("cap", i.cap)?,
-        pad: pad(i.pad)?,
-    };
     Ok(Config {
         column,
         seed: int("seed", i.seed)?,
         lanes: int("lanes", i.lanes)?,
         window: int("window", i.window)?,
-        packing,
+        seq_len: int("seq_len", i.seq_len)?,
     })
-}
-
-/// The pad token as a `u32`. Batches reach Python as int32, so a negative
-/// pad, such as -1, means the token with the same bits.
-fn pad(value: &Bound<'_, PyAny>) -> PyResult<u32> {
-    match value.extract::<i32>() {
-        Ok(negative) if negative < 0 => Ok(negative as u32),
-        _ => int("pad", value),
-    }
 }
 
 /// The store and prefix of `location`, and the index cache: `cache`, else

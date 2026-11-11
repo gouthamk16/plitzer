@@ -22,7 +22,7 @@ import plitzer
 loader = plitzer.Loader(
     "s3://bucket/fineweb-edu",          # or a local folder
     seed=0, lanes=512, window=64,        # B lanes, W row groups per window
-    seq_len=2048, docs=4, cap=4096, pad=0,
+    seq_len=2048,                        # every row is 2048 real tokens: none dropped, no padding
     budget=8 << 30,                      # bytes of decoded row groups kept in memory
                                          # (4 per token + 8 per document)
     rank=0, world=8,                     # this GPU, of 8
@@ -30,7 +30,6 @@ loader = plitzer.Loader(
 while loader.epoch < 3:                  # also right after loader.resume(state)
     for batch in loader:                 # the rest of this epoch; then epoch + 1
         tokens = np.from_dlpack(batch.tokens)    # or torch.from_dlpack, or pyarrow.array
-        lengths = np.from_dlpack(batch.lengths)  # real tokens in each row
         ...
     state = loader.checkpoint()          # this GPU's part; plitzer.merge(parts) joins all GPUs
 ```
@@ -42,7 +41,7 @@ from torch.utils.data import DataLoader
 import plitzer.torch
 
 dataset = plitzer.torch.Dataset("s3://bucket/fineweb-edu", seed=0, lanes=512, window=64,
-                                seq_len=2048, docs=4, cap=4096, pad=0, budget=8 << 30)
+                                seq_len=2048, budget=8 << 30)
 loader = DataLoader(dataset, batch_size=None, num_workers=0)  # each item is one step
 while dataset.epoch < 3:                 # also right after dataset.load_state_dict(state)
     for batch in loader:                 # batch.tokens: (lanes per GPU, seq_len) int32
@@ -64,9 +63,10 @@ The design, its rationale and the decision log are in [docs/design.md](docs/desi
   - [x] each epoch yields every sample exactly once
   - [x] each lane's slice is one contiguous stretch of storage
   - [x] a saved reference output matches on every OS
-- [x] **Lanes:** pack each lane's documents into fixed-length sequences, carry leftover tokens, and checkpoint each lane's state. Property tests:
+- [x] **Lanes:** pack each lane's documents into fixed-length sequences, and checkpoint each lane's position. Property tests:
   - [x] resuming at step k matches the tail of an uninterrupted run
   - [x] global batches are identical across GPU counts
+- [x] **Lossless packing:** fill each sequence from the rest of the current document and whole documents, with lanes running on across epochs, so no token is dropped or padded (was 19.3% lost on FineWeb-Edu lengths)
 - [x] **Index:** build a row-group index from Parquet footers, with caching
 - [x] **I/O:** async reads with `object_store` (local disk and S3, tested against versitygw), plus a prefetch queue capped by bytes
   - [x] read one row group's token column without its footer (local disk and S3)

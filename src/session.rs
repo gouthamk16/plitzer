@@ -122,10 +122,15 @@ impl Session {
     /// session's epoch, and does nothing otherwise. Trainers call this at the
     /// start of each epoch, also the one they resumed into, and a checkpoint
     /// after an epoch's last step is already at the next epoch. Going back
-    /// would repeat data with no error; open a new session to do that. The
-    /// lanes start at the first document of `epoch`.
+    /// would repeat data with no error; open a new session to do that.
+    ///
+    /// Right after the last step of an epoch, the next epoch is where the
+    /// session goes anyway, and the lanes run on into it. Any other later
+    /// epoch is a jump: the lanes start at its first document.
     pub fn set_epoch(&mut self, epoch: u64) {
-        if epoch > self.epoch {
+        if self.ended() && epoch == self.epoch + 1 {
+            (self.epoch, self.step) = (epoch, 0);
+        } else if epoch > self.epoch {
             let start = Position {
                 epoch,
                 doc: 0,
@@ -233,6 +238,11 @@ impl Session {
     /// `open`, in every epoch.
     pub fn bytes_read(&self) -> u64 {
         self.reader.bytes_read()
+    }
+
+    /// The counter of `bytes_read`, to read without the session.
+    pub fn bytes_counter(&self) -> Arc<std::sync::atomic::AtomicU64> {
+        self.reader.bytes_counter()
     }
 
     fn positions(&self) -> Vec<Position> {

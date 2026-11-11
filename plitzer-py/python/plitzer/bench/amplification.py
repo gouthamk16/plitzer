@@ -8,14 +8,15 @@ groups in ceil(n/W) windows, at most 1 + ceil(n/W)(world - 1)/n, which is
 about 1 + (world - 1)/W.
 
     python -m plitzer.bench.amplification DATA --lanes 512 --window 64 \\
-        --worlds 1,8,64 --seq-len 2048 --docs 2 --cap 2048
+        --worlds 1,8,64 --seq-len 2048
 
 DATA is a local folder of Parquet files. Each rank runs in turn in this
-process, for epoch 0.
+process, for epochs 0 and 1, and counts the bytes of epoch 1.
 """
 
 import argparse
 import tempfile
+import time
 from collections.abc import Sequence
 from pathlib import Path
 from typing import NamedTuple
@@ -31,8 +32,6 @@ class Settings(NamedTuple):
     lanes: int
     window: int
     seq_len: int
-    docs: int
-    cap: int
     budget: int
     seed: int = 0
     column: str = "tokens"
@@ -84,7 +83,9 @@ def scan(location: Path, column: str) -> Dataset:
 def rank_bytes(
     location: Path, settings: Settings, rank: int, world: int, cache: Path
 ) -> int:
-    """The bytes that rank ``rank`` of ``world`` fetches in epoch 0."""
+    """The bytes that rank ``rank`` of ``world`` fetches in one epoch: its
+    second, so that the windows that the prefetch reads into the next epoch
+    count once at each end."""
     s = settings
     loader = plitzer.Loader(
         location,
@@ -92,9 +93,6 @@ def rank_bytes(
         lanes=s.lanes,
         window=s.window,
         seq_len=s.seq_len,
-        docs=s.docs,
-        cap=s.cap,
-        pad=0,
         budget=s.budget,
         column=s.column,
         cache=cache,
@@ -103,7 +101,21 @@ def rank_bytes(
     )
     for _ in loader:
         pass
-    return loader.bytes_read
+    first = settled(loader)
+    for _ in loader:
+        pass
+    return settled(loader) - first
+
+
+def settled(loader: plitzer.Loader) -> int:
+    """`bytes_read` once the prefetch stops: it reads a fixed number of
+    windows past the slowest lane, so the count it stops at depends only on
+    where the lanes stand, not on how fast the reads were."""
+    last = -1
+    while loader.bytes_read != last:
+        last = loader.bytes_read
+        time.sleep(0.05)
+    return last
 
 
 def measure(
@@ -146,8 +158,6 @@ def main(argv: Sequence[str] | None = None) -> None:
         "--worlds", type=lambda v: [int(w) for w in v.split(",")], required=True
     )
     p.add_argument("--seq-len", type=int, required=True)
-    p.add_argument("--docs", type=int, required=True)
-    p.add_argument("--cap", type=int, required=True)
     p.add_argument("--budget", type=int, default=8 << 30)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--column", default="tokens")
@@ -155,9 +165,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     results = []
     with tempfile.TemporaryDirectory() as tmp:
         for window in a.window:
-            s = Settings(
-                a.lanes, window, a.seq_len, a.docs, a.cap, a.budget, a.seed, a.column
-            )
+            s = Settings(a.lanes, window, a.seq_len, a.budget, a.seed, a.column)
             results.extend(measure(a.data, s, a.worlds, Path(tmp, "index")))
     print(table(results))
 

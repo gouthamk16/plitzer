@@ -197,28 +197,33 @@ def fnv1a(data: bytes) -> int:
 
 
 def test_resume_refuses_a_hand_made_checkpoint(make: MakeLoader) -> None:
-    """Checksummed bytes with lane states that no run makes are refused at
-    resume, with nothing changed, never a panic."""
+    """Checksummed bytes with a lane position that no run makes are refused,
+    with nothing changed, never a panic."""
     loader = make()
     for _ in range(3):
         next(loader)
     good = loader.checkpoint()
-    # The last lane state is 20 bytes (step u64, doc u64, offset u32) before
-    # the 8-byte checksum; move its leftover start back to doc 0.
+    # The last lane is 20 bytes (epoch u64, doc u64, offset u32) before the
+    # 8-byte checksum.
     at = len(good) - 8 - 20
-    doc = int.from_bytes(good[at + 8 : at + 16], "little")
-    refused = 0
-    for start in range(doc):
+
+    def with_lane(doc: int, offset: int) -> bytes:
         body = bytearray(good[:-8])
-        body[at + 8 : at + 20] = start.to_bytes(8, "little") + bytes(4)
-        bad = bytes(body) + fnv1a(bytes(body)).to_bytes(8, "little")
-        try:
-            loader.resume(bad)
-        except plitzer.CheckpointError:
-            refused += 1
-            assert loader.checkpoint() == good, "a refused resume changes nothing"
-        loader.resume(good)
-    assert refused > 0
+        body[at + 8 : at + 20] = doc.to_bytes(8, "little") + offset.to_bytes(
+            4, "little"
+        )
+        return bytes(body) + fnv1a(bytes(body)).to_bytes(8, "little")
+
+    with pytest.raises(plitzer.CheckpointError, match="past its"):
+        loader.resume(with_lane(10**6, 0))
+    assert loader.checkpoint() == good, "a refused resume changes nothing"
+    # An offset past its document is found at the next step, with its tokens.
+    doc = int.from_bytes(good[at + 8 : at + 16], "little")
+    loader.resume(with_lane(doc, 10**6))
+    with pytest.raises(plitzer.CheckpointError, match="past its document"):
+        next(loader)
+    loader.resume(good)
+    assert loader.checkpoint() == good
 
 
 def test_bad_settings(make: MakeLoader, tmp_path: Path) -> None:
@@ -235,8 +240,8 @@ def test_bad_settings(make: MakeLoader, tmp_path: Path) -> None:
     with pytest.raises(plitzer.ConfigError, match="lanes must be an int, not float"):
         # Also with a bad location: the settings are checked first.
         make(lanes=4.0, storage_options={"region": "x"})  # type: ignore[arg-type]
-    with pytest.raises(plitzer.ConfigError, match="docs must be an int, not bool"):
-        make(docs=True)
+    with pytest.raises(plitzer.ConfigError, match="seq_len must be an int, not bool"):
+        make(seq_len=True)
     make().set_epoch(np.int64(1))  # has __index__
 
     with pytest.raises(plitzer.ConfigError, match="seed must be an int, not type"):

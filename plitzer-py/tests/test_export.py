@@ -16,17 +16,13 @@ if TYPE_CHECKING:
     from typing_extensions import CapsuleType
 
 
-def test_batch_shapes_and_padding(make: MakeLoader) -> None:
+def test_batch_shape(make: MakeLoader) -> None:
     batch = next(make())
     assert batch.tokens is batch.tokens
     assert batch.tokens.shape == (4, 8)
-    assert batch.lengths.shape == (4,)
     tokens = np.from_dlpack(batch.tokens)
-    lengths = np.from_dlpack(batch.lengths)
-    assert tokens.dtype == np.int32 and lengths.dtype == np.int32
-    for row, n in zip(tokens, lengths, strict=True):
-        assert (row[n:] == -1).all(), "pad 2**32 - 1 reads as -1"
-        assert (row[:n] >= 0).all()
+    assert tokens.dtype == np.int32
+    assert (tokens >= 0).all(), "every row is full: there is no pad token"
 
 
 class Legacy:
@@ -40,12 +36,6 @@ class Legacy:
 
     def __dlpack_device__(self) -> tuple[int, int]:
         return self.array.__dlpack_device__()
-
-
-def test_negative_pad_is_the_same_token(make: MakeLoader) -> None:
-    a = np.from_dlpack(next(make(pad=-1)).tokens)
-    b = np.from_dlpack(next(make(pad=2**32 - 1)).tokens)
-    assert np.array_equal(a, b) and (a == -1).any()
 
 
 def test_dlpack_versioned_and_legacy(make: MakeLoader) -> None:
@@ -107,6 +97,3 @@ def test_arrow_export(make: MakeLoader) -> None:
     assert isinstance(tokens.type, pa.FixedShapeTensorType)
     assert tokens.type.shape == [8]
     assert np.array_equal(tokens.to_numpy_ndarray(), np.from_dlpack(batch.tokens))
-    lengths = pa.array(batch.lengths)
-    assert lengths.type == pa.int32()
-    assert np.array_equal(lengths.to_numpy(), np.from_dlpack(batch.lengths))

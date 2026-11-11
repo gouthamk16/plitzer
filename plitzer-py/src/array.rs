@@ -132,27 +132,16 @@ impl Array {
     }
 }
 
-/// One step of one GPU: a sequence of L tokens per lane, and the count of
-/// real (not pad) tokens in each.
+/// One step of one GPU: a sequence of exactly L tokens per lane.
 #[pyclass(module = "plitzer._plitzer", frozen)]
 pub struct Batch {
     #[pyo3(get)]
     tokens: Py<Array>,
-    #[pyo3(get)]
-    lengths: Py<Array>,
 }
 
 impl Batch {
-    pub fn new(
-        py: Python<'_>,
-        tokens: Vec<u32>,
-        lengths: Vec<u32>,
-        seq_len: usize,
-    ) -> PyResult<Self> {
-        let lanes = lengths.len();
-        Ok(Batch {
-            tokens: Py::new(py, Array::new(tokens, vec![lanes, seq_len], "tokens"))?,
-            lengths: Py::new(py, Array::new(lengths, vec![lanes], "lengths"))?,
-        })
+    pub fn new(py: Python<'_>, tokens: Vec<u32>, lanes: usize, seq_len: usize) -> PyResult<Self> {
+        let tokens = Py::new(py, Array::new(tokens, vec![lanes, seq_len], "tokens"))?;
+        Ok(Batch { tokens })
     }
 }

@@ -5,7 +5,7 @@
 | Field | Value |
 |---|---|
 | Status | Active. It changes with each feature PR. The code is pre-alpha. |
-| Last change | 2026-11-09, PR #24 |
+| Last change | 2026-11-11, PR #26 |
 | Language standard | ASD-STE100 (Simplified Technical English) |
 | Code | `src/` at the commit of this file |
 
@@ -64,12 +64,9 @@ Each term has only one definition in this document.
 | world | The number of GPUs. |
 | rank | The position of one GPU, from 0 to world − 1. |
 | Step | One global batch. Each lane supplies one sequence per step. |
-| D | The number of documents that a lane takes at each step. |
-| Leftover | The tokens that a lane took but did not put into a sequence yet. |
-| C | The cap: the maximum number of leftover tokens that a lane keeps after a step. |
-| Cursor | The number of documents that a lane took in the epoch before a step. |
-| Lane state | The checkpoint of one lane: the next step and the position where its leftover starts, as `(step, doc, offset)`. |
-| Pad token | The token that fills the end of a sequence that has too few tokens. |
+| S | The number of steps in an epoch: ⌈T/(B·L)⌉, where T is the number of tokens in the dataset. |
+| Stream | The documents of one lane: its slices of the windows of epoch e, then of epoch e + 1, and so on. |
+| Position | The place of a lane in its stream, as `(epoch, doc, offset)`: token `offset` of its document `doc` of epoch `epoch`. A checkpoint holds one position for each lane. |
 | Key | The 32-byte seed of one shuffle. Only `seed::key` makes a key. |
 | Read amplification | The bytes that one GPU reads, divided by the bytes of its own data. |
 | Prefix | The folder or key prefix in the store below which the dataset files are. |
@@ -77,7 +74,6 @@ Each term has only one definition in this document.
 | ETag | A version tag that the store gives to each file. It changes when the file changes. |
 | Fingerprint | A 64-bit hash of the index without the ETags. |
 | Budget | The most bytes of decoded tokens that the loader of one GPU keeps in memory. |
-| Need plan | The list of row groups that one GPU needs, each with the first and last step that needs it. |
 | Token column | The Parquet column that holds the tokens of each document as a list of integers. |
 | Checkpoint part | The checkpoint of the lanes of one GPU. |
 | Global checkpoint | A checkpoint that holds all B lanes. It resumes on each GPU count. |
@@ -90,15 +86,15 @@ Each term has only one definition in this document.
 
 | Id | Requirement | Verification | Status |
 |---|---|---|---|
-| REQ-1 | The order is a pure function of `(seed, epoch, step)` and the index. | Golden tests in `shuffle`, `seed`, `order` and `pack`. | Met for the order and the packer |
-| REQ-2 | Each epoch supplies each document exactly once. The only exception is leftover tokens that a lane drops at its cap. | `order::exactly_once` and `pack::exactly_once_tokens` (property tests). | Met for the order and the packer |
+| REQ-1 | The order is a pure function of `(seed, epoch)` and the index, and the sequences are a pure function of the order and the tokens. | Golden tests in `shuffle`, `seed`, `order` and `pack`. | Met for the order and the packer |
+| REQ-2 | Each epoch of the order holds each document exactly once. The sequences hold each token of each lane's stream, in order, and no pad token: no token is lost. | `order::exactly_once` and `pack::lossless` (property tests). | Met |
 | REQ-3 | Lanes and their slices depend only on `(seed, epoch, B, W)`. They do not depend on world. | `Order` has no world input. `order::gpu_lanes_partition` (property test). | Met |
-| REQ-4 | A resume at step k gives the same tail as a run without a stop. This is also true when world changes. | `pack::resume_matches_tail` and `pack::world_invariant` (property tests). `session::resume_on_another_world_matches_one_run` reads Parquet files through checkpoint bytes. `test_kill_and_resume_on_another_world` and `test_kill_and_resume_with_torch` kill a training run of real processes at a random step and resume it on another number of processes (sections 5.11 and 5.12). | Met |
+| REQ-4 | A resume at step k gives the same tail as a run without a stop. This is also true when world changes. | `pack::resume_matches_tail` (property test) and `load::resume_matches_tail`. `session::resume_on_another_world_matches_one_run` reads Parquet files through checkpoint bytes. `test_kill_and_resume_on_another_world` and `test_kill_and_resume_with_torch` kill a training run of real processes at a random step and resume it on another number of processes (sections 5.11 and 5.12). | Met |
 | REQ-5 | The output is the same on Linux, macOS and Windows. | CI runs the golden tests on the three systems. | Met |
-| REQ-6 | Read amplification is 1 + ⌈n/W⌉(world − 1)/n or less, in row groups, for n row groups: approximately 1 + (world − 1)/W. | The reader reads no footer (`read::reads_without_footer`). Each GPU reads only its own slices (`load::reads_only_own_row_groups`), each one time (`load::each_gpu_reads_its_plan_once`). Measurement on FineWeb-Edu lengths (section 6). | Met |
+| REQ-6 | Read amplification is 1 + ⌈n/W⌉(world − 1)/n or less, in row groups, for n row groups: approximately 1 + (world − 1)/W. | The reader reads no footer (`read::reads_without_footer`). Each GPU reads only the windows that its lanes reach, each one time (`load::each_window_is_read_once`). Measurement on FineWeb-Edu lengths (section 6). | Met |
 | REQ-7 | A dependency upgrade does not change the order without a test failure. | Golden tests pin the shuffle output and the key bytes. | Met |
 | REQ-8 | A start with an unchanged dataset reads no Parquet footers. | `index::open_uses_cache_without_footers`. | Met |
-| REQ-9 | The decoded tokens in memory stay at or below the budget, and a budget that the loader accepts never stops it. | `load::budget_is_checked_and_kept`. | Met |
+| REQ-9 | The reads ahead stay at or below the budget, and a budget that the loader accepts never stops it. | `load::one_window_of_budget_is_enough`, `load::a_budget_below_one_window_is_refused` and `load::passed_windows_are_evicted`. | Met |
 | REQ-10 | A resume with different settings or a different dataset stops with an error that names the field. | `checkpoint::check_names_the_field` and `session::resume_refuses_other_runs`. | Met |
 | REQ-11 | Python reads each batch without a copy, through DLPack and Arrow. | `test_dlpack_versioned_and_legacy`, `test_arrow_export` and `test_data_outlives_the_batch_and_the_loader`. | Met |
 | REQ-12 | Input from Python gives a Python exception, never a panic or a wait with no end. | `test_bad_settings`, `test_resume_refuses_other_runs` and `test_forked_child_makes_its_own_loader`. Manual tests: Ctrl-C during a stopped S3 read gives `KeyboardInterrupt` in 0.51 s. A SIGUSR1 handler that calls `checkpoint()` during a stopped S3 read saves a complete checkpoint. | Met |
@@ -123,10 +119,10 @@ flowchart LR
 | Shuffle | `src/shuffle.rs` | Implemented | [5.1](#51-shuffle) |
 | Seed key | `src/seed.rs` | Implemented | [5.2](#52-seed-key) |
 | Order | `src/order.rs` | Implemented | [5.3](#53-order) |
-| Pack | `src/pack.rs`, `src/pack/replay.rs` | Implemented | [5.4](#54-pack) |
+| Pack | `src/pack.rs`, `src/pack/stream.rs` | Implemented | [5.4](#54-pack) |
 | Index | `src/index.rs` | Implemented | [5.5](#55-index) |
 | Read | `src/read.rs` | Implemented | [5.6](#56-read) |
-| Loader | `src/load.rs`, `src/load/plan.rs`, `src/load/replay.rs` | Implemented | [5.7](#57-loader) |
+| Loader | `src/load.rs`, `src/load/sequence.rs`, `src/load/prefetch.rs`, `src/load/buffer.rs` | Implemented | [5.7](#57-loader) |
 | Checkpoint | `src/checkpoint.rs` | Implemented | [5.8](#58-checkpoint) |
 | Session | `src/session.rs` | Implemented | [5.9](#59-session) |
 | Store | `src/store.rs`, `src/store/s3.rs` | Implemented | [5.10](#510-store) |
@@ -297,111 +293,89 @@ The property tests use small inputs. Thus empty row groups, empty lanes and shor
 
 ### 5.4 Pack
 
-**Function:** The pack module makes one sequence of L tokens for each lane at each step. It also gives the state of each lane for a checkpoint, and makes a lane again from that state.
+**Function:** The pack module makes one sequence of exactly L tokens for each lane at each step. It drops no token and adds no pad token. It also gives the position of each lane for a checkpoint, and makes a lane again from that position.
 
 **Interface:**
 
 ```rust
-pub trait Tokens { fn tokens(&self, doc: Doc) -> &[u32]; }
+pub trait Tokens { fn tokens(&self, doc: Doc) -> Option<&[u32]>; }  // None: not in memory
 
-pub struct Packing {
-    pub seq_len: u32, // L
-    pub docs: u32,    // D
-    pub cap: u32,     // C
-    pub pad: u32,     // pad token
+pub struct Position { pub epoch: u64, pub doc: u64, pub offset: u32 }
+
+pub struct Orders { pub seed: u64, pub lanes: u32, pub window: u32, pub seq_len: u32, /* rows, epochs */ }
+pub struct Epoch { pub number: u64, /* the order inputs, windows */ }
+pub struct Lane { /* private: lane, stream, offset */ }
+pub enum Need { Ready, Missing { slice: (u64, usize), doc: Doc }, Bad(String), Empty(String) }
+
+impl Orders {
+    pub fn new(seed: u64, lanes: u32, window: u32, seq_len: u32, rows: &[u32]) -> Arc<Orders>;
+    pub fn epoch(&self, number: u64) -> Arc<Epoch>;   // made once, shared by the lanes in it
 }
-
-pub struct LaneState { pub step: u64, pub doc: u64, pub offset: u32 }
-
-pub struct Epoch { /* private: a copy of the order inputs, packing, windows, steps */ }
-pub struct Lane { /* private: Arc<Epoch>, ... */ }
-
 impl Epoch {
-    pub fn new(order: Order<'_>, packing: Packing) -> Self;
     pub fn order(&self) -> Order<'_>;
     pub fn windows(&self) -> &[Window];
-    pub fn packing(&self) -> Packing;
-    pub fn steps(&self) -> u64;
     pub fn lane_docs(&self, lane: u32) -> u64;
-    pub fn lane(self: &Arc<Self>, lane: u32, state: LaneState, tokens: &impl Tokens)
-        -> Result<Lane, String>;   // Err for a state that no run makes
-    pub fn replay(self: &Arc<Self>, lane: u32, state: LaneState) -> Result<Replay, String>;
-    pub fn check(&self, lane: u32, state: LaneState) -> Result<u64, String>;  // lane, step and leftover in range, no leftover after the last step; the cursor
-}
-impl Replay {   // a lane before its leftover is replayed
-    pub fn part(&mut self) -> &[Doc];      // the next documents of the leftover, in one window
-    pub fn take(&mut self, tokens: &impl Tokens, n: u64) -> Result<(), String>;  // the next n documents; Err past the cap
-    pub fn finish(self) -> Result<Lane, String>;           // Err if documents are left
 }
 impl Lane {
-    pub fn fill(&mut self, tokens: &impl Tokens, out: &mut [u32]) -> u32;
-    pub fn state(&self) -> LaneState;
+    pub fn new(orders: &Arc<Orders>, lane: u32, at: Position) -> Result<Lane, String>;
+    pub fn position(&self) -> Position;
+    pub fn slice(&self) -> (u64, usize);                    // (epoch, window) of the current document
+    pub fn need(&self, tokens: &impl Tokens) -> Need;       // what the next sequence needs; no change
+    pub fn fill(&mut self, tokens: &impl Tokens, out: &mut [u32]);
 }
 ```
 
-**Design:** The documents of a lane in an epoch are its slices from `Order::lane`, window after window. `Lane::fill` does these steps:
+**Design:** The stream of a lane is its slices from `Order::lane` in each window of epoch 0, then in each window of epoch 1, and so on. A position `(epoch, doc, offset)` is token `offset` of the `doc`-th document of the stream in `epoch`.
 
-1. Take the next D documents and add their tokens to the leftover.
-2. Copy the first L tokens of the leftover into `out`. Fill the remainder of `out` with the pad token.
-3. If the leftover has more than C tokens, remove the oldest tokens until C tokens remain.
-4. Return the number of real tokens in `out`.
+`Lane::fill` does these steps:
 
-The cursor before step s is `min(s·D, lane_docs)`. It is a function of the step, so a checkpoint does not store it (D-14). The leftover is always the tokens from `(doc, offset)` to the cursor. Thus the lane state is sufficient to make the lane again.
+1. Copy the remaining tokens of the current document into `out`.
+2. Copy the next documents, one after the other, until `out` holds L tokens.
+3. Stop in the last document at the token after the last one copied. That is the new position.
 
-`Epoch::lane` makes each lane, also at the start of an epoch (the default state, at step 0). It reads the documents from the lane state to the cursor again, and removes the first `offset` tokens.
+Each token is copied one time, from its row group to `out`, with one copy for each part of a document. A document can end in one sequence and continue in the next. An empty document gives no token, and the lane goes to the next document. At the end of the lane's documents of an epoch, the lane goes on to its first document of the next epoch (D-79).
 
-The epoch has `ceil(max lane_docs / D) + ceil(C / L)` steps, or 0 steps if it has no documents. The last `ceil(C / L)` steps empty all leftovers. A lane with no tokens supplies a sequence of pad tokens.
+`Lane::need` does the same steps without a change to the lane. It gives `Ready` if all tokens of the next sequence are in memory. Else it gives the first document that is not in memory, and its window. The loader uses `need` before `fill`, so `fill` never waits (section 5.7).
 
-**Example:** L is 4, D is 2 and C is 3. Lane 1 takes these documents, with these tokens:
+`Orders::epoch` makes the windows of an epoch one time and shares them with each lane in that epoch. Lanes cross the end of an epoch at different steps, so two epochs can be in use at the same time.
 
-```text
-document   0        1           2           3          4
-tokens     19 20    21 ... 27   13 ... 18   3 ... 7    (none)
-```
+**Example:** L is 4. A lane takes documents of 3, 5, 0 and 6 tokens: `a1 a2 a3`, `b1 ... b5`, the empty document, `c1 ... c6`.
 
-| Step | Sequence | Dropped | Lane state after |
-|---|---|---|---|
-| 0 | 19 20 21 22 | 23 24 | (1, 1, 4) |
-| 1 | 25 26 27 13 | 14 ... 18, 3, 4 | (2, 3, 2) |
-| 2 | 5 6 7 pad | — | (3, 5, 0) |
-| 3 | pad pad pad pad | — | (4, 5, 0) |
-
-At step 0, the leftover has 9 tokens. The lane copies 4 tokens. Then it removes 23 and 24, so that C = 3 tokens remain.
+| Step | Sequence | Position after |
+|---|---|---|
+| 0 | a1 a2 a3 b1 | (e, 1, 1) |
+| 1 | b2 b3 b4 b5 | (e, 3, 0) |
+| 2 | c1 c2 c3 c4 | (e, 3, 4) |
+| 3 | c5 c6, then the first 2 tokens of the next document | ... |
 
 **Rationale:**
 
-- The cap removes the oldest tokens. Thus the leftover is one continuous run of tokens that ends at the cursor, and `(doc, offset)` can describe it (D-12).
-- The last `ceil(C / L)` steps empty the leftovers. Thus the cap is the only cause of dropped tokens, and the epoch length does not depend on token counts (D-13).
+- Each step takes tokens until the sequence is full, not a fixed number of documents. A fixed number of documents cannot give L tokens on average: the leftover then grows or empties as a random walk, so a cap drops tokens or a lane pads. On FineWeb-Edu lengths with D = 2 and C = L = 2048, the fixed packer dropped 19.3 % of the tokens (D-77).
+- The leftover is always the rest of one document. Thus `(doc, offset)` describes it, and a resume reads only the document of each lane, not a replay of many documents (D-78).
+- A lane goes on into the next epoch, so no lane waits or pads at the end of an epoch (D-79).
+- `need` and `fill` are two calls. `need` finds each document that the step needs while the lane does not change, so the loader can wait for reads and be cancel safe (D-80).
 - The pack module reads tokens through the `Tokens` trait. The loader implements it with the row groups in memory, and the tests use a corpus in memory (D-16).
-- The lane state holds its step. Thus a caller cannot give the state of one step with a different step (D-17).
-- `fill` writes into a buffer from the caller. The Python stage can then give one buffer of B/world × L tokens to each GPU, with no copy (D-15).
-- Each `Lane` reads the windows of its `Epoch`. Thus the row group shuffle occurs one time for each epoch, not one time for each lane.
 
 **Limits:**
 
-- If D documents have many more than L + C tokens, the sequences are mostly the ends of documents. The cap removes the starts (section 7).
 - The packer adds no tokens between documents. The `Tokens` source must add an EOS token if the model needs one.
 - A document can have a maximum of `u32::MAX` tokens.
-- A checkpoint is correct only with the same `Order` and `Packing` values. The checkpoint struct must store them (section 5.8).
-- `Epoch::new` panics if L or D is 0. `fill` panics if `out` does not have L tokens, or after the last step. `Epoch::lane` panics if the step or the state is not possible (D-11).
+- A lane that finds no token in two whole epochs gives `Need::Empty`. This occurs only when a dataset has fewer documents or tokens than the lanes need.
+- `Orders::new` panics if B, W or L is 0. `fill` panics if `out` does not have L tokens, or if `need` did not give `Ready` (D-11).
 
 **Verification:**
 
 | Test | Type | What it shows |
 |---|---|---|
-| `resume_matches_tail` | Property | For each lane and step k, a lane made from the state at step k supplies the same sequences as the run without a stop. |
-| `replay_in_parts` | Property | A leftover replayed one document at a time, and one `part` at a time, gives the same lane as one replay of all of it. Each part is in one window and is what `take` then takes. `finish` before the last document gives an error. |
-| `empty_start_stops_at_once` | Unit | A state on an empty document gives the error "does not start on a document" after one document. |
-| `far_behind_state_stops_early` | Unit | A state 10 documents behind its cursor with C = 8 gives the cap error after 3 documents. |
-| `world_invariant` | Property | B is 12. A run with world a, a stop at step k and a resume with world b gives the global batches of world 1. |
-| `exactly_once_tokens` | Property | The real tokens of each sequence are one continuous run of the lane stream, and the runs go forward. With a large C, all lanes together supply each token exactly once. |
-| `cap_and_padding` | Property | Pad tokens occur only at the end. The leftover is never more than C. A short sequence occurs only with an empty leftover. At the end of the epoch, each lane state is `(lane_docs, 0)`. |
-| `golden` | Unit | The example above, and a hash over 60 row groups, is the same on each OS. |
-| `*_panics` | Unit | Each invalid input in the limits causes a panic. |
-| `leftover_after_the_last_step_is_refused` | Unit | A state at the last step with a leftover gives an error: its tokens would never be emitted. |
-| `lane_out_of_range_is_refused` | Unit | `check` and `lane` give an error, not a panic, for a lane that is not in the order. |
+| `lossless` | Property | The sequences of each lane, joined, are its stream: each token of each document, in order, across epoch ends. No token is dropped and no pad token occurs. |
+| `resume_matches_tail` | Property | For each lane and step k, a lane made from the position after step k supplies the same sequences as the run without a stop. |
+| `need_names_the_first_missing_document` | Unit | With one row group out of memory, `need` gives the first document of the stream in it, and `Ready` with all row groups. |
+| `a_lane_with_no_tokens_is_an_error` | Unit | A lane with no document, or with only empty documents, gives `Need::Empty`. |
+| `bad_positions_are_refused` | Unit | A document past the lane's documents, an offset at the end of the epoch and a lane out of range give an error. An offset past its document gives `Need::Bad`. |
+| `golden` | Unit | Two lanes over a small corpus give their streams. A hash over 60 row groups is the same on each OS. |
+| `wrong_out_len_panics` | Unit | An `out` of the wrong length causes a panic. |
 
-The property tests use small inputs. Thus empty documents, empty lanes, C = 0, C < L and L = 1 occur frequently.
+The property tests use small inputs. Thus empty documents, empty lanes, documents longer than L, L = 1 and steps across many epochs occur frequently.
 
 ### 5.5 Index
 
@@ -597,120 +571,96 @@ After step 3, `read` adds the length of the fetched chunk to an atomic counter. 
 
 ### 5.7 Loader
 
-**Function:** The loader runs the lanes of one GPU. It reads the row groups of these lanes before the lanes need them, and it keeps the decoded tokens in memory below a byte limit. For each step, it gives one sequence for each lane.
+**Function:** The loader runs the lanes of one GPU. It reads the row groups of these lanes before the lanes need them, and it keeps the decoded tokens in memory near the byte budget. For each step, it gives one sequence of L tokens for each lane.
 
 **Interface:**
 
 ```rust
-pub struct Loader { /* private: epoch, lanes, needs, buffer, arrivals, held, driver */ }
+pub struct Loader { /* private: orders, lanes, buffer, arrivals, pending, demand, slowest, driver */ }
 
 impl Loader {
-    pub async fn new(epoch: Arc<Epoch>, reader: Arc<Reader>, index: Arc<Index>,
-                     lanes: Range<u32>, states: &[LaneState], budget: u64) -> Result<Loader, Error>;
-    pub async fn next(&mut self, out: &mut [u32]) -> Result<Option<Vec<u32>>, Error>;
-    pub fn ended(&self) -> bool;               // true after the last step of the epoch
-    pub fn states(&self) -> Vec<LaneState>;   // the part of the checkpoint for this GPU
+    pub fn new(orders: Arc<Orders>, reader: Arc<Reader>, index: Arc<Index>,
+               lanes: Range<u32>, at: &[Position], budget: u64) -> Result<Loader, Error>;
+    pub async fn next(&mut self, out: &mut [u32]) -> Result<(), Error>;
+    pub fn positions(&self) -> Vec<Position>;   // the part of the checkpoint for this GPU
     pub fn resident_bytes(&self) -> usize;
 }
 
-pub enum Error { Budget { needed, budget }, Read(read::Error), Join(..), Stopped, State(String) }
+pub enum Error { Budget { needed, budget }, Read(read::Error), Join(..), Stopped, State(String), Empty(String) }
 ```
 
 The caller gives `lanes = gpu_lanes(B, world, rank)`. Thus the loader does not know world.
 
-**Design:** `Loader::new` makes a need plan for its lanes:
+**Design:** The read order of a GPU is the row groups that its lanes take from, window by window, epoch after epoch. The key of a read is `(epoch, window, position in the window)`. Keys grow along the order. A lane takes tokens at its own pace in documents, so the order does not say at which step a read is necessary (D-81).
 
-1. Find the row groups of each lane slice with `Order::lane_groups`.
-2. The slice of a lane holds the stream positions `[p, p + len)`. The lane takes them at the steps `p / D` to `(p + len − 1) / D`.
-3. Give each row group of the slice that step range. The lane shuffles its slice, so a document can come at each step of the range.
-4. Merge the ranges of all lanes of the GPU. Each row group gets a first step and a last step.
-5. Sort the row groups by first step.
+A driver task does these steps for each window of the order:
 
-On a resume, `new` makes the plan from the cursor of each lane, then it replays the leftover of each lane:
-
-1. Make the plan with each `doc` set to the cursor. The plan holds only the documents that the lanes did not take. If the budget is less than its peak, return `Error::Budget` before a read.
-2. For each lane, until `Replay::part` is empty: the part is the next documents of the leftover in one window. Find their row groups. If their cost is more than the budget, return `Error::Budget`. Else get their permits from a semaphore of the budget size, read them, give the part to `Replay::take`, and release the row groups and the permits. The lanes replay at the same time.
-3. Start the prefetch, and receive the row groups of the first step. Thus a resume succeeds only if the run can go on from there.
-
-The lane copies the tokens of its leftover, so it does not need the row groups of a part after the part. The replay finds each part from the stream of the lane, so it shuffles no window two times, and it stops at the first part that gives an error (D-65).
-
-The cost of a row group is its decoded size: `values · 4 + (rows + 1) · 8` bytes. `peak` finds the largest cost of the row groups that are necessary at the same step. If the budget is less than this peak, `new` returns `Error::Budget`.
-
-A driver task does these steps for each row group of the plan, in order:
-
-1. Get the permits of its cost, in KiB, from a semaphore of the budget size.
-2. Get one of 16 read slots.
-3. Start a task that reads the row group. The task releases its read slot when the read ends.
-4. Send the task to the loader.
-
-The decoded row group keeps its permits. The loader releases the permits when it removes the row group from memory.
+1. Wait until the window is at most 2 windows after the window of the slowest lane, or until a step waits for a read in it.
+2. For each row group of the window that a lane of the GPU takes from, and that a lane has not passed: get the permits of its cost, in KiB, from a semaphore of the budget size. If a step waits for this key or a later key, add the permits to the semaphore first, so that the read starts at once (D-82).
+3. Get one of 16 read slots, and start a task that reads the row group.
+4. Send the task and its key to the loader.
 
 `Loader::next` does these steps:
 
-1. Receive each row group with a first step at or before the current step.
-2. Fill one sequence for each lane.
-3. Remove each row group with this step as its last step.
+1. Call `need` for each lane. If a document is not in memory, send its key to the driver as the demand, and take arrivals in order until that key is in memory. Then do step 1 again.
+2. Fill one sequence for each lane. This step has no wait.
+3. For each lane that left a window, remove the lane from the users of the row groups of its slice there. Remove each row group that has no user.
+
+The loader keeps each arrival for the lanes whose slice in that window holds it and that have not passed the window. A user is `(lane, epoch, window)`. A row group can be in a window of each of two epochs at the same time, at the end of an epoch, so the users of both windows keep it (D-83).
+
+`Loader::new` makes the lanes at their positions and starts the driver at the window of the slowest lane. There is no replay: the leftover of a lane is the rest of one document, and the first step reads it with the other row groups of the slice.
+
+The cost of a row group is its decoded size: `values · 4 + (rows + 1) · 8` bytes. If the budget is less than one window of the lanes of the GPU, `new` returns `Error::Budget`.
 
 **Rationale:**
 
-- The plan uses one entry for each lane slice, not for each document. FineWeb-Edu has approximately 10⁹ documents, but only some thousand windows (D-31).
-- The driver gets the permits of one row group at a time, in plan order. The semaphore of tokio is first in, first out, so a later row group cannot take the permits that an earlier row group needs (D-32).
-- At step s, the loader holds the row groups that are necessary at s, and some that are read early. The first set is not more than the peak. Thus a budget at or above the peak cannot stop the loader (D-33).
-- The cost comes from the value count of the chunk. The uncompressed size of a chunk with a dictionary is approximately half of the decoded size (D-34).
-- The loader owns its epoch and its lanes. Thus `Lane` holds an `Arc<Epoch>`, and `Epoch` keeps a copy of the row counts (D-35).
-- A checkpoint does not hold the row groups in memory. A resume reads them again. torchdata, MosaicML Streaming and LitData do the same (D-36).
-- The loader stops all read tasks when it is dropped.
-- The loader has a maximum of 16 reads at the same time. Without this limit, a large budget starts thousands of requests at the start. The index has the same limit for footers.
-- If a read fails, `next` returns the error, and the next calls return `Error::Stopped`. The lanes did not change in the failed step, so `states()` is a correct point to resume from.
-- `next` is cancel safe. The loader keeps the read that it waits for, so a dropped `next` loses no row group (D-44).
-- A resume, and a retry after a failed read, run with each budget that a run with no stop accepts. The plan from the cursor holds a subset of the ranges of that run. The row groups of a part are in one lane slice of one window, and that run holds all of the slice at the steps where the lane takes from that window (D-65).
-- The replay reads are tasks, so their decode runs on the worker threads of the runtime, also when Python waits with `block_on`. `new` holds them in `Abort`, so a dropped `new`, such as from a dropped `Session::resume`, stops them.
-- `Replay::take` stops with an error when the tokens after the first document of the leftover are more than C. The offset of the state is in that first document, so the state can never fit. Thus a state far behind its cursor stops after some documents, before its leftover fills the memory.
+- The budget caps the reads ahead, not the reads that a step waits for. Lanes can be a window apart, so a fixed budget could hold the row groups of the next window while a slow lane waits for one in the current window. The demand lets the read start, so the loader never waits for itself (D-82).
+- The driver reads at most 2 windows after the slowest lane. The stream has no end, so a large budget would otherwise read whole epochs ahead.
+- Users are per window, so a release removes only what an arrival added. A lane can pass a window through the copy of a row group from the other epoch, before the read of this window arrives. Then it holds no place in that window (D-83).
+- `next` removes row groups only after all lanes are filled. `need` found each row group in memory for the whole step.
+- `next` is cancel safe. The lanes change only after the last wait, and the loader keeps the read that it waits for, so a dropped `next` loses no row group (D-44).
+- A checkpoint does not hold the row groups in memory. A resume reads them again (D-36).
+- If a read fails, `next` returns the error, and the next calls return `Error::Stopped`. The lanes did not change in the failed step, so `positions()` is a correct point to resume from.
 
 **Limits:**
 
-- The budget does not include the memory of a decode in progress. Research measured approximately 3.5 times the decoded size of the row group during its decode.
+- A step that waits for a read can take the memory past the budget, by the row groups between the last read and the read that the step needs.
+- The budget does not include the memory of a decode in progress.
 - Use a multi-thread tokio runtime. On a single-thread runtime the loader is correct, but the reads progress only while the caller waits for `next`.
-- `new` makes the plan synchronously. At FineWeb-Edu scale this takes approximately 0.1 s in a release build.
-- The decode of a row group runs in a tokio task and blocks its worker thread for a few milliseconds.
-- All lane states must have the same step.
-- A resume reads the row groups of the current window of each lane two times: one time for the replay and one time for the plan. In the replay, a row group that more than one lane of the GPU takes from is read one time for each of these lanes. This occurs only at a resume.
+- At the end of an epoch, a row group in the last window of the epoch and in a window of the next epoch is read two times when the two windows are not in memory at the same time.
 
 **Verification:**
 
 | Test | Type | What it shows |
 |---|---|---|
-| `loader_matches_direct` | Unit | For world 1, 2 and 4, the batches of all ranks are equal to a run over all row groups in memory. |
-| `resume_matches_tail` | Unit | A stop at step k on world a and a resume on world b give the same batches as a run with no stop. |
-| `budget_is_checked_and_kept` | Unit | A budget below the peak gives `Error::Budget`. A budget equal to the peak runs to the end, and the bytes in memory stay at or below the budget. |
-| `resume_needs_no_more_than_a_fresh_run` | Unit | For two seeds and world 1 and 2, a resume at each step with the peak budget of a run with no stop gives the same batches as that run. |
-| `budget_counts_the_replay` | Unit | At a flush step with a leftover, the plan is empty, but a budget below a part of the replay gives `Error::Budget` and does not wait. |
-| `evicts_everything` | Unit | After the last step, no row group is in memory. |
-| `new_reads_the_first_step` | Unit | A corrupt row group of step 0 gives `Error::Read` from `new`, with no leftover to replay. |
-| `failed_read_stops_the_loader` | Unit | A corrupt chunk gives `Error::Read` one time and then `Error::Stopped`. The lane states stay at the step before the failure. |
-| `prefetches_ahead` | Unit | With a large budget, the loader reads all row groups before `next` needs them. |
-| `reads_only_own_row_groups` | Unit | The plans of all ranks cover all row groups. Ranks share only the row groups at the edges of their slices. |
-| `each_gpu_reads_its_plan_once` | Unit | For three seeds and 1, 2 and 4 GPUs, each GPU fetches the chunk bytes of the row groups of its plan for one epoch, no more. One GPU fetches exactly the dataset. |
-| `plan_matches_lane_streams` | Unit | Each document that a lane takes at step s is in a row group that the plan needs at s. This is also true after a resume, with the plan from the cursor. |
+| `loader_matches_direct` | Unit | For three seeds and world 1, 2 and 4, over about three epochs, the batches of all ranks are equal to the packer over all row groups in memory. |
+| `resume_matches_tail` | Unit | A stop at step k on world a and a resume on world b from the positions give the same batches as a run with no stop. |
+| `one_window_of_budget_is_enough` | Unit | With a budget of one window, world 1 and 2 run to the end in 20 s or less, with the same batches. Without the demand, this test stops. |
+| `a_budget_below_one_window_is_refused` | Unit | A budget 1 KiB below one window gives `Error::Budget`. |
+| `passed_windows_are_evicted` | Unit | After each step, each row group in memory is in a window from the slowest lane to 4 windows after the fastest lane. |
+| `each_window_is_read_once` | Unit | The bytes that a GPU reads are at least the windows before its slowest lane and at most the windows to 2 after its fastest lane. |
+| `failed_read_stops_the_loader` | Unit | A corrupt chunk gives `Error::Read` one time and then `Error::Stopped`. The positions stay at the step before the failure. |
+| `a_bad_position_is_an_error` | Unit | An offset past its document gives `Error::State` that names the lane, at the first step. |
+| `next_is_cancel_safe` | Unit | Over a store with 5 ms reads, `next` futures dropped at their first poll lose no row group. |
 | `lane_groups_match` | Property | `Order::lane_groups` gives the row groups that `Order::lane` uses. |
-| `next_is_cancel_safe` | Unit | Over a store with 20 ms reads, `next` futures dropped while a read is in flight lose no row group. The test counts these drops and needs at least one. |
 
 ### 5.8 Checkpoint
 
-**Function:** A checkpoint holds the settings, the fingerprint, the epoch and the lane states of some lanes. It changes to bytes and back. It refuses a resume with different settings or a different dataset.
+**Function:** A checkpoint holds the settings, the fingerprint, the epoch, the step and the positions of some lanes. It changes to bytes and back. It refuses a resume with different settings or a different dataset.
 
 **Interface:**
 
 ```rust
 pub struct Config { pub column: String, pub seed: u64, pub lanes: u32 /* B */,
-                    pub window: u32 /* W */, pub packing: Packing }
+                    pub window: u32 /* W */, pub seq_len: u32 /* L */ }
 
 pub struct Checkpoint {
     pub config: Config,
     pub fingerprint: u64,     // Index::fingerprint
     pub epoch: u64,
-    pub first_lane: u32,      // lanes[i] is the state of lane first_lane + i
-    pub lanes: Vec<LaneState>,
+    pub step: u64,            // the next step of the epoch, for all lanes
+    pub first_lane: u32,      // lanes[i] is the position of lane first_lane + i
+    pub lanes: Vec<Position>,
 }
 
 impl Checkpoint {
@@ -718,12 +668,12 @@ impl Checkpoint {
     pub fn from_bytes(bytes: &[u8]) -> Result<Checkpoint, Error>;
     pub fn merge(parts: Vec<Checkpoint>) -> Result<Checkpoint, Error>;
     pub fn is_global(&self) -> bool;
-    pub fn states(&self, lanes: Range<u32>) -> Result<Vec<LaneState>, Error>;
+    pub fn positions(&self, lanes: Range<u32>) -> Result<Vec<Position>, Error>;
     pub fn check(&self, config: &Config, fingerprint: u64) -> Result<(), Error>;
 }
 
 pub enum Error { Bytes(&'static str), Version(u32), Checksum,
-                 Mismatch { field, saved, now }, Parts(String) }
+                 Mismatch { field, saved, now }, Parts(String), Range(String) }
 ```
 
 **Design:** The bytes have this layout. All integers are little-endian.
@@ -731,16 +681,17 @@ pub enum Error { Bytes(&'static str), Version(u32), Checksum,
 | Field | Type |
 |---|---|
 | Magic | `PLTZCKPT` (8 bytes) |
-| Version | u32, now 1 |
+| Version | u32, now 2 |
 | Column | u32 length, then UTF-8 |
 | Seed | u64 |
-| B, W, L, D, C, pad token | 6 × u32 |
-| Fingerprint | u64 |
-| Epoch | u64 |
+| B, W, L | 3 × u32 |
+| Fingerprint, epoch, step | 3 × u64 |
 | First lane | u32 |
 | Lane count | u32 |
-| Each lane | step u64, doc u64, offset u32 |
+| Each lane | epoch u64, doc u64, offset u32 |
 | Checksum | u64, FNV-1a of all bytes before it |
+
+Each lane has its own epoch: at the end of an epoch, some lanes are a few documents into the next epoch. Version 1 held the settings and the states of the fixed packer (D, C, pad, a step for each lane), and `from_bytes` refuses it with `Error::Version(1)` (D-84).
 
 Each GPU gives a checkpoint part for its own lanes. `merge` puts the parts of all GPUs into one global checkpoint:
 
@@ -761,7 +712,7 @@ Each GPU gives a checkpoint part for its own lanes. `merge` puts the parts of al
 **Limits:**
 
 - The checksum finds damage, not changes by an attacker.
-- `from_bytes` does not make sure that each lane state is correct for the epoch. `Session::resume` refuses a step past the epoch, a leftover past the cursor and a leftover after the last step, through `Epoch::check` (D-64). The other states that no run makes, such as an offset past its document or a leftover past the cap, need the tokens. `Epoch::lane` then gives an error. `Session::resume` makes the loader at once, so it gives that error as `checkpoint::Error::Range`, and the session stays where it was. No checkpoint causes a panic. `merge` reserves no memory from the B in the bytes.
+- `from_bytes` does not make sure that each position is correct. `Session::resume` refuses a step past the epoch and a document past the lane's documents of its epoch. An offset past its document needs the tokens, so the first step gives that error as `load::Error::State`. Python gives both as `CheckpointError`. No checkpoint causes a panic.
 
 **Verification:**
 
@@ -774,12 +725,12 @@ Each GPU gives a checkpoint part for its own lanes. `merge` puts the parts of al
 | `truncation_is_refused` | Property | A checkpoint with bytes removed from its end gives an error. |
 | `merge_tiles_the_lanes` | Unit | Parts in any order give one global checkpoint. |
 | `merge_refuses_bad_parts` | Unit | No parts, a missing lane, a gap, an overlap, different steps, configs or epochs, and B = 2³² − 1 in the bytes each give `Error::Parts`, with no large allocation. |
-| `states_of_a_part` | Unit | `states` gives lanes that the part holds, and refuses other lanes and lanes at different steps. |
+| `positions_of_a_part` | Unit | `positions` gives lanes that the part holds, and refuses other lanes. |
 | `check_names_the_field` | Unit | `check` gives the name of the field that is different. |
 
 ### 5.9 Session
 
-**Function:** A session runs the lanes of one GPU from one epoch to the next. It opens the dataset, makes the loader of each epoch, and gives the checkpoint part of the GPU.
+**Function:** A session runs the lanes of one GPU from one epoch to the next. It opens the dataset, keeps one loader across epochs, and gives the checkpoint part of the GPU.
 
 **Interface:**
 
@@ -789,58 +740,61 @@ impl Session {
                       config: Config, rank: u32, world: u32, budget: u64) -> Result<Session, Error>;
     pub fn set_epoch(&mut self, epoch: u64);
     pub async fn resume(&mut self, checkpoint: &Checkpoint) -> Result<(), Error>;  // makes the loader
-    pub async fn next(&mut self, out: &mut [u32]) -> Result<Option<Vec<u32>>, Error>;
+    pub async fn next(&mut self, out: &mut [u32]) -> Result<bool, Error>;          // false: the epoch ended
     pub fn checkpoint(&self) -> Checkpoint;    // the part of this GPU
-    pub fn ended(&self) -> bool;               // the last step is taken; `next` gives `None` next
+    pub fn ended(&self) -> bool;               // the last step is taken; `next` gives false next
     pub fn epoch(&self) -> u64;
+    pub fn steps(&self) -> u64;                // S, the steps of each epoch
     pub fn lanes(&self) -> Range<u32>;
     pub fn bytes_read(&self) -> u64;           // the chunk bytes fetched since `open`
+    pub fn bytes_counter(&self) -> Arc<AtomicU64>;
 }
 
-pub enum Error { Config(String), Index(index::Error), Read(read::Error),
+pub enum Error { Config(String), Empty, Index(index::Error), Read(read::Error),
                  Load(load::Error), Checkpoint(checkpoint::Error) }
 ```
 
 **Design:**
 
-- `open` checks the config, opens the index with `Index::open`, and makes the reader. The lanes are `gpu_lanes(B, world, rank)`.
-- `open` refuses more than 2²⁴ lanes, and more than 2³⁰ tokens in one step of one GPU or in its leftovers (lanes × C). These sizes are far past any real batch, and a larger value could only use all the memory (D-63).
-- The session keeps the lane states to start from. `set_epoch` sets them to the start of a later epoch. It does nothing for the current epoch or an earlier one. `resume` takes them from a checkpoint after `check`. It drops the old loader first and keeps its position, then makes the new loader, and changes the position only when that succeeds. An ended loader is not dropped: it holds no row groups, and it still gives the `None` that ends its epoch. Thus an error, or a `resume` future that is dropped, leaves the session where it was.
-- `next` makes the loader of the epoch at the first step. At the end of the epoch, `next` returns `None`, and the session goes to step 0 of the next epoch.
-- If `next` fails, the session keeps the lane states of the loader and drops the loader. The next call makes a new loader and tries the same step again.
-- `checkpoint` gives the lane states of the loader. Before the first step of an epoch, it gives the start states. After the last step of an epoch, it gives `(epoch + 1, step 0)`, also before the call of `next` that returns `None`.
+- `open` checks the config, opens the index with `Index::open`, and makes the reader and the `Orders`. The lanes are `gpu_lanes(B, world, rank)`. A dataset with no tokens gives `Error::Empty`.
+- An epoch has S = ⌈T/(B·L)⌉ steps, where T is the value count of the token column in the index. All GPUs get the same S from the index (D-79).
+- `open` refuses more than 2²⁴ lanes, and more than 2³⁰ tokens in one step of one GPU. These sizes are far past any real batch, and a larger value could only use all the memory (D-63).
+- `next` makes the loader at the first step, and keeps it across epochs. After S steps, `next` returns false, and the session goes to step 0 of the next epoch. The lanes keep their positions.
+- `set_epoch(e)` right after the last step of epoch e − 1 goes to epoch e, and the lanes go on. A later epoch is a jump: the lanes start at the first document of e. An earlier epoch or the current epoch changes nothing.
+- `resume` takes the positions from a checkpoint after `check`, refuses a step past the epoch, and makes the loader, which refuses a document past the lane's documents. It drops the old loader first and keeps its positions, and changes the session only when the new loader is made.
+- If `next` fails, the session keeps the positions of the loader and drops the loader. The next call makes a new loader and tries the same step again.
+- `checkpoint` gives the positions of the loader. After the last step of an epoch, it gives `(epoch + 1, step 0)`, also before the call of `next` that returns false.
 
 **Rationale:**
 
-- After the last step of an epoch, a checkpoint holds `(epoch + 1, step 0)`. A resume from it starts the next epoch, not an empty end of the old epoch. The parts of all GPUs agree, also if only some GPUs received `None` (D-40).
-- Trainers call `set_epoch` at the start of each epoch, also the epoch that they resumed into. A checkpoint after the last step of an epoch is at the next epoch. Thus `set_epoch` only goes forward, and a resume never repeats data (D-43).
+- After the last step of an epoch, a checkpoint holds `(epoch + 1, step 0)`. The parts of all GPUs agree, also if only some GPUs received the end (D-40).
+- Trainers call `set_epoch` at the start of each epoch, also the epoch that they resumed into. A checkpoint after the last step of an epoch is at the next epoch. Thus `set_epoch` only goes forward, and a resume never repeats data (D-43). `__iter__` of the Python `Loader` calls it to start the next epoch, so a call at the end of an epoch must not move the lanes.
 - The Python bindings give the config to `open`. Thus `open` returns `Error::Config` for a config that would cause a panic (D-41).
-- A failed read leaves the lane states before the failed step. Thus a retry can continue, and the caller does not have to make a new session (D-42).
-- The session calculates the fingerprint one time. The fingerprint encodes the full index.
+- A failed read leaves the positions before the failed step. Thus a retry can continue (D-42).
 
 **Limits:**
 
-- `resume` makes the loader, so a budget that is too small for the resumed step gives its error at `resume`.
 - All GPUs must call `next` the same number of times, as in each data-parallel run.
+- T counts one value for each empty row too. Thus S is a little high for a dataset with many empty documents, and an epoch then takes a little more than one pass.
 
 **Verification:**
 
 | Test | Type | What it shows |
 |---|---|---|
 | `resume_on_another_world_matches_one_run` | Unit | Runs on world a stop at step k, also at and after the end of an epoch. Their merged checkpoint resumes on world b. The batches are the same as one run on world 1 with no stop. |
-| `epochs_roll_over` | Unit | After the last step, `ended` is true, and the checkpoint holds epoch 1 and the start states, before and after `None`. Parts from a GPU that received `None` and a GPU that did not merge. The batches of epoch 1 are not the same as epoch 0. |
-| `set_epoch_starts_that_epoch` | Unit | `set_epoch(1)` after some steps gives the batches of epoch 1. |
+| `epochs_roll_over` | Unit | After S steps, `ended` is true, and the checkpoint holds `(1, 0)` before and after the end. The lanes keep their positions across the end. Parts from a GPU that received the end and a GPU that did not merge. |
+| `set_epoch_starts_that_epoch` | Unit | `set_epoch(1)` after some steps gives the same batches as a session that jumps to epoch 1 at once, and these are not the batches of a run that arrives at epoch 1. |
 | `set_epoch_keeps_a_resume_in_that_epoch` | Unit | `set_epoch(0)` after a resume in epoch 0 keeps the resumed position. |
 | `set_epoch_never_goes_back` | Unit | `set_epoch(0)` after a resume from the end of epoch 0 gives the batches of epoch 1. |
 | `next_is_cancel_safe` | Unit | Over a store with 5 ms reads, calls of `next` that are dropped after one poll give the same batches as a run with no drops. |
-| `resume_is_cancel_safe` | Unit | Over a store with 20 ms reads, a `resume` future dropped after one poll leaves `checkpoint()` unchanged, and the next batches are the same as a run with no `resume`. |
+| `first_step_after_a_resume_is_cancel_safe` | Unit | Over a store with 20 ms reads, the first `next` after a resume, dropped after one poll, leaves `checkpoint()` unchanged, and the next batches are the same as a run with no stop. |
 | `resume_refuses_other_runs` | Unit | A different L, a different seed and an added file each give `Mismatch` with the name of the field. |
-| `refused_resume_keeps_the_epoch_end` | Unit | After the last step, a `resume` that fails when it makes the loader leaves `ended` true, and the next `next` gives `None`. |
+| `refused_resume_keeps_the_epoch_end` | Unit | After the last step, a refused `resume` leaves `ended` true, and the next `next` gives false. |
 | `resume_needs_this_ranks_lanes` | Unit | A part resumes the rank that holds its lanes, and another rank refuses it. |
-| `resume_refuses_states_outside_the_epoch` | Unit | A step past the epoch, a leftover past the cursor, and a leftover that starts earlier and goes past the cap each give `checkpoint::Error::Range` at `resume`, not a panic. After a refused resume, `checkpoint()` is unchanged, also on a new session. |
-| `open_refuses_bad_settings` | Unit | A world that does not divide B, a rank out of range, no GPUs, W = 0, D = 0, 2²⁵ lanes, L = 2³² − 1 and C = 2³² − 1 each give `Error::Config`. |
+| `resume_refuses_positions_outside_the_run` | Unit | A step past the epoch and a document past the lane's documents give `checkpoint::Error::Range` that names the lane, and `checkpoint()` is unchanged, also on a new session. An offset past its document gives `load::Error::State` at the first step. |
+| `open_refuses_bad_settings` | Unit | A world that does not divide B, a rank out of range, no GPUs, W = 0, L = 0, 2²⁵ lanes and L = 2³² − 1 each give `Error::Config`. |
 | `next_retries_after_a_failed_read` | Unit | After a failed read and a repair of the file, the next calls give the same batches as a run with no failure. |
-| `bytes_read_one_gpu_is_the_dataset` | Unit | `bytes_read` is 0 before the first step. One GPU fetches the dataset's chunk bytes once in each of two epochs. |
+| `bytes_read_one_gpu_is_about_the_dataset_an_epoch` | Unit | `bytes_read` is 0 before the first step, and after e epochs it is between e − 1 and e + 1 datasets. |
 
 ### 5.10 Store
 
@@ -902,7 +856,7 @@ pub enum Error { Store(object_store::Error), Scheme(String), Option(String) }
 ```python
 class Loader:
     def __init__(self, location: str | os.PathLike[str], *, seed: int, lanes: int, window: int,
-                 seq_len: int, docs: int, cap: int, pad: int, budget: int, rank: int | None = None, world: int | None = None,
+                 seq_len: int, budget: int, rank: int | None = None, world: int | None = None,
                  column: str = "tokens", cache: str | os.PathLike[str] | None = None,
                  storage_options: Mapping[str, str | bool] | None = None) -> None: ...
     def __iter__(self) -> Loader: ...           # the rest of the current epoch
@@ -911,8 +865,7 @@ class Loader:
     def checkpoint(self) -> bytes: ...          # the part of this GPU
     def resume(self, checkpoint: bytes | bytearray) -> None: ...
     epoch: int; lanes: range; bytes_read: int   # read-only properties
-class Batch:  tokens: Array                     # shape (lanes, seq_len)
-              lengths: Array                    # shape (lanes,): the real tokens of each row
+class Batch:  tokens: Array                     # shape (lanes, seq_len): each row is full
 class Array:  shape; __dlpack__(...); __dlpack_device__(); __arrow_c_array__(...)
 def merge(parts: Sequence[bytes | bytearray]) -> bytes: ...
 class PlitzerError(Exception); ConfigError, CheckpointError, DataError (PlitzerError)
@@ -924,7 +877,7 @@ class PlitzerError(Exception); ConfigError, CheckpointError, DataError (PlitzerE
 - Each `Loader` records the PID of the process that made it. In a forked child, a copied `Loader` gives `RuntimeError` for each method and property: a parent thread can have held one of its locks at the fork. A new `Loader` in the child works.
 - The `Loader` is frozen. A lock holds its session for the whole of a step, and a snapshot holds the checkpoint before the next step. `checkpoint()`, `epoch` and `lanes` read only the snapshot, so a signal handler or another thread can read them during a step. A second call that needs the session during a step gets `RuntimeError`, never a deadlock (D-59). No call holds the snapshot lock while Python runs, because Python can release the GIL and `save` takes the lock while it holds the GIL.
 - `epoch` is the epoch of the next step, as in `checkpoint()`. After the last step of an epoch, it is the next epoch.
-- `bytes_read` is `Session::bytes_read` at the end of the last call, such as the last step. Each call that changes the snapshot also stores it, so a thread can read it during a step (D-70).
+- `bytes_read` reads the counter of the reader, `Session::bytes_counter`, with no lock. Thus it also counts the reads ahead, while they arrive, and a thread can read it during a step (D-85).
 - `__next__` releases the GIL and waits on the runtime for 100 ms at a time. Between these waits it checks for signals. Thus Ctrl-C gives `KeyboardInterrupt` in 100 ms or less, and it drops the `next` future. `Loader::next` is cancel safe (D-44), so the next call does the same step again.
 - At the end of an epoch, `__next__` raises `StopIteration`, and it raises it again at each later call, as a Python iterator must. `__iter__` starts the next epoch: a new `for` loop gives it. `__iter__` also moves on a loader whose last step is taken but which did not raise `StopIteration` yet, such as the second loader in a `zip` (D-55).
 - Each step writes into a new `Vec<u32>`. An arrow `Buffer` holds it, and each export holds a clone of that `Buffer`. Thus an exported array stays valid after the batch, the loader and the export call.
@@ -963,15 +916,14 @@ The Arrow export is as follows:
 | Array | Arrow type |
 |---|---|
 | `tokens` | `FixedSizeList<int32, L>`, with the extension `arrow.fixed_shape_tensor` and the metadata `{"shape":[L]}` |
-| `lengths` | `Int32Array` |
 
 An Arrow consumer moves the structs out of the capsules and sets their `release` to null. The capsule then frees only an empty struct.
 
 **Rationale:**
 
 - Both DLPack ABIs: numpy 2 and current torch ask for the versioned ABI, and older consumers call `__dlpack__()` with no arguments (D-46).
-- int32: torch has little support for `uint32`, and vocabularies are much smaller than 2³¹. A pad token of 2³² − 1 shows as −1 (D-47).
-- `pad` has no default. Many tokenizers use 0 as a real token, so the user must choose (D-52). A negative `pad` from −2³¹ is the token with the same bits, so `pad=-1` and `pad=2**32 - 1` give the same batches.
+- int32: torch has little support for `uint32`, and vocabularies are much smaller than 2³¹ (D-47).
+- Each row is L real tokens, so a batch has no `lengths` and the loader has no `pad` (D-77).
 - `set_epoch(e)` opens the iterator for epoch `e` when the loader stands at the start of `e`, also just after `StopIteration`. Thus a trainer that calls `set_epoch` and then `next` for each epoch gets each epoch. The epoch after `u64::MAX` is `u64::MAX`: the count stops there and never wraps to 0.
 - The runtime has all its drivers. The S3 client needs the I/O driver, and the waits need the timer.
 - The PID check stops a forked child before it waits for runtime threads that it does not have (D-50).
@@ -982,7 +934,7 @@ An Arrow consumer moves the structs out of the capsules and sets their `release`
 - One wheel for each platform covers CPython 3.11 and later (abi3). It does not cover the free-threaded build.
 - During a step, only `checkpoint()`, `epoch` and `lanes` work from another thread or a signal handler. `__next__`, `__iter__`, `set_epoch` and `resume` give `RuntimeError` until the step ends.
 - If a step stops with a panic, the `Loader` gives `RuntimeError` for each later step: its lanes can be part way through the step. `checkpoint()` still gives the last good state, so a new `Loader` can resume from it.
-- Each epoch has its own peak (section 5.7), and the loader of each epoch checks the budget when it starts. Thus a budget that fits epoch 0 can give `ConfigError` at the start of a later epoch. The error gives the bytes that are necessary. The budget is not part of a checkpoint, so a resume with a larger budget continues the run.
+- The loader checks the budget against the largest window of the epoch where it starts (section 5.7). A later epoch can have a larger window: then the steps that wait for a read take the memory past the budget, but the run does not stop. A jump with `set_epoch` makes a new loader, which can give `ConfigError` with the bytes that are necessary. The budget is not part of a checkpoint, so a resume with a larger budget continues the run.
 - The data is writable. Two exports of one array share the same memory.
 - Signals are checked only on the main thread, as in Python.
 - A `KeyboardInterrupt` can come after `__next__` returns and before the caller gets the batch, as with each Python iterator. Then `checkpoint()` is already after that step, and a resume does not give its batch again. Save checkpoints between training steps, for example from a flag that a signal handler sets, not in an `except KeyboardInterrupt` block around the loop.
@@ -999,21 +951,20 @@ An Arrow consumer moves the structs out of the capsules and sets their `release`
 | `test_checkpoint_during_a_step` | pytest | Another thread reads `checkpoint()` and `epoch` during all the steps of an epoch with no error. Each checkpoint it reads is complete. |
 | `test_iterator_protocol` | pytest | After the end of an epoch, `next` raises `StopIteration` again. The next `for` loop gives the next epoch. |
 | `test_non_strict_zip_keeps_ranks_together` | pytest | Two epochs through `zip` (not strict) of two world-2 loaders give the batches of one world-1 loader. |
-| `test_batch_shapes_and_padding` | pytest | The shapes and the int32 type are correct. After the real tokens, each row holds the pad token. |
-| `test_negative_pad_is_the_same_token` | pytest | `pad=-1` gives the same batches as `pad=2**32 - 1`. |
+| `test_batch_shape` | pytest | The shape and the int32 type are correct, and each row is full. |
 | `test_dlpack_versioned_and_legacy` | pytest | Both ABIs give the same data, with the correct capsule names. |
 | `test_unused_capsules_are_freed` | pytest | 300 000 capsules that nobody takes are freed: the peak memory grows less than 16 MiB (Linux). |
 | `test_no_default_cache_without_a_user_folder` | pytest | With no user cache folder and no `cache`, `Loader` gives `ConfigError`. |
 | `test_default_cache_is_made_and_shared` | pytest | With no `cache`, the index makes its cache folder. Three spellings of one folder use one cache file. |
 | `test_data_outlives_the_batch_and_the_loader` | pytest | DLPack and Arrow data stay correct after the batch and the loader are deleted. |
 | `test_copy_and_device` | pytest | `copy=True` gives separate memory. A device that is not the CPU gives `BufferError`. |
-| `test_arrow_export` | pytest | pyarrow reads `tokens` as a `FixedShapeTensorArray` and `lengths` as int32. |
+| `test_arrow_export` | pytest | pyarrow reads `tokens` as a `FixedShapeTensorArray`. |
 | `test_resume_on_another_world` | pytest | Parts from world 2, merged, resume on world 4 with the same tail as one run. |
 | `test_resume_refuses_other_runs` | pytest | A different L, bad bytes and an incomplete merge give `CheckpointError`. |
-| `test_resume_refuses_a_hand_made_checkpoint` | pytest | Checksummed bytes whose leftover starts at an earlier document give `CheckpointError` at `resume`, and `checkpoint()` is unchanged. |
-| `test_bad_settings` | pytest | Bad settings, `world=-1`, `seed=2**200`, `lanes=4.0`, `docs=True`, a URL with `#` and a cache below a file give `ConfigError`. A missing folder gives `DataError`. |
-| `test_bytes_read_counts_each_epoch` | pytest | `bytes_read` is 0 before the first step, and grows by the dataset's chunk bytes in each epoch. |
+| `test_resume_refuses_a_hand_made_checkpoint` | pytest | Checksummed bytes with a document past the lane's documents give `CheckpointError` at `resume`, and `checkpoint()` is unchanged. An offset past its document gives `CheckpointError` at the next step. |
+| `test_bad_settings` | pytest | Bad settings, `world=-1`, `seed=2**200`, `lanes=4.0`, `seq_len=True`, a URL with `#` and a cache below a file give `ConfigError`. A missing folder gives `DataError`. |
 | `test_kill_and_resume_on_another_world` | pytest, end to end | Three times with a new seed: a run of 1 to 6 processes is killed at a random step of 3.5 epochs, one time in three at the end of an epoch. Each rank saves its own part at each step. After the kill, the newest step that all ranks saved is merged and resumed on another number of processes, as a real trainer does. The batch of each step and lane, before and after the kill, is the same as one process with no stop. Each rank must end with the exit code of the kill. `PLITZER_E2E_SEED` repeats a seed. |
+| `test_resume_with_the_fresh_budget` | pytest | On world 1 and 2, a resume at each step runs with the smallest budget of a fresh run, and 1 KiB less gives `ConfigError`. |
 | `test_forked_child_makes_its_own_loader` | pytest | In a child of `os.fork`, the copied loader gives `RuntimeError`. A new loader gives the same first batch as the parent. The child frees the copy with no wait. |
 | `test_s3_matches_local` | pytest | The same files on versitygw and on local disk give the same batches. |
 
@@ -1026,7 +977,6 @@ An Arrow consumer moves the structs out of the capsules and sets their `release`
 ```python
 class TokenBatch(NamedTuple):
     tokens: torch.Tensor     # shape (lanes, seq_len), int32
-    lengths: torch.Tensor    # shape (lanes,), int32: the real tokens of each row
 class LoaderSettings(TypedDict): ...  # the keywords of plitzer.Loader, without rank and world
 class State(TypedDict):
     plitzer: bytes           # a global checkpoint
@@ -1053,7 +1003,7 @@ class Dataset(IterableDataset[TokenBatch]):
 
 **Rationale:**
 
-- A global checkpoint needs the state of each lane. A rank knows only its own lanes, and the leftover of a lane depends on its tokens. Thus `state_dict()` must collect the parts from all ranks (D-66).
+- A global checkpoint needs the state of each lane. A rank knows only its own lanes, and the position of a lane depends on its tokens. Thus `state_dict()` must collect the parts from all ranks (D-66).
 - Lightning makes the checkpoint on each rank, and then one rank writes it. `torch.distributed.checkpoint` writes an item that each rank holds with the same key only one time. Thus a collective `state_dict()` with the same bytes on each rank works with both (D-66).
 - `TokenBatch` is a `NamedTuple` of tensors. `DataLoader` with `batch_size=None` keeps a `NamedTuple` (D-67).
 - The state is the position of the next batch that the dataset gives, as for other iterable datasets. It does not guess how many batches the loop holds (D-68).
@@ -1098,7 +1048,7 @@ def write(groups: Iterator[NDArray[int64]], path: Path, seed: int) -> None: ...
 def build(sources: Sequence[str | Path], out: Path, row_groups: int, seed: int = 0) -> list[Path]: ...
 
 # amplification: python -m plitzer.bench.amplification DATA --lanes 512 --window 64 --worlds 1,8,64 ...
-class Settings(NamedTuple): lanes; window; seq_len; docs; cap; budget; seed = 0; column = "tokens"
+class Settings(NamedTuple): lanes; window; seq_len; budget; seed = 0; column = "tokens"
 class World(NamedTuple): window; per_gpu: list[int]; dataset: Dataset   # .amplification, .bound
 class Dataset(NamedTuple): row_groups: int; bytes: int
 def scan(location: Path, column: str) -> Dataset: ...
@@ -1110,7 +1060,7 @@ def table(results: Sequence[World]) -> str: ...   # Markdown
 
 - FineWeb-Edu has a `token_count` column, the GPT-2 tokens of each document, but no token column. `lengths` reads only the footer and the `token_count` chunks of a source file. For a URL, pyarrow reads through `RangeFile`, which makes one HTTP range request for each read. `RangeFile` tries a request again after a connection error or a server error (5xx), up to 4 times. It uses `urllib`, which uses the `HTTPS_PROXY` setting.
 - `write` makes one row group for each source row group, with the same documents and lengths. The tokens are random in [0, 50257), from a seeded generator (D-69). It writes a temporary file and renames it, so a failed build leaves no file. It refuses a row group of 2³¹ tokens or more, which int32 offsets cannot hold.
-- `measure` runs each rank of each world in turn in one process, for epoch 0, and records `Loader.bytes_read`. All ranks use one index cache. The amplification is the sum of the ranks' bytes divided by `Dataset.bytes` from `scan`: the column chunk bytes of each row group that has rows, from the Parquet metadata.
+- `measure` runs each rank of each world in turn in one process, for epochs 0 and 1, and records the `Loader.bytes_read` of epoch 1. The prefetch reads a few windows past the slowest lane, also into the next epoch, so epoch 1 counts these reads one time at each end, as each epoch of a long run does. After each epoch, `measure` waits until `bytes_read` does not change for 50 ms: the reads ahead stop at a fixed point after the lanes. All ranks use one index cache. The amplification is the sum of the ranks' bytes divided by `Dataset.bytes` from `scan`: the column chunk bytes of each row group that has rows, from the Parquet metadata.
 - `World.bound` is 1 + (world − 1)/W. The lanes of the GPUs split each window into stretches in storage order, and two neighbours share at most the row group at their edge. Thus the GPUs read at most W + world − 1 row groups of a window. The bound counts row groups, not bytes.
 
 **Rationale:** CLAUDE.md puts the harness in the package, with tests, not in a script. A dataset with real lengths gives the real sizes of row groups and chunks, which are the only inputs of the read amplification. A tokenizer run on 10B tokens is not necessary for this.
@@ -1125,8 +1075,9 @@ def table(results: Sequence[World]) -> str: ...   # Markdown
 
 | Test | Type | Checks |
 |---|---|---|
-| `test_measure_one_gpu_reads_the_dataset` | pytest | One GPU has an amplification of exactly 1. Two and four GPUs have 1 or more. |
-| `test_measure_even_row_groups` | pytest | Row groups of equal rows: when world divides W, the amplification is exactly 1. With half a row group for each lane, 4 GPUs read exactly 2 times the dataset. |
+| `test_bytes_read_counts_each_epoch` | pytest | `bytes_read` is 0 before the first step, and after e epochs it is between e − 1 and e + 1 datasets. |
+| `test_measure_runs_every_rank` | pytest | `measure` runs each rank of 1, 2 and 4 GPUs, and each amplification is 1 or more. |
+| `test_measure_even_row_groups` | pytest | Row groups of equal rows: when world divides W, the amplification of epoch 1 is exactly 1. With half a row group for each lane, 4 GPUs read exactly 2 times the dataset. |
 | `test_scan_and_bound` | pytest | `scan` counts the row groups. The bound for 512 row groups, W = 100 and 64 GPUs is 1 + 6 · 63/512. |
 | `test_main_prints_a_row_for_each_run` | pytest | The CLI prints one table row for each W and world. |
 | `test_build_keeps_lengths_and_row_groups` | pytest | A built file has the source's row groups and lengths, and int32 tokens below the vocabulary size. The same seed gives the same file. |
@@ -1174,7 +1125,6 @@ def table(results: Sequence[World]) -> str: ...   # Markdown
 
 | Question | Effect |
 |---|---|
-| How many tokens does the Pack stage lose to pad tokens and dropped leftover, on real FineWeb-Edu lengths? What part of the sequences are ends of documents only (section 5.4)? | The values of C and D. |
 | Must the loader add an EOS token between documents, or must the `Tokens` source do it? | The `Tokens` trait. |
 | How well do documents mix inside one sequence on a sorted dataset? | The value of W. |
 | What are the statistics of the batch of each GPU? | Possible bias between GPUs. |
@@ -1195,12 +1145,12 @@ def table(results: Sequence[World]) -> str: ...   # Markdown
 | D-9 | Use `proptest` for the properties of the order. | The inputs (row counts, W, B, seed) have a real input space. | Fixed loops over a few cases. | #6 |
 | D-10 | Lane slices have equal document counts, not equal token counts. | Simple and exact. Token balance is a Pack problem. | Slices by token count. | #6 |
 | D-11 | Invalid configuration causes a panic. | It is a programmer error until the Python bindings exist. D-41 changes this for `Session`. | `Result` errors now. | #6 |
-| D-12 | The cap removes the oldest leftover tokens. | The leftover is one run to the cursor, so `(doc, offset)` is the full lane state. | Remove the newest tokens: documents stay whole, but the leftover gets gaps and the state becomes a list of ranges. | #8 |
-| D-13 | Each epoch ends with `ceil(C / L)` steps that empty the leftovers. | Only the cap drops tokens, and the epoch length is known before the read. | Drop the leftover at the end of the epoch. | #8 |
-| D-14 | Each step takes a fixed D documents. | The cursor is a function of the step, so a checkpoint does not store it. | Take documents until the sequence is full: the cursor then depends on token counts and must be in the checkpoint. | #8 |
+| D-12 | The cap removes the oldest leftover tokens. | The leftover is one run to the cursor, so `(doc, offset)` is the full lane state. D-78 replaces this: there is no cap. | Remove the newest tokens: documents stay whole, but the leftover gets gaps and the state becomes a list of ranges. | #8 |
+| D-13 | Each epoch ends with `ceil(C / L)` steps that empty the leftovers. | Only the cap drops tokens, and the epoch length is known before the read. D-79 replaces this: there are no flush steps. | Drop the leftover at the end of the epoch. | #8 |
+| D-14 | Each step takes a fixed D documents. | The cursor is a function of the step, so a checkpoint does not store it. D-77 replaces this: the fixed D lost tokens. | Take documents until the sequence is full: the cursor then depends on token counts and must be in the checkpoint. | #8 |
 | D-15 | `fill` writes into a buffer from the caller. | One buffer for each GPU batch, with no copy. | Return a new `Vec` for each sequence. | #8 |
 | D-16 | The pack module reads tokens through the `Tokens` trait. | The Read stage does not exist yet. Tests use a corpus in memory, and the Read stage can implement the trait later. | A fixed token source, such as a `Vec` of all tokens. | #8 |
-| D-17 | `LaneState` holds the step. | A state cannot go with a different step, which gives wrong sequences with no error. | A separate step input to `Epoch::lane`. | #8 |
+| D-17 | `LaneState` holds the step. | A state cannot go with a different step, which gives wrong sequences with no error. D-84 replaces this: one step for all lanes, and a position for each lane. | A separate step input to `Epoch::lane`. | #8 |
 | D-18 | Read footers with `ParquetMetaDataPushDecoder`. | It needs no `arrow`, and it does no I/O of its own. | `ParquetMetaDataReader`: its async API needs all of `arrow`. `ParquetObjectReader`: deprecated. | #10 |
 | D-19 | Build the index over `object_store` from the start. | Local disk and S3 use the same code, and S3 is the expensive case. | Local files only, with S3 in the Read PR. | #10 |
 | D-20 | The cache is valid if the path, size and ETag of each file are the same. | A file can change and keep its size. | Path and size only. | #10 |
@@ -1227,7 +1177,7 @@ def table(results: Sequence[World]) -> str: ...   # Markdown
 | D-49 | S3 uses `AmazonS3Builder::from_env` and the options, in our `store` module. | `parse_url_opts` does not read the `AWS_*` environment variables. | `object_store::parse_url_opts`. | #18 |
 | D-50 | One runtime for each process. A forked child makes its own, and a `Loader` copied into the child refuses to work. | A forked child has none of the parent's runtime threads, so a wait on the copied loader never ends. A new loader in the child must still work. | One runtime that refuses all work after a fork: the child can then never make a loader. | #18 |
 | D-51 | Python waits in slices of 100 ms and checks for signals between them. | Ctrl-C works, and `Loader::next` is cancel safe. | One wait with no signal check: Ctrl-C does nothing until the step ends. | #18 |
-| D-52 | `pad` has no default. | Many tokenizers use 0 as a real token. `lengths` gives the real tokens, but a silent default hides the choice. | A default of 0. | #18 |
+| D-52 | `pad` has no default. | Many tokenizers use 0 as a real token. `lengths` gives the real tokens, but a silent default hides the choice. D-77 removes `pad`. | A default of 0. | #18 |
 | D-53 | The bindings are the `plitzer-py` workspace crate, built by maturin as abi3 wheels for CPython 3.11 and later. | The core crate stays free of PyO3, and one wheel covers each platform. | PyO3 in the core crate behind a feature. | #18 |
 | D-54 | The default cache name is a hash of the resolved store and prefix. | The same text can name two datasets, and two texts can name one dataset. | A hash of the location text. | #18 |
 | D-55 | `__next__` keeps raising `StopIteration` after an epoch ends, and `__iter__` starts the next epoch. | Python iterators stay ended. A `zip` stops at the first ended loader, so `__iter__` must move the others on. | Start the next epoch at the next `__next__`. | #18 |
@@ -1238,15 +1188,24 @@ def table(results: Sequence[World]) -> str: ...   # Markdown
 | D-60 | The runtime has at most 8 worker threads and 32 blocking threads. | Each GPU process has its own runtime, and a loader has at most 16 reads in flight. | One worker for each CPU: hundreds of threads in each process on a large node. | #18 |
 | D-61 | No default cache without a user cache folder. | A shared temporary folder lets other users break or poison the index. | A shared folder in the temporary directory. | #18 |
 | D-62 | A URL with `?` or `#` is an error. | The parser drops what follows them, and they can be part of a real name, so another dataset would open with no error. | Drop the query and the fragment. | #18 |
-| D-63 | `Session::open` refuses more than 2²⁴ lanes, and more than 2³⁰ tokens in one step of one GPU or in its leftovers. | These sizes are far past any real batch. Larger values could only use all memory, which stops the process with no Python exception. | No bound. | #18 |
-| D-64 | `Epoch::lane` gives an error, not a panic, for a state that no run makes. `Session::resume` makes the loader at once and keeps the old position on an error. | A checkpoint made by hand passes the checksum, and its states would stop the packer with a panic. A resume that cannot go on must not replace a good position. | Trust each checksummed checkpoint, or check only some states, or make the loader at the next step. | #18 |
-| D-65 | A resume replays the leftover of each lane one window at a time, then plans from the cursor. | The plan counted the replayed row groups together with the row groups of the resume step. A resume, and a retry after a failed read, then could need more than the budget of a run with no stop. | Count the worst resume in the budget of each run, which makes each budget larger. | #20 |
+| D-63 | `Session::open` refuses more than 2²⁴ lanes, and more than 2³⁰ tokens in one step of one GPU or in its leftovers. | These sizes are far past any real batch. Larger values could only use all memory, which stops the process with no Python exception. D-77 removes the leftovers. | No bound. | #18 |
+| D-64 | `Epoch::lane` gives an error, not a panic, for a state that no run makes. `Session::resume` makes the loader at once and keeps the old position on an error. | A checkpoint made by hand passes the checksum, and its states would stop the packer with a panic. A resume that cannot go on must not replace a good position. `Lane::new` now gives this error. | Trust each checksummed checkpoint, or check only some states, or make the loader at the next step. | #18 |
+| D-65 | A resume replays the leftover of each lane one window at a time, then plans from the cursor. | The plan counted the replayed row groups together with the row groups of the resume step. A resume, and a retry after a failed read, then could need more than the budget of a run with no stop. D-78 replaces this: there is no replay. | Count the worst resume in the budget of each run, which makes each budget larger. | #20 |
 | D-66 | `Dataset.state_dict()` gathers the parts of all ranks and gives the same global checkpoint on each rank. | A global checkpoint needs each lane, and a rank knows only its own lanes. Lightning makes the checkpoint on each rank, and `torch.distributed.checkpoint` writes an item that all ranks hold only one time. | A part for each rank: a resume then needs the same GPU count, or code that merges the parts. | #21 |
 | D-67 | Each item is a `TokenBatch` `NamedTuple` of int32 tensors for one step. | `DataLoader` with `batch_size=None` keeps it. The tensors share memory with the export. | A dict, which is not typed, or int64 tensors, which need a copy. | #21 |
 | D-68 | `state_dict()` is the position of the next batch that the dataset gives. | A count of fetched batches that the loop did not train is wrong for some loops: at the end of an epoch, for a loop with a step limit, and after a crash during the last batch. | An `ahead` count with heuristics for these cases. | #21 |
 | D-69 | Measure the read amplification on FineWeb-Edu lengths, with random tokens. | The amplification depends only on the row counts and chunk bytes. `token_count` gives the real lengths from a few MB of each file. | Tokenize the text: 10B tokens, which is too much for a benchmark run. | #24 |
-| D-70 | `Loader.bytes_read` is the count at the end of the last call. | A thread can read it during a step, as it can read `checkpoint()`. | A live count, which needs the session lock during a step, or a new shared counter in `Session`. | #24 |
+| D-70 | `Loader.bytes_read` is the count at the end of the last call. | A thread can read it during a step, as it can read `checkpoint()`. D-85 replaces this. | A live count, which needs the session lock during a step, or a new shared counter in `Session`. | #24 |
 | D-71 | No cache on each node. | When world divides W, the measured amplification is 1. Otherwise it is near 1 + (world − 1)/W, so a W of several times world keeps it small: 1.016 at W = 300 for 8 GPUs (section 6). | A cache on each node that GPUs share. | #24 |
+| D-77 | Each step takes tokens until the sequence is full: the rest of the current document, then whole documents, cut at exactly L. There is no D, no cap and no pad token. | A fixed D gives L tokens only on average, so the leftover is a random walk: it hits the cap and drops tokens, or it empties and pads. On FineWeb-Edu lengths with D = 2 and C = 2048, 19.3 % of the tokens were lost. | A fixed D with a larger cap: 1.6 % lost at C = 128k, more memory, and the walk grows with the dataset. | #26 |
+| D-78 | A lane position is `(epoch, doc, offset)`, and `fill` copies from the row group into `out`, one copy for each piece of a document. | The leftover is always the rest of one document, so a resume reads only that document. Pack time went from 1.17 to 0.53 ns for each token. | A leftover buffer, and a replay of it at a resume. | #26 |
+| D-79 | The stream of a lane goes on into the next epoch. An epoch is S = ⌈T/(B·L)⌉ steps. | No lane waits or pads at the end of an epoch. Each GPU gets S from the index. | Flush steps with pad tokens at each epoch end. | #26 |
+| D-80 | `Lane::need` finds the missing documents of a step, and `fill` runs only when all are in memory. | The loader waits for reads before a lane changes, so `next` stays cancel safe. | A `fill` that waits for reads part way through the lanes. | #26 |
+| D-81 | The loader reads in window order across epochs, with keys `(epoch, window, position)`, and no step plan. | The step at which a lane gets to a document depends on token counts, so a plan by step is not known. Window order is the order in which the lanes use row groups. | A plan of step ranges from estimated token counts. | #26 |
+| D-82 | The budget caps the reads ahead. A step that waits for a read adds the permits for it, and a budget below one window is refused. | Lanes can be a window apart, so a fixed budget can hold the next window while a slow lane waits. The added permits stop a wait for itself. | A reserve of the budget for the current slice of each lane. | #26 |
+| D-83 | The users of a row group are `(lane, epoch, window)`, and the release is after all lanes filled. | At an epoch end, a row group can be in a window of each epoch. Users by lane only freed a row group that another lane still needed in the same step. | Users by lane. | #26 |
+| D-84 | Checkpoint version 2: one step, and `(epoch, doc, offset)` for each lane. Version 1 gives `Error::Version(1)`. | Lanes are in different epochs at an epoch end. Version 1 is from the fixed packer, so its batches cannot continue. | Convert version 1. | #26 |
+| D-85 | `Loader.bytes_read` reads the shared counter of the reader, with no lock. | The benchmark must count the reads ahead while they arrive. A thread can read it during a step. | The count at the end of the last call (D-70). | #26 |
 | D-22 | The sidecar uses its own binary format and FNV-1a. | No new dependency, and the bytes are fixed by our code. | `serde` with `bincode`, or JSON. | #10 |
 | D-23 | A sidecar that does not exist or is corrupt causes a new build. | The sidecar is only a cache. | An error that the user must correct. | #10 |
 | D-24 | The index keeps the place of each token column chunk, and the reader reads no footer. | A window has row groups from approximately W files. A footer read for each row group costs approximately 1.5 times the data. | Read the footer of each file again, or keep footers in memory (9.4 GB for FineWeb-Edu). | #12 |
@@ -1273,6 +1232,7 @@ def table(results: Sequence[World]) -> str: ...   # Markdown
 | 2026-10-26 | #21 | Add the PyTorch dataset (`plitzer/torch.py`): `Dataset`, `TokenBatch` and a collective `state_dict()`. torch is the optional extra `plitzer[torch]`. CI installs the CPU build of torch. |
 | 2026-11-05 | #23 | Add the end-to-end tests that kill a training run at a random step and resume it on another number of processes (`plitzer-py/tests/e2e.py`, `e2e_stream.py`, `e2e_torch.py`). |
 | 2026-11-09 | #24 | Add `bytes_read` (`Reader`, `Session`, `Loader`) and `plitzer.bench` (section 5.13). Measure the read amplification on FineWeb-Edu lengths (section 6). Correct the bound to 1 + ⌈n/W⌉(world − 1)/n. |
+| 2026-11-11 | #26 | Lossless packing: each step fills the sequence from the rest of the current document and whole documents, and lanes go on across epochs (`src/pack/stream.rs`). Remove D, C, the pad token and `Batch.lengths`. The loader reads in window order with a budget for the reads ahead (`src/load/sequence.rs`, `prefetch.rs`, `buffer.rs`), and the replay is removed. Checkpoint version 2. `bytes_read` is live. |
 
 ## 10. Maintenance
 

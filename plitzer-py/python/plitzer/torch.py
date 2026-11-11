@@ -43,9 +43,8 @@ class TokenBatch(NamedTuple):
     it is, also with ``pin_memory=True``."""
 
     tokens: torch.Tensor
-    """Shape (lanes, seq_len), int32: one sequence per lane, padded with ``pad``."""
-    lengths: torch.Tensor
-    """Shape (lanes,), int32: the real (not pad) tokens of each sequence."""
+    """Shape (lanes, seq_len), int32: one sequence of exactly L tokens per
+    lane, with nothing dropped and no padding."""
 
 
 class LoaderSettings(TypedDict):
@@ -56,9 +55,6 @@ class LoaderSettings(TypedDict):
     lanes: SupportsIndex
     window: SupportsIndex
     seq_len: SupportsIndex
-    docs: SupportsIndex
-    cap: SupportsIndex
-    pad: SupportsIndex
     budget: SupportsIndex
     column: NotRequired[str]
     cache: NotRequired[str | os.PathLike[str] | None]
@@ -99,7 +95,7 @@ class Dataset(IterableDataset[TokenBatch]):
             raise RuntimeError(_ONE_PROCESS)
         self._check_world()
         for batch in self._loader:
-            yield TokenBatch(from_dlpack(batch.tokens), from_dlpack(batch.lengths))
+            yield TokenBatch(from_dlpack(batch.tokens))
 
     def __getstate__(self) -> object:
         # A DataLoader worker made by spawn gets a pickled copy; refuse it as

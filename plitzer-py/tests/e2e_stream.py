@@ -20,18 +20,14 @@ SETTINGS: "Settings" = {
     "lanes": 12,
     "window": 4,
     "seq_len": 16,
-    "docs": 2,
-    "cap": 24,
-    "pad": 2**32 - 1,
     "budget": 1 << 30,
 }
 
 Stream = dict[tuple[int, int], str]
 
 
-def digest(tokens: npt.NDArray[np.generic], length: int) -> str:
-    data = tokens.tobytes() + length.to_bytes(4, "little")
-    return hashlib.sha256(data).hexdigest()[:16]
+def digest(tokens: npt.NDArray[np.generic]) -> str:
+    return hashlib.sha256(tokens.tobytes()).hexdigest()[:16]
 
 
 def read(path: Path) -> Stream:
@@ -73,9 +69,9 @@ def reference(location: Path, cache: Path, epochs: float) -> Reference:
     ends = []
     for _ in range(int(epochs) + 1):
         for b in loader:
-            tokens, lengths = np.from_dlpack(b.tokens), np.from_dlpack(b.lengths)
+            tokens = np.from_dlpack(b.tokens)
             lanes = range(SETTINGS["lanes"])
-            want.append({i: digest(tokens[i], int(lengths[i])) for i in lanes})
+            want.append({i: digest(tokens[i]) for i in lanes})
         ends.append(len(want))
     whole = int(epochs)
     last = ends[whole] - (ends[whole - 1] if whole else 0)

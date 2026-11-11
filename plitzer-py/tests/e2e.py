@@ -42,7 +42,7 @@ PEER_DIED = 3
 # kill comes late, and a kill on time still lands mid-run.
 MARGIN = 6
 
-Arrays = tuple[npt.NDArray[np.generic], npt.NDArray[np.generic]]
+Tokens = npt.NDArray[np.generic]
 
 
 @dataclass(frozen=True)
@@ -66,7 +66,7 @@ def train(
     job: Job,
     rank: int,
     lanes: range,
-    epoch: Callable[[], Iterable[Arrays]],
+    epoch: Callable[[], Iterable[Tokens]],
     save: Callable[[int], None],
 ) -> None:
     """Steps from `job.start` to `job.steps`, an epoch at a time. Logs each
@@ -76,10 +76,9 @@ def train(
     step = job.start
     while step < job.steps:
         taken = 0
-        for tokens, lengths in epoch():
+        for tokens in epoch():
             line = "".join(
-                f"{step} {lane} {digest(tokens[i], int(lengths[i]))}\n"
-                for i, lane in enumerate(lanes)
+                f"{step} {lane} {digest(tokens[i])}\n" for i, lane in enumerate(lanes)
             ).encode()
             # One write: a kill leaves no half-logged step behind.
             assert os.write(log, line) == len(line), "a short write to the log"
@@ -127,9 +126,9 @@ def loader_rank(rank: int, job: Job, ready: Barrier) -> None:
         loader.resume(Path(job.resume).read_bytes())
     ready.wait()
 
-    def epoch() -> Iterable[Arrays]:
+    def epoch() -> Iterable[Tokens]:
         for b in loader:
-            yield np.from_dlpack(b.tokens), np.from_dlpack(b.lengths)
+            yield np.from_dlpack(b.tokens)
 
     def save(step: int) -> None:
         atomic_write(Path(job.out, f"part-{rank}-{step}"), loader.checkpoint())

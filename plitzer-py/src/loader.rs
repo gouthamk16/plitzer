@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard, TryLockError};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 
 use plitzer::checkpoint::Checkpoint;
 use plitzer::session::Session;
@@ -26,8 +26,8 @@ pub struct Loader {
     /// read it without `state`, so a signal handler or another thread can
     /// save a checkpoint while a step waits on a read.
     snapshot: Mutex<Checkpoint>,
-    /// `Session::bytes_read` when the snapshot was taken, read without `state`.
-    bytes_read: AtomicU64,
+    /// `Session::bytes_counter`, read without `state`, also during a step.
+    bytes_read: Arc<AtomicU64>,
     seq_len: usize,
     /// The process that made the loader. See `check_process` and `Drop`.
     pid: u32,
@@ -52,23 +52,19 @@ impl State {
             .expect("only Drop takes the session")
             .checkpoint()
     }
-
-    fn bytes_read(&self) -> u64 {
-        let session = self.session.as_ref();
-        session.expect("only Drop takes the session").bytes_read()
-    }
 }
 
 impl Loader {
     fn from_session(session: Session) -> Self {
-        let seq_len = session.checkpoint().config.packing.seq_len as usize;
+        let seq_len = session.checkpoint().config.seq_len as usize;
+        let session_counter = session.bytes_counter();
         let state = State {
             session: Some(session),
             exhausted: false,
         };
         Loader {
             snapshot: Mutex::new(state.checkpoint()),
-            bytes_read: AtomicU64::new(state.bytes_read()),
+            bytes_read: session_counter,
             state: Mutex::new(state),
             seq_len,
             pid: std::process::id(),
@@ -95,7 +91,6 @@ impl Loader {
     fn save(&self, state: &State) {
         let checkpoint = state.checkpoint();
         *self.snapshot.lock().unwrap_or_else(|e| e.into_inner()) = checkpoint;
-        self.bytes_read.store(state.bytes_read(), Ordering::Relaxed);
     }
 
     /// The snapshot, refused in a forked child: a parent thread may have
@@ -135,7 +130,7 @@ impl Drop for Loader {
 impl Loader {
     #[new]
     #[pyo3(signature = (
-        location, *, seed, lanes, window, seq_len, docs, cap, pad, budget,
+        location, *, seed, lanes, window, seq_len, budget,
         rank=None, world=None, column="tokens".to_string(), cache=None, storage_options=None,
     ))]
     // Python callers pass these as keywords, so a struct would only add a
@@ -149,9 +144,6 @@ impl Loader {
         lanes: &Bound<'_, PyAny>,
         window: &Bound<'_, PyAny>,
         seq_len: &Bound<'_, PyAny>,
-        docs: &Bound<'_, PyAny>,
-        cap: &Bound<'_, PyAny>,
-        pad: &Bound<'_, PyAny>,
         budget: &Bound<'_, PyAny>,
         rank: Option<&Bound<'_, PyAny>>,
         world: Option<&Bound<'_, PyAny>>,
@@ -164,9 +156,6 @@ impl Loader {
             lanes,
             window,
             seq_len,
-            docs,
-            cap,
-            pad,
         };
         // The settings first: their errors are the simplest to fix.
         let at = placement(rank, world, budget)?;
@@ -198,13 +187,14 @@ impl Loader {
         if state.exhausted {
             return Ok(None);
         }
-        let mut tokens = vec![0; state.session().lanes().len() * self.seq_len];
-        let real = block_on(py, state.session().next(&mut tokens))?;
+        let lanes = state.session().lanes().len();
+        let mut tokens = vec![0; lanes * self.seq_len];
+        let step = block_on(py, state.session().next(&mut tokens))?;
         // Also after an error: the session then stands before the failed step.
         self.save(&state);
-        let real = real.map_err(session_error)?;
-        state.exhausted = real.is_none();
-        let batch = real.map(|lengths| Batch::new(py, tokens, lengths, self.seq_len));
+        let step = step.map_err(session_error)?;
+        state.exhausted = !step;
+        let batch = step.then(|| Batch::new(py, tokens, lanes, self.seq_len));
         batch.transpose()
     }
 
@@ -253,8 +243,8 @@ impl Loader {
         Ok(self.snapshot()?.epoch)
     }
 
-    /// The bytes of token chunks that this loader fetched from storage, up
-    /// to the end of its last call. See `Session::bytes_read`.
+    /// The bytes of token chunks that this loader fetched from storage, at
+    /// this moment: the prefetch reads between steps too.
     #[getter]
     fn bytes_read(&self) -> PyResult<u64> {
         self.check_process()?;

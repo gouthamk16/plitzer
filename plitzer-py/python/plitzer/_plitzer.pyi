@@ -47,16 +47,19 @@ class Batch:
 
     @property
     def tokens(self) -> Array:
-        """Shape (lanes, seq_len): one sequence per lane, padded with `pad`."""
-    @property
-    def lengths(self) -> Array:
-        """Shape (lanes,): the real (not pad) tokens of each sequence."""
+        """Shape (lanes, seq_len): one sequence of exactly L tokens per lane.
+        A lane packs its documents end to end with nothing dropped and no
+        padding, so a document can end in one sequence and go on in the
+        next."""
 
 class Loader:
     """The lanes of GPU `rank` of `world`, from one epoch to the next.
 
     Iterate it for the rest of the current epoch; the next iteration gives
-    the next epoch.
+    the next epoch. An epoch is ceil(T / (lanes * seq_len)) steps for the
+    dataset's T tokens. A lane's documents run on from one epoch into the
+    next, so at an epoch's end some lanes are a few documents into the next
+    epoch: nothing is dropped and nothing is padded.
     """
 
     def __init__(
@@ -67,9 +70,6 @@ class Loader:
         lanes: SupportsIndex,
         window: SupportsIndex,
         seq_len: SupportsIndex,
-        docs: SupportsIndex,
-        cap: SupportsIndex,
-        pad: SupportsIndex,
         budget: SupportsIndex,
         rank: SupportsIndex | None = None,
         world: SupportsIndex | None = None,
@@ -101,11 +101,9 @@ class Loader:
     @property
     def bytes_read(self) -> int:
         """The bytes of token chunks that this loader fetched from storage,
-        in every epoch, up to the end of its last call. It works during a
-        step too. One GPU reads each chunk once in an epoch with no resume;
-        a resume reads the row groups of the leftovers again. With more
-        GPUs, the sum over all of them divided by the dataset's chunk bytes
-        is the read amplification."""
+        in every epoch, at this moment: the prefetch reads between steps
+        too, a few windows ahead. With more GPUs, the sum over all of them
+        divided by the dataset's chunk bytes is the read amplification."""
 
 def merge(parts: Sequence[bytes | bytearray]) -> bytes:
     """One global checkpoint from the parts of all GPUs, in any order."""

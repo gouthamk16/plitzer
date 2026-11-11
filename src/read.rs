@@ -85,8 +85,8 @@ pub struct Reader {
     store: Arc<dyn ObjectStore>,
     prefix: Path,
     schema: SchemaDescPtr,
-    /// The bytes of every chunk fetched so far.
-    fetched: AtomicU64,
+    /// The bytes of every chunk fetched so far, shared with those who watch.
+    fetched: Arc<AtomicU64>,
 }
 
 impl Reader {
@@ -96,7 +96,7 @@ impl Reader {
             store,
             prefix,
             schema,
-            fetched: AtomicU64::new(0),
+            fetched: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -104,6 +104,11 @@ impl Reader {
     /// that then failed to decode. A failed fetch adds nothing.
     pub fn bytes_read(&self) -> u64 {
         self.fetched.load(Ordering::Relaxed)
+    }
+
+    /// The counter of `bytes_read`, to read at any time, also during a read.
+    pub fn bytes_counter(&self) -> Arc<AtomicU64> {
+        self.fetched.clone()
     }
 
     /// The tokens of each row of row group `row_group` of `index`.
