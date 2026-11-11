@@ -562,13 +562,14 @@ After step 3, `read` adds the length of the fetched chunk to an atomic counter. 
 - The input of v1 is a column of token lists. Tokenization in the loader is a later item (D-26).
 - `object_store` does not cut a large range, and AWS advises requests of 8 to 16 MB at the same time. Each piece is a separate `get_ranges` call, so that `object_store` does not merge the pieces again (D-27).
 - A negative token, a null token or a token larger than `u32::MAX` gives `Error::BadToken`. A null token would otherwise become token 0.
-- A chunk that decodes to a different number of rows than its footer gives `Error::Decode`. A level count that is not the slots of the record gives `Error::Slots`.
-- A chunk whose rows do not have the slots of its footer gives `Error::Slots`. The order cuts the slices by these slots, so a lane would otherwise find too few tokens.
+- A chunk that decodes to a different number of rows than its footer gives `Error::Decode`.
+- The order cuts the slices by the slots of the index, so the reader makes sure of two counts: the levels of the chunk are its slots, and its rows have those slots (a token, or one slot for a row with none). A level that is neither, such as a null struct around the integer, gives `Error::Slots`. A lane would otherwise find too few tokens.
+- The buffers have the size of the slots of the footer before the decode. A reservation that fails gives `Error::Decode`, not an abort.
 
 **Limits:**
 
 - The reader reads one row group at a time. The loader reads many row groups at the same time (section 5.7).
-- The levels take 4 bytes for each slot while a chunk decodes, and the reader frees them after the decode.
+- The levels take 4 bytes for each slot while a chunk decodes, and the reader frees them after the decode. An INT64 chunk also holds its values as 8 bytes for each slot until the copy into `u32`. The budget counts only the result, 4 bytes for each slot, so with 16 reads in flight the memory can be above the budget by these buffers.
 - A column of more than one list level, or a column that is not a list of plain integers, gives an index error.
 
 **Verification:**
@@ -585,6 +586,7 @@ After step 3, `read` adds the length of the fetched chunk to an atomic counter. 
 | `bad_tokens_are_errors` | Unit | A negative token and a null token each give `Error::BadToken`. |
 | `row_count_must_match_the_footer` | Unit | An index with 5 rows for a chunk of 3 rows gives `Error::Decode`. |
 | `slots_must_match_the_index` | Unit | `RowGroupTokens::slots` is the value count of the index, and an index with one more gives `Error::Slots`. |
+| `a_null_struct_around_a_token_is_an_error` | Unit | A `list<struct<int32>>` with a null struct passes the index, and its read gives `Error::Slots`. Without the check of the slots of the rows, the read loses a token. |
 | `reads_what_was_written` | Property | Random `list<int32>` and `list<uint32>` columns, with null and empty rows, a dictionary or not, and data pages of 1 to 63 rows, read back as written. A wrong row start or a null token read as a token fails it. |
 | `fetch_splits_large_ranges`, `pieces_cover_range` | Unit | The pieces cover the range with no gap and no overlap, and each piece is 16 MiB or less. |
 | `index_and_read_over_s3` | Integration | The index, the sidecar and the reader work against versitygw in the `s3` CI job. |

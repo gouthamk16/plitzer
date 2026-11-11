@@ -129,22 +129,8 @@ impl Reader {
                 source,
             })?;
         self.fetched.fetch_add(data.len() as u64, Ordering::Relaxed);
-        let path = || file.path.clone();
-        column::decode(self.schema.column(0), rg, data).map_err(|e| match e {
-            column::Fail::Parquet(source) => Error::Decode {
-                path: path(),
-                row_group,
-                source,
-            },
-            column::Fail::BadToken => Error::BadToken {
-                path: path(),
-                row_group,
-            },
-            column::Fail::Slots => Error::Slots {
-                path: path(),
-                row_group,
-            },
-        })
+        column::decode(self.schema.column(0), rg, data)
+            .map_err(|e| e.at(file.path.clone(), row_group))
     }
 
     fn location(&self, path: &str) -> Result<Path, Error> {

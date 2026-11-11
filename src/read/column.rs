@@ -23,8 +23,22 @@ pub(super) enum Fail {
     Parquet(ParquetError),
     /// A null token, or one that is negative or too large for `u32`.
     BadToken,
-    /// The levels do not have the slots of the index record.
+    /// The levels or the rows do not have the slots of the index record.
     Slots,
+}
+
+impl Fail {
+    pub(super) fn at(self, path: String, row_group: u32) -> super::Error {
+        match self {
+            Fail::Parquet(source) => super::Error::Decode {
+                path,
+                row_group,
+                source,
+            },
+            Fail::BadToken => super::Error::BadToken { path, row_group },
+            Fail::Slots => super::Error::Slots { path, row_group },
+        }
+    }
 }
 
 impl From<ParquetError> for Fail {
@@ -47,31 +61,45 @@ pub(super) fn decode(
         .build()?;
     let pages = SerializedPageReader::new(Arc::new(chunk), &meta, rg.rows as usize, None)?;
     let unsigned = unsigned(&column);
-    match column.physical_type() {
-        PhysicalType::INT32 => {
-            let (values, offsets) = read::<Int32Type>(column, pages, rg)?;
-            // UINT_8, UINT_16 and UINT_32 are stored with the bits of a u32.
-            if !unsigned && values.iter().any(|&t| t < 0) {
-                return Err(Fail::BadToken);
-            }
-            let len = values.len();
-            let tokens = ScalarBuffer::new(Buffer::from_vec(values), 0, len);
-            Ok(RowGroupTokens::from_parts(offsets, tokens))
-        }
-        PhysicalType::INT64 => {
-            let (values, offsets) = read::<Int64Type>(column, pages, rg)?;
-            let fits = |&t: &i64| match unsigned {
-                true => (t as u64) <= u64::from(u32::MAX),
-                false => (0..=i64::from(u32::MAX)).contains(&t),
-            };
-            if !values.iter().all(fits) {
-                return Err(Fail::BadToken);
-            }
-            let tokens: Vec<u32> = values.iter().map(|&t| t as u32).collect();
-            Ok(RowGroupTokens::from_parts(offsets, tokens.into()))
-        }
-        other => Err(ParquetError::General(format!("a token column of {other}")).into()),
+    let tokens = match column.physical_type() {
+        PhysicalType::INT32 => int32(read::<Int32Type>(column, pages, rg)?, unsigned)?,
+        PhysicalType::INT64 => int64(read::<Int64Type>(column, pages, rg)?, unsigned)?,
+        other => return Err(ParquetError::General(format!("a token column of {other}")).into()),
+    };
+    // A level that is neither a token nor an empty row, such as a null
+    // struct around the integer, has a slot in the index but no token.
+    if tokens.slots() != u64::from(rg.values) {
+        return Err(Fail::Slots);
     }
+    Ok(tokens)
+}
+
+/// INT32 values with no copy. UINT_8, UINT_16 and UINT_32 are stored with
+/// the bits of a u32; a signed type must not be negative.
+fn int32(
+    (values, offsets): (Vec<i32>, Vec<usize>),
+    unsigned: bool,
+) -> Result<RowGroupTokens, Fail> {
+    if !unsigned && values.iter().any(|&t| t < 0) {
+        return Err(Fail::BadToken);
+    }
+    let len = values.len();
+    let tokens = ScalarBuffer::new(Buffer::from_vec(values), 0, len);
+    Ok(RowGroupTokens::from_parts(offsets, tokens))
+}
+
+/// INT64 values copied into u32, each in its range.
+fn int64(
+    (values, offsets): (Vec<i64>, Vec<usize>),
+    unsigned: bool,
+) -> Result<RowGroupTokens, Fail> {
+    let token = |&t: &i64| match unsigned {
+        true => u32::try_from(t as u64),
+        false => u32::try_from(t),
+    };
+    let tokens: Result<Vec<u32>, _> = values.iter().map(token).collect();
+    let tokens = tokens.map_err(|_| Fail::BadToken)?;
+    Ok(RowGroupTokens::from_parts(offsets, tokens.into()))
 }
 
 /// The values of the chunk and the row offsets into them.
@@ -84,11 +112,7 @@ fn read<T: DataType>(
     let max_def = column.max_def_level();
     let nullable = column.self_type().is_optional();
     let mut reader = ColumnReaderImpl::<T>::new(column, Box::new(pages));
-    let (mut values, mut def, mut rep) = (
-        Vec::with_capacity(slots),
-        Vec::with_capacity(slots),
-        Vec::with_capacity(slots),
-    );
+    let (mut values, mut def, mut rep) = (buffer(slots)?, buffer(slots)?, buffer(slots)?);
     let (read, _, levels) =
         reader.read_records(rows, Some(&mut def), Some(&mut rep), &mut values)?;
     let more = reader
@@ -102,6 +126,16 @@ fn read<T: DataType>(
         return Err(Fail::Slots);
     }
     Ok((values, offsets(&def, &rep, max_def, nullable, rows)?))
+}
+
+/// An empty buffer with room for `slots` items. The count comes from the
+/// footer, so a corrupt one gives an error, not an abort.
+fn buffer<T>(slots: usize) -> Result<Vec<T>, Fail> {
+    let mut v = Vec::new();
+    v.try_reserve_exact(slots).map_err(|_| {
+        ParquetError::General(format!("no memory for the {slots} slots of the footer"))
+    })?;
+    Ok(v)
 }
 
 /// The row offsets from the levels: a row starts at each repetition level 0,

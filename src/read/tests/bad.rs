@@ -145,3 +145,27 @@ async fn bytes_read_counts_only_fetched_chunks() {
     assert!(matches!(gone, Err(Error::Fetch { .. })), "{:?}", gone.err());
     assert_eq!(reader.bytes_read(), len);
 }
+
+// A null struct around the integer has a slot in the footer but no token:
+// the reader refuses it, so a lane never finds fewer tokens than its slots.
+#[tokio::test]
+async fn a_null_struct_around_a_token_is_an_error() {
+    use arrow_array::builder::{ListBuilder, StructBuilder};
+    use arrow_schema::{DataType, Field};
+    let fields = vec![Field::new("t", DataType::Int32, true)];
+    let mut b = ListBuilder::new(StructBuilder::from_fields(fields, 3));
+    for valid in [true, false, true] {
+        let s = b.values();
+        s.field_builder::<Int32Builder>(0).unwrap().append_value(7);
+        s.append(valid);
+    }
+    b.append(true);
+    let d = data();
+    write(&d.path("x.parquet"), Arc::new(b.finish()), props(Compression::SNAPPY, false));
+    let Ok(index) = d.index().await else {
+        return; // the index refuses the column: no read can lose a token
+    };
+    let reader = Reader::new(d.store.clone(), d.prefix.clone(), &index).unwrap();
+    let got = reader.read(&index, 0).await;
+    assert!(matches!(got, Err(Error::Slots { .. } | Error::BadToken { .. })), "{got:?}");
+}
