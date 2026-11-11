@@ -6,13 +6,13 @@ import numpy as np
 import pyarrow.parquet as pq
 import pytest
 
-from plitzer.bench import baseline, fineweb
+from plitzer.bench import baseline, fineweb, phases
 
 # The adapters need the `baseline` extra: Mosaic, `datasets` and torch.
 pytest.importorskip("streaming")
 pytest.importorskip("datasets")
 
-RUN = baseline.Run(seed=3, batch=8, workers=2)
+RUN = phases.Run(seed=3, batch=8, workers=2)
 LENGTHS = [np.array([(7 * i) % 13 for i in range(g, g + 40)]) for g in (0, 40, 80)]
 
 
@@ -25,7 +25,7 @@ def data(tmp_path_factory: pytest.TempPathFactory) -> Path:
     return out
 
 
-def doc_key(doc: baseline.Doc) -> str:
+def doc_key(doc: phases.Doc) -> str:
     return hashlib.sha256(np.asarray(doc, np.int32).tobytes()).hexdigest()
 
 
@@ -34,13 +34,14 @@ def source(data: Path) -> list[str]:
     return sorted(doc_key(np.array(d, np.int32)) for d in column)
 
 
-@pytest.mark.parametrize("name", list(baseline.LOADERS))
+# plitzer packs documents into sequences: test_compare.py checks its tokens.
+@pytest.mark.parametrize("name", sorted(set(phases.LOADERS) - phases.PACKED))
 def test_an_epoch_gives_each_document_once(
     name: str, data: Path, tmp_path: Path
 ) -> None:
-    load = baseline.loader(name)
+    load = phases.loader(name)
     prepared = load.convert(data, tmp_path)
-    one = baseline.Run(seed=3, batch=8, workers=0)
+    one = phases.Run(seed=3, batch=8, workers=0)
     got = [doc_key(d) for batch in load.open(data, prepared, one, None) for d in batch]
     assert sorted(got) == source(data)
 
@@ -52,13 +53,13 @@ def test_resume_is_exact(name: str, data: Path, tmp_path: Path) -> None:
     assert r.exact and r.lost == 0
     assert r.convert_bytes > 0 and r.docs_per_s > 0 and r.tokens_per_s > 0
     assert r.resume_s > 0
-    assert (r.cores is None) == (not baseline.workers_counted())
+    assert (r.cores is None) == (not phases.workers_counted())
 
 
 def test_cpu_counts_this_process() -> None:
     # Until 0.1 s of CPU, not of wall time: a busy runner can deschedule us.
-    start, deadline = baseline.cpu(), time.perf_counter() + 30
-    while baseline.cpu() - start < 0.1:
+    start, deadline = phases.cpu(), time.perf_counter() + 30
+    while phases.cpu() - start < 0.1:
         assert time.perf_counter() < deadline, "cpu() never grew"
 
 

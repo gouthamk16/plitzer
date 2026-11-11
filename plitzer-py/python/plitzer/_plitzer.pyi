@@ -105,5 +105,9 @@ class Loader:
         too, a few windows ahead. With more GPUs, the sum over all of them
         divided by the dataset's chunk bytes is the read amplification."""
 
+DEBUG: bool
+"""Whether this is a debug build. Benchmarks refuse one: it runs several
+times slower than a release build."""
+
 def merge(parts: Sequence[bytes | bytearray]) -> bytes:
     """One global checkpoint from the parts of all GPUs, in any order."""
