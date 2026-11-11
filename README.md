@@ -58,7 +58,7 @@ The design, its rationale and the decision log are in [docs/design.md](docs/desi
 
 ## TODO
 
-- [ ] **Benchmark baseline:** measure MosaicML Streaming and HF `datasets` on a FineWeb-Edu Parquet sample (conversion time, samples/s, CPU cores used, resume time)
+- [x] **Benchmark baseline:** measure MosaicML Streaming and HF `datasets` on a FineWeb-Edu Parquet sample (conversion time, samples/s, CPU cores used, resume time) (`plitzer.bench.baseline`, [design §5.14](docs/design.md#514-baseline-harness))
 - [x] **Ordering core:** shuffle row groups per epoch, split each window into lane slices, and shuffle each slice (`rand_chacha`). Property tests:
   - [x] each epoch yields every sample exactly once
   - [x] each lane's slice is one contiguous stretch of storage
@@ -66,7 +66,7 @@ The design, its rationale and the decision log are in [docs/design.md](docs/desi
 - [x] **Lanes:** pack each lane's documents into fixed-length sequences, and checkpoint each lane's position. Property tests:
   - [x] resuming at step k matches the tail of an uninterrupted run
   - [x] global batches are identical across GPU counts
-- [x] **Lossless packing:** fill each sequence from the rest of the current document and whole documents, with lanes running on across epochs, so no token is dropped or padded (was 19.3% lost on FineWeb-Edu lengths)
+- [x] **Lossless packing:** cut lane slices by tokens and fill each sequence to exactly L, with lanes running on across epochs, so no token is dropped or padded (was 19.3% lost on FineWeb-Edu lengths)
 - [x] **Index:** build a row-group index from Parquet footers, with caching
 - [x] **I/O:** async reads with `object_store` (local disk and S3, tested against versitygw), plus a prefetch queue capped by bytes
   - [x] read one row group's token column without its footer (local disk and S3)

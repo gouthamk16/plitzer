@@ -130,6 +130,7 @@ flowchart LR
 | Python bindings | `plitzer-py/` | Implemented | [5.11](#511-python-bindings) |
 | PyTorch dataset | `plitzer-py/python/plitzer/torch.py` | Implemented | [5.12](#512-pytorch-dataset) |
 | Benchmark harness | `plitzer-py/python/plitzer/bench/` | Implemented | [5.13](#513-benchmark-harness) |
+| Baseline harness | `plitzer-py/python/plitzer/bench/baseline.py`, `mosaic.py`, `hf.py` | Implemented | [5.14](#514-baseline-harness) |
 
 ## 5. Component design
 
@@ -1102,6 +1103,87 @@ def table(results: Sequence[World]) -> str: ...   # Markdown
 | `test_build_retries_a_server_error` | pytest | A build succeeds after 3 responses of 503. After 4, `RangeFile` gives the `HTTPError`. |
 | `test_write_refuses_a_row_group_past_int32` | pytest | A row group of 2³¹ tokens gives `ValueError`, and no file. |
 
+### 5.14 Baseline harness
+
+**Function:** `plitzer.bench.baseline` measures how other loaders read the Parquet files that plitzer reads. For each loader, it measures:
+
+- the conversion;
+- one shuffled epoch (documents and tokens each second, CPU cores used);
+- a resume at the middle of the epoch.
+
+The resume measurements are the wait for the first batch, whether the rest of the epoch is the same as an uninterrupted run, and how many documents the resume loses. The adapters need the `baseline` extra (torch, `mosaicml-streaming`, `datasets`).
+
+**Interface (`plitzer/bench/baseline.py`):**
+
+```python
+# python -m plitzer.bench.baseline DATA --loaders mosaic,hf,hf-stream --batch 64 --workers 4
+class Run(NamedTuple): seed: int; batch: int; workers: int
+class Opened(Protocol):                       # a loader at the start of an epoch or at a state
+    def __iter__(self) -> Iterator[list[Doc]]: ...
+    def state(self) -> object: ...            # after the batches given so far
+class Loader(Protocol):
+    def convert(self, data: Path, work: Path) -> Path: ...
+    def open(self, data: Path, prepared: Path, run: Run, state: object) -> Opened: ...
+class Result(NamedTuple): loader; convert_s; convert_bytes; docs_per_s; tokens_per_s
+                          cores: float | None; resume_s; exact: bool; lost: int
+LOADERS: dict[str, tuple[str, str]]           # name -> (module, class) of plitzer.bench
+def measure(name: str, data: Path, work: Path, run: Run, resume_at: int) -> Result: ...
+def table(results: Sequence[Result]) -> str: ...
+```
+
+**Design:**
+
+- `mosaic`: `MDSWriter` converts the files to MDS shards with zstd. Each document is one sample, with its tokens as bytes, as llm-foundry writes them (D-75). A shuffled `StreamingDataset` with a `StreamingDataLoader` reads them, with `run.workers` workers. The collate function gives a dict of lists (D-75). The state is `state_dict()`.
+- `hf`: `load_dataset("parquet")` converts the files to an Arrow cache. `shuffle(seed)` gives a random order, and each batch is a slice of the shuffled dataset. The state is the index of the next document, as `accelerate.skip_first_batches` uses for a map-style sampler.
+- `hf-stream`: `load_dataset(..., streaming=True)` reads the files with no conversion, through a shuffle buffer of 10 000 documents. The state is `state_dict()`, which does not hold the buffer.
+- The HF loaders iterate in the main process: `IterableDataset.state_dict()` counts only what the main process takes (D-76).
+- Each phase runs in a new `spawn` process (D-73). The phases are the conversion, the timed epoch, the tail and the resume. The process times its own work, so imports and the start of the process do not count.
+- The CPU time is `os.times()` of the process, with the workers that it joined. Cores is CPU time divided by wall time. Cores is unknown when `os.times()` cannot count the workers: on Windows, and when the start method is `forkserver` (the Linux default from Python 3.14), whose workers are not children of the phase process.
+- The timed epoch counts documents and tokens, and saves the state after `resume_at` batches. It makes no digest, so the time is only the loader's work. Its clock starts after `open`: it measures the pace of the loader. The clock of the resume starts before `open`, because a resume waits for the loader to start.
+- The tail phase runs an uninterrupted epoch again, with no clock, and makes a digest of all batches after the first `resume_at`. The resume runs to the end of the epoch, with the same digest. `exact` is true if the two digests are the same. `lost` is the documents of the uninterrupted rest minus the documents of the resumed rest (D-74).
+- `measure` refuses an unknown loader and a `resume_at` below 1. The epoch refuses a `resume_at` with no batch after it. The CLI refuses an unknown or repeated loader name before it starts.
+
+**Rationale:** The same files, seed, batch size (in documents), worker count and epoch feed each loader. The input is the FineWeb-Edu-shaped dataset of section 5.13 (D-72). The loaders iterate documents, which is the unit that each loader gives.
+
+**Limits:**
+
+- The numbers depend on the computer. Compare rows of one table, not tables from different computers.
+- `cores` is unknown on Windows and with the `forkserver` start method.
+- The `hf` rows use no DataLoader workers (D-76).
+- The time of the first batch of a resume includes the start of the loader: for Mosaic, the dataset and its workers; for `hf`, the cache and the shuffle. The shuffle of `hf` uses the index file that the earlier phases wrote, as a resumed job uses the file of its first run.
+- Each loader reads the data three times after the conversion: the timed epoch, the tail and the resume.
+
+**Verification:**
+
+| Test | Type | Checks |
+|---|---|---|
+| `test_an_epoch_gives_each_document_once` | pytest | For each loader, one epoch gives each document of the source one time, also the empty ones. |
+| `test_resume_is_exact` | pytest | Mosaic and `hf` resume at batch 5 with the rest of the epoch of an uninterrupted run, and lose no document. The other fields are positive, and `cores` is unknown only where `workers_counted()` is false. |
+| `test_a_streaming_resume_loses_the_shuffle_buffer` | pytest | `hf-stream` needs no conversion. Its resume is not exact, and it loses the 80 documents that its buffer held. |
+| `test_cpu_counts_this_process` | pytest | `cpu()` grows by 0.1 s while this process works, within 30 s of wall time. |
+| `test_resume_at_must_be_inside_the_epoch` | pytest | A resume after the last batch, or at 0, gives an error. |
+| `test_main_refuses_unknown_or_repeated_loaders` | pytest | The CLI refuses `hf,hf_stream` and `hf,hf` before it starts. |
+| `test_main_prints_a_row_for_each_loader` | pytest | The CLI prints one table row for each loader. |
+
+These tests run in a CI job of their own (`baseline`, on Linux), which installs the loaders. `mosaicml-streaming` pins numpy below 2.2, and the other tests run with the newest numpy. Other jobs skip these tests.
+
+**Results:** One run on 4 CPU cores, 15 GiB of RAM and a local disk:
+- The data is the 512 row groups of section 6: 512 000 documents, 1104 MiB of Parquet token chunks.
+- The settings are batch 64, 4 workers for Mosaic, seed 0, and a resume at batch 4000 of 8000.
+- The library versions are `mosaicml-streaming` 0.13.0, `datasets` 5.0.1 and torch 2.15.0 (CPU).
+
+| loader | convert (s) | converted (MiB) | docs/s | Mtokens/s | cores | resume (s) | exact resume | docs lost |
+|---|---|---|---|---|---|---|---|---|
+| mosaic | 22.3 | 1222 | 28 014 | 28.8 | 2.68 | 2.89 | yes | 0 |
+| hf | 4.5 | 2009 | 86 357 | 88.7 | 1.00 | 0.18 | yes | 0 |
+| hf-stream | 0.0 | 0 | 2 949 | 3.0 | 1.10 | 3.06 | no | 10 000 |
+
+- The computer is a shared cloud computer. An earlier run timed the digest inside the epoch, so its `hf` speed was 20 % lower. Its Mosaic and `hf-stream` values were the same within 5 %, but its Mosaic conversion took 53.5 s. Thus the conversion time of Mosaic is 22 to 54 s.
+- Mosaic needs a conversion, and a second copy of the data. It uses 2.7 cores for 28 000 documents each second. Its resume is exact.
+- `hf` makes a second copy of 2 GiB, 1.8 times the Parquet chunks, because the Arrow cache is not compressed. All of the cache fits in the page cache of this computer, so its random access does not wait for the disk. On a dataset larger than RAM, each batch reads from random positions of the disk.
+- `hf-stream` needs no copy, but it gives 2900 documents each second, and its resume loses the 10 000 documents of its buffer. Thus it is neither fast nor resumable without loss.
+- Section 7 keeps the comparison with plitzer as an open question. The next PR adds plitzer to this table.
+
 ## 6. Read amplification
 
 **Problem:** A naive split gives each GPU a random part of a shuffled batch. Each GPU then needs a document from almost each row group of the window. Each GPU reads approximately world times its own data.
@@ -1145,6 +1227,7 @@ def table(results: Sequence[World]) -> str: ...   # Markdown
 | How well do documents mix inside one sequence on a sorted dataset? | The value of W. |
 | What are the statistics of the batch of each GPU? | Possible bias between GPUs. |
 | What is the best trade-off between W and memory? | The default W. |
+| How fast is plitzer, with how many cores, against the baseline of section 5.14? | The benchmark table in the README. |
 
 ## 8. Decision log
 
@@ -1213,6 +1296,11 @@ def table(results: Sequence[World]) -> str: ...   # Markdown
 | D-69 | Measure the read amplification on FineWeb-Edu lengths, with random tokens. | The amplification depends only on the row counts and chunk bytes. `token_count` gives the real lengths from a few MB of each file. | Tokenize the text: 10B tokens, which is too much for a benchmark run. | #24 |
 | D-70 | `Loader.bytes_read` is the count at the end of the last call. | A thread can read it during a step, as it can read `checkpoint()`. D-85 replaces this. | A live count, which needs the session lock during a step, or a new shared counter in `Session`. | #24 |
 | D-71 | No cache on each node. | When world divides W, the measured amplification is 1. Otherwise it is near 1 + (world − 1)/W, so a W of several times world keeps it small: 1.016 at W = 300 for 8 GPUs (section 6). With slices cut by slots (D-86), it is near 1 + (world − 1)/W also when world divides W: 1.013 at W = 512 for 8 GPUs. | A cache on each node that GPUs share. | #24 |
+| D-72 | The baseline reads the FineWeb-Edu-shaped dataset of section 5.13. | Each loader reads the same files. The speed of a loader does not depend on the token values (D-69). | A tokenized copy of the text: 10B tokens, and a different input from the plitzer measurement. | #25 |
+| D-73 | Each phase of the baseline runs in a new process and times itself. | No page of a worker, shared-memory segment or warm object goes from one phase to the next, and imports do not count. | One process for all phases. | #25 |
+| D-74 | The resume check runs to the end of the epoch and compares a digest of all later batches. | A resume that keeps its first batch but loses documents later passes a check of the first batch only. `hf-stream` loses its buffer this way. | Compare only the first batch after the resume. | #25 |
+| D-75 | The Mosaic adapter writes tokens as bytes, and its collate function gives a dict of lists. | The `ndarray` encoding refuses an empty document. `StreamingDataLoader` counts the samples of a batch from its first value, so a list batch saves a wrong state. | `ndarray:int32` and `collate_fn=list`. | #25 |
+| D-76 | The HF adapters iterate in the main process, with no DataLoader workers. | `IterableDataset.state_dict()` counts only what the main process takes. With workers, the state is wrong. | A `DataLoader` with workers, or `torchdata`'s `StatefulDataLoader`, which is one more dependency. | #25 |
 | D-77 | Each step takes tokens until the sequence is full: the rest of the current document, then whole documents, cut at exactly L. There is no D, no cap and no pad token. | A fixed D gives L tokens only on average, so the leftover is a random walk: it hits the cap and drops tokens, or it empties and pads. On FineWeb-Edu lengths with D = 2 and C = 2048, 19.3 % of the tokens were lost. | A fixed D with a larger cap: 1.6 % lost at C = 128k, more memory, and the walk grows with the dataset. | #26 |
 | D-78 | A lane position is `(epoch, window, token)`, and `fill` copies from the row group into `out`, one copy for each piece. | The index gives the slots of each slice, so a position is checked and found with no read, and a resume reads only the slice of each lane. Pack time went from 1.17 to 0.53 ns for each token. | A leftover buffer, and a replay of it at a resume. | #26 |
 | D-79 | The stream of a lane goes on into the next epoch. An epoch is S = ⌈T/(B·L)⌉ steps. | No lane waits or pads at the end of an epoch. Each GPU gets S from the index. | Flush steps with pad tokens at each epoch end. | #26 |
@@ -1250,6 +1338,7 @@ def table(results: Sequence[World]) -> str: ...   # Markdown
 | 2026-10-26 | #21 | Add the PyTorch dataset (`plitzer/torch.py`): `Dataset`, `TokenBatch` and a collective `state_dict()`. torch is the optional extra `plitzer[torch]`. CI installs the CPU build of torch. |
 | 2026-11-05 | #23 | Add the end-to-end tests that kill a training run at a random step and resume it on another number of processes (`plitzer-py/tests/e2e.py`, `e2e_stream.py`, `e2e_torch.py`). |
 | 2026-11-09 | #24 | Add `bytes_read` (`Reader`, `Session`, `Loader`) and `plitzer.bench` (section 5.13). Measure the read amplification on FineWeb-Edu lengths (section 6). Correct the bound to 1 + ⌈n/W⌉(world − 1)/n. |
+| 2026-11-11 | #25 | Add `plitzer.bench.baseline`, with adapters for MosaicML Streaming and HF `datasets` (section 5.14), and measure the baseline. |
 | 2026-11-11 | #26 | Lossless packing: lane slices are cut by slots (tokens and empty rows), so lanes take the same share of the tokens and stay together. Each step fills the sequence from the rest of the current piece and whole pieces, and lanes go on across epochs (`src/pack/lane.rs`, `src/pack/pieces.rs`). The reader checks the slots of each row group. Remove D, C, the pad token and `Batch.lengths`. The loader reads in window order with a budget for the reads ahead (`src/load/sequence.rs`, `prefetch.rs`, `buffer.rs`), and the replay is removed. Checkpoint version 2. `bytes_read` is live. |
 
 ## 10. Maintenance
