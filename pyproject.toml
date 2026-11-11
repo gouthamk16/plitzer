@@ -5,13 +5,26 @@ build-backend = "maturin"
 [project]
 name = "plitzer"
 description = "Deterministic, resumable dataloader for Parquet on local disk and S3"
+readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT OR Apache-2.0"
+license-files = ["LICENSE-MIT", "LICENSE-APACHE"]
+authors = [{ name = "gouthamk16" }]
+keywords = ["dataloader", "parquet", "pytorch", "llm", "pretraining", "s3", "deterministic"]
 dynamic = ["version"]
 classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Programming Language :: Rust",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Typing :: Typed",
 ]
 
 [project.optional-dependencies]
@@ -25,13 +38,22 @@ baseline = ["plitzer[bench,torch]", "mosaicml-streaming>=0.13", "datasets>=3"]
 
 [project.urls]
 Repository = "https://github.com/gouthamk16/plitzer"
+Documentation = "https://github.com/gouthamk16/plitzer/blob/main/docs/design.md"
+Issues = "https://github.com/gouthamk16/plitzer/issues"
+Changelog = "https://github.com/gouthamk16/plitzer/blob/main/CHANGELOG.md"
 
 [dependency-groups]
 dev = ["maturin>=1.15,<2", "mypy>=1.13", "numpy>=2.1", "pyarrow>=18", "pytest>=8", "ruff>=0.8"]
 
 [tool.maturin]
-python-source = "python"
+manifest-path = "plitzer-py/Cargo.toml"
+python-source = "plitzer-py/python"
 module-name = "plitzer._plitzer"
+# Repository files that a source build does not need.
+exclude = [
+    { path = ".github/**", format = "sdist" },
+    { path = "CLAUDE.md", format = "sdist" },
+]
 
 [tool.ruff]
 target-version = "py311"
@@ -46,7 +68,7 @@ known-first-party = ["plitzer", "conftest", "e2e", "e2e_stream", "e2e_torch"]
 strict = true
 python_version = "3.11"
 # The stubs and conftest, without a built extension.
-mypy_path = ["python", "tests"]
+mypy_path = ["plitzer-py/python", "plitzer-py/tests"]
 
 [[tool.mypy.overrides]]
 # pyarrow and datasets ship no type information. streaming does, but CI

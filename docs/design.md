@@ -5,7 +5,7 @@
 | Field | Value |
 |---|---|
 | Status | Active. It changes with each feature PR. The code is pre-alpha. |
-| Last change | 2026-11-11, PR #26 |
+| Last change | 2026-11-11, PR #28 |
 | Language standard | ASD-STE100 (Simplified Technical English) |
 | Code | `src/` at the commit of this file |
 
@@ -131,6 +131,7 @@ flowchart LR
 | PyTorch dataset | `plitzer-py/python/plitzer/torch.py` | Implemented | [5.12](#512-pytorch-dataset) |
 | Benchmark harness | `plitzer-py/python/plitzer/bench/` | Implemented | [5.13](#513-benchmark-harness) |
 | Baseline harness | `plitzer-py/python/plitzer/bench/baseline.py`, `mosaic.py`, `hf.py` | Implemented | [5.14](#514-baseline-harness) |
+| Packaging and release | `pyproject.toml`, `.github/workflows/release.yml` | Implemented | [5.15](#515-packaging-and-release) |
 
 ## 5. Component design
 
@@ -1184,6 +1185,54 @@ These tests run in a CI job of their own (`baseline`, on Linux), which installs 
 - `hf-stream` needs no copy, but it gives 2900 documents each second, and its resume loses the 10 000 documents of its buffer. Thus it is neither fast nor resumable without loss.
 - Section 7 keeps the comparison with plitzer as an open question. The next PR adds plitzer to this table.
 
+### 5.15 Packaging and release
+
+**Function:** The release workflow builds the Python package for each platform, tests each wheel, and publishes the wheels and the sdist to PyPI.
+
+**Interface:**
+
+```sh
+pip install plitzer                 # a wheel; "plitzer[torch]" adds the PyTorch dataset
+maturin develop --release           # from the repository root, into the active virtualenv
+maturin sdist                       # the source package
+git tag v0.1.0 && git push --tags   # a release: the tag must be the Cargo version
+```
+
+`plitzer.__version__` is the version of the installed package.
+
+**Design:**
+
+- `pyproject.toml` is at the root of the repository. `[tool.maturin]` gives the manifest `plitzer-py/Cargo.toml` and the Python source `plitzer-py/python`. Thus the README and both licence files are in the package, and `pip install` of the repository works (D-90).
+- The extension uses the abi3 interface of CPython 3.11. Thus one wheel for each platform covers each CPython from 3.11.
+- `.github/workflows/release.yml` builds five artifacts with `maturin-action`:
+  - a wheel for Linux x86_64 (manylinux 2.28);
+  - a wheel for Linux aarch64, on an arm runner;
+  - a universal2 wheel for macOS;
+  - a wheel for Windows x64;
+  - the sdist.
+- Each wheel goes into a new virtualenv on its own system, with no Rust and no source tree. `test_loader.py` and `test_export.py` then run against it. A wheel is also built from the sdist.
+- A pull request that changes the workflow runs the builds and the tests. A `v*` tag also runs the publish job. That job refuses a tag that is not the Cargo version, and publishes with PyPI trusted publishing, in the `pypi` environment (D-91).
+
+**Rationale:**
+
+- The aarch64 wheel builds on an arm runner, not with a cross compiler. `aws-lc-sys`, the TLS library of the S3 client, needs a C compiler for its target.
+- One universal2 wheel serves both kinds of Mac, and the arm runner tests it.
+- Trusted publishing needs no token in the repository. PyPI accepts only this workflow of this repository.
+
+**Limits:**
+
+- The x86_64 half of the macOS wheel is built but not run in CI.
+- The first publish needs a pending trusted publisher on pypi.org: project `plitzer`, workflow `release.yml`, environment `pypi`. Only the owner of the repository can add it.
+- Linux wheels need glibc 2.28 or later. There is no musl wheel.
+
+**Verification:**
+
+| Check | Type | What it shows |
+|---|---|---|
+| `wheels` job | CI | Each of the 4 wheels builds, installs into a new virtualenv, and passes `test_loader.py` and `test_export.py` on its own system. |
+| `sdist` job | CI | The sdist builds, and a wheel built from it imports and gives `plitzer.__version__`. |
+| `twine check` | Manual | The wheel and the sdist have valid metadata. The README renders, and both licence files are in the wheel. |
+
 ## 6. Read amplification
 
 **Problem:** A naive split gives each GPU a random part of a shuffled batch. Each GPU then needs a document from almost each row group of the window. Each GPU reads approximately world times its own data.
@@ -1312,6 +1361,8 @@ These tests run in a CI job of their own (`baseline`, on Linux), which installs 
 | D-85 | `Loader.bytes_read` reads the shared counter of the reader, with no lock. | The benchmark must count the reads ahead while they arrive. A thread can read it during a step. | The count at the end of the last call (D-70). | #26 |
 | D-86 | Cut the lane slices by slots, the tokens and empty rows that the footer counts, and cut a row at a slice edge. | Each lane takes L tokens a step, so each needs the same share of the tokens. With slices of equal document counts, lanes went apart by 3.9 windows in one epoch and 11.8 in six on FineWeb-Edu lengths, and an epoch took 20 s, not 1.6 s. | Slices by documents (D-10), or slice edges at the nearest document, which need the rows before the slices are known. | #26 |
 | D-87 | The reader refuses a chunk whose rows do not have the slots of the index. | The slices are cut by these slots, so a lane would find too few tokens with no clear error. | Trust the footer. | #26 |
+| D-90 | `pyproject.toml` is at the root of the repository, and points maturin to `plitzer-py/Cargo.toml`. | The README and the licence files are at the root, and PEP 639 refuses a licence path with `..`. `pip install` of the repository needs a `pyproject.toml` at its root. | Copies of the README and the licences in `plitzer-py/`. | #28 |
+| D-91 | Publish from a `v*` tag with PyPI trusted publishing, after each wheel passes its tests on its own system. | No token is in the repository. A wheel that does not import fails before PyPI gets it. | A PyPI token as a secret, and a publish with no test of the wheels. | #28 |
 | D-22 | The sidecar uses its own binary format and FNV-1a. | No new dependency, and the bytes are fixed by our code. | `serde` with `bincode`, or JSON. | #10 |
 | D-23 | A sidecar that does not exist or is corrupt causes a new build. | The sidecar is only a cache. | An error that the user must correct. | #10 |
 | D-24 | The index keeps the place of each token column chunk, and the reader reads no footer. | A window has row groups from approximately W files. A footer read for each row group costs approximately 1.5 times the data. | Read the footer of each file again, or keep footers in memory (9.4 GB for FineWeb-Edu). | #12 |
@@ -1340,6 +1391,7 @@ These tests run in a CI job of their own (`baseline`, on Linux), which installs 
 | 2026-11-09 | #24 | Add `bytes_read` (`Reader`, `Session`, `Loader`) and `plitzer.bench` (section 5.13). Measure the read amplification on FineWeb-Edu lengths (section 6). Correct the bound to 1 + ⌈n/W⌉(world − 1)/n. |
 | 2026-11-11 | #25 | Add `plitzer.bench.baseline`, with adapters for MosaicML Streaming and HF `datasets` (section 5.14), and measure the baseline. |
 | 2026-11-11 | #26 | Lossless packing: lane slices are cut by slots (tokens and empty rows), so lanes take the same share of the tokens and stay together. Each step fills the sequence from the rest of the current piece and whole pieces, and lanes go on across epochs (`src/pack/lane.rs`, `src/pack/pieces.rs`). The reader checks the slots of each row group. Remove D, C, the pad token and `Batch.lengths`. The loader reads in window order with a budget for the reads ahead (`src/load/sequence.rs`, `prefetch.rs`, `buffer.rs`), and the replay is removed. Checkpoint version 2. `bytes_read` is live. |
+| 2026-11-11 | #28 | Add the release workflow (section 5.15): wheels for 4 platforms and an sdist, a test of each wheel on its own system, and PyPI trusted publishing on a `v*` tag. Move `pyproject.toml` to the root, with the README, the licences and the package metadata. Add `plitzer.__version__` and `CHANGELOG.md`. |
 
 ## 10. Maintenance
 
