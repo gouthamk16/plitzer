@@ -144,12 +144,6 @@ impl Epoch {
     pub fn windows(&self) -> &[Window] {
         &self.windows
     }
-
-    /// The slots of lane `lane` in the whole epoch.
-    pub fn lane_slots(&self, lane: u32) -> u64 {
-        let order = self.order();
-        self.windows.iter().map(|w| order.lane_len(w, lane)).sum()
-    }
 }
 
 /// What the next sequence of a lane needs.

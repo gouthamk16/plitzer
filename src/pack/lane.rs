@@ -52,20 +52,11 @@ impl At {
 /// The current slice's pieces, and where the lane stands in them.
 struct Built {
     pieces: Vec<Piece>,
-    /// The row groups of the pieces, and their tokens.
+    /// The row groups of the slice, and its tokens.
     groups: Vec<u32>,
     tokens: u64,
     next: usize,
     offset: usize,
-}
-
-impl Built {
-    fn missing(&self, tokens: &impl Tokens) -> Option<u32> {
-        self.groups
-            .iter()
-            .copied()
-            .find(|&g| tokens.row_group(g).is_none())
-    }
 }
 
 /// One lane's packer.
@@ -143,24 +134,9 @@ impl Lane {
             if at.empty || dry == 3 {
                 return Need::Empty(at_lane(self.lane, NO_TOKENS));
             }
-            // A row group can be in memory for another epoch's window and
-            // leave with it, so the cached slice is checked too.
-            let cached = self.built.as_ref().filter(|_| first);
-            first = false;
-            let total = match cached {
-                Some(b) => match b.missing(tokens) {
-                    None => b.tokens,
-                    Some(row_group) => {
-                        return Need::Missing {
-                            slice: self.slice(),
-                            row_group,
-                        };
-                    }
-                },
-                None => match self.count(&at, tokens) {
-                    Ok(total) => total,
-                    Err(need) => return need,
-                },
+            let total = match self.total(&at, first, tokens) {
+                Ok(total) => total,
+                Err(need) => return need,
             };
             if token > total {
                 let why = format!("{:?} is past its slice's tokens", self.position());
@@ -173,7 +149,7 @@ impl Lane {
             if rest > 0 {
                 dry = 0;
             }
-            (want, token) = (want - rest, 0);
+            (want, token, first) = (want - rest, 0, false);
             at.advance(&self.orders, self.lane);
         }
     }
@@ -209,16 +185,26 @@ impl Lane {
         }
     }
 
-    /// The tokens of the slice at `at`, or what stops their count.
-    fn count(&self, at: &At, tokens: &impl Tokens) -> Result<u64, Need> {
-        let (order, w) = (at.epoch.order(), at.window());
+    /// The tokens of the slice at `at`, from the built pieces when `at` is
+    /// where the lane stands, or what stops their count.
+    fn total(&self, at: &At, here: bool, tokens: &impl Tokens) -> Result<u64, Need> {
         let slice = (at.epoch.number, at.window);
-        match pieces::pieces(&order, w, self.lane, tokens) {
-            Ok(p) => Ok(p.iter().map(Piece::tokens).sum::<usize>() as u64),
-            Err(Unbuilt::Missing(row_group)) => Err(Need::Missing { slice, row_group }),
-            Err(Unbuilt::Mismatch(g)) => {
+        let unbuilt = |e| match e {
+            Unbuilt::Missing(row_group) => Need::Missing { slice, row_group },
+            Unbuilt::Mismatch(g) => {
                 let why = format!("row group {g} has fewer tokens than its slots in the index");
-                Err(Need::Bad(at_lane(self.lane, &why)))
+                Need::Bad(at_lane(self.lane, &why))
+            }
+        };
+        match self.built.as_ref().filter(|_| here) {
+            // A row group can be in memory for another epoch's window and
+            // leave with it, so the built slice is checked too.
+            Some(b) => match b.groups.iter().find(|&&g| tokens.row_group(g).is_none()) {
+                None => Ok(b.tokens),
+                Some(&g) => Err(unbuilt(Unbuilt::Missing(g))),
+            },
+            None => {
+                pieces::count(&at.epoch.order(), at.window(), self.lane, tokens).map_err(unbuilt)
             }
         }
     }
@@ -228,15 +214,12 @@ impl Lane {
     fn built(&mut self, tokens: &impl Tokens) -> &mut Built {
         if self.built.is_none() {
             let order = self.at.epoch.order();
-            let pieces = pieces::pieces(&order, self.at.window(), self.lane, tokens)
+            let (pieces, groups) = pieces::pieces(&order, self.at.window(), self.lane, tokens)
                 .unwrap_or_else(|_| panic!("`need` found the slice in memory"));
             let (mut next, mut left) = (0, self.token as usize);
             while left > 0 && left >= pieces[next].tokens() {
                 (next, left) = (next + 1, left - pieces[next].tokens());
             }
-            let mut groups: Vec<u32> = pieces.iter().map(|p| p.row_group).collect();
-            groups.sort_unstable();
-            groups.dedup();
             let total = pieces.iter().map(Piece::tokens).sum::<usize>() as u64;
             self.built = Some(Built {
                 pieces,

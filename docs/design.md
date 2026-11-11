@@ -319,7 +319,6 @@ impl Orders {
 impl Epoch {
     pub fn order(&self) -> Order<'_>;
     pub fn windows(&self) -> &[Window];
-    pub fn lane_slots(&self, lane: u32) -> u64;
 }
 impl Lane {
     pub fn new(orders: &Arc<Orders>, lane: u32, at: Position) -> Result<Lane, String>;
@@ -641,6 +640,7 @@ The cost of a row group is its decoded size: `values · 4 + (rows + 1) · 8` byt
 **Limits:**
 
 - A step that waits for a read can take the memory past the budget, by the row groups between the last read and the read that the step needs.
+- A lane makes the pieces of a slice only when all its row groups are in memory, and the lanes go into the next window at approximately the same step. With a budget of one window, each step into a new window waits for the reads of that window, and the memory is then approximately two windows. Give a budget of two windows or more.
 - The budget does not include the memory of a decode in progress.
 - Use a multi-thread tokio runtime. On a single-thread runtime the loader is correct, but the reads progress only while the caller waits for `next`.
 - At the end of an epoch, a row group in the last window of the epoch and in a window of the next epoch is read two times when the two windows are not in memory at the same time.

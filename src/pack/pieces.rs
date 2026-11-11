@@ -26,41 +26,57 @@ pub(super) enum Unbuilt {
     Mismatch(u32),
 }
 
-/// Lane `lane`'s pieces of `window`, shuffled into reading order.
+/// Lane `lane`'s pieces of `window`, shuffled into reading order, and the
+/// row groups they come from.
 pub(super) fn pieces(
     order: &Order,
     window: &Window,
     lane: u32,
     tokens: &impl Tokens,
-) -> Result<Vec<Piece>, Unbuilt> {
+) -> Result<(Vec<Piece>, Vec<u32>), Unbuilt> {
     let parts = order.lane(window, lane);
     let mut pieces = Vec::new();
     for part in &parts {
-        let rows = tokens
-            .row_group(part.row_group)
-            .ok_or(Unbuilt::Missing(part.row_group))?;
-        of_part(part, rows, &mut pieces).ok_or(Unbuilt::Mismatch(part.row_group))?;
+        of_part(part, rows(part, tokens)?, |p| pieces.push(p))?;
     }
     order.shuffle_lane(window, lane, &mut pieces);
-    Ok(pieces)
+    Ok((pieces, parts.iter().map(|p| p.row_group).collect()))
 }
 
-/// Appends the pieces of the rows in `part`, in storage order. A row has a
+/// The tokens of lane `lane`'s slice of `window`, with no pieces made.
+pub(super) fn count(
+    order: &Order,
+    window: &Window,
+    lane: u32,
+    tokens: &impl Tokens,
+) -> Result<u64, Unbuilt> {
+    let mut total = 0;
+    for part in &order.lane(window, lane) {
+        of_part(part, rows(part, tokens)?, |p| total += p.tokens() as u64)?;
+    }
+    Ok(total)
+}
+
+fn rows<'a>(part: &Part, tokens: &'a impl Tokens) -> Result<Rows<'a>, Unbuilt> {
+    (tokens.row_group(part.row_group)).ok_or(Unbuilt::Missing(part.row_group))
+}
+
+/// Gives the pieces of the rows in `part`, in storage order. A row has a
 /// slot for each token, or one slot if it has none, which gives no piece.
-/// `None` if the rows have fewer slots than the part needs.
-fn of_part(part: &Part, rows: Rows, out: &mut Vec<Piece>) -> Option<()> {
+/// An error if the rows have fewer slots than the part needs.
+fn of_part(part: &Part, rows: Rows, mut each: impl FnMut(Piece)) -> Result<(), Unbuilt> {
     let (from, to) = (part.slots.start, part.slots.end);
     let mut slot = 0u64;
     for r in rows.offsets.windows(2) {
         if slot >= to {
-            return Some(());
+            return Ok(());
         }
         let len = (r[1] - r[0]) as u64;
         let next = slot + len.max(1);
         if len > 0 && next > from {
             let start = r[0] + (from.max(slot) - slot) as usize;
             let end = r[0] + (to.min(next) - slot) as usize;
-            out.push(Piece {
+            each(Piece {
                 row_group: part.row_group,
                 start,
                 end,
@@ -68,5 +84,8 @@ fn of_part(part: &Part, rows: Rows, out: &mut Vec<Piece>) -> Option<()> {
         }
         slot = next;
     }
-    (slot >= to).then_some(())
+    match slot >= to {
+        true => Ok(()),
+        false => Err(Unbuilt::Mismatch(part.row_group)),
+    }
 }

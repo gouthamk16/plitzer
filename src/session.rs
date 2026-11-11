@@ -92,9 +92,11 @@ impl Session {
             .await
             .map_err(Error::Index)?;
         let reader = Reader::new(store, prefix, &index).map_err(Error::Read)?;
+        // Slots count one for each empty row too, so S is a little high for
+        // a dataset with many empty rows.
         let slots = index.slots();
-        let tokens: u64 = slots.iter().map(|&v| u64::from(v)).sum();
-        if tokens == 0 {
+        let total: u64 = slots.iter().map(|&v| u64::from(v)).sum();
+        if total == 0 {
             return Err(Error::Empty);
         }
         let per_step = u64::from(config.lanes) * u64::from(config.seq_len);
@@ -109,7 +111,7 @@ impl Session {
             start: vec![Position::default(); lanes.len()],
             lanes,
             budget,
-            steps: tokens.div_ceil(per_step),
+            steps: total.div_ceil(per_step),
             epoch: 0,
             step: 0,
             loader: None,

@@ -111,7 +111,7 @@ fn stream_of(o: &Orders, c: &Corpus, lane: u32, e: u64) -> Vec<u32> {
     let epoch = o.epoch(e);
     let mut tokens = Vec::new();
     for w in epoch.windows() {
-        let Ok(pieces) = pieces::pieces(&epoch.order(), w, lane, c) else {
+        let Ok((pieces, _)) = pieces::pieces(&epoch.order(), w, lane, c) else {
             panic!("the corpus has every row group")
         };
         for p in pieces {

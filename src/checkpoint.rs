@@ -3,7 +3,7 @@
 //! ```text
 //! magic "PLTZCKPT" | version u32 | column (len u32, UTF-8) | seed u64 | lanes u32 |
 //! window u32 | seq_len u32 | fingerprint u64 | epoch u64 | step u64 | first_lane u32 |
-//! count u32 | each lane: epoch u64 | doc u64 | offset u32 |
+//! count u32 | each lane: epoch u64 | window u32 | token u64 |
 //! checksum u64 (FNV-1a of all bytes before it)
 //!
 //! Version 1 held the fixed-D packer's settings and states; it is refused.
