@@ -5,7 +5,7 @@
 | Field | Value |
 |---|---|
 | Status | Active. It changes with each feature PR. The code is pre-alpha. |
-| Last change | 2026-11-11, PR #26 |
+| Last change | 2026-11-11, PR #27 |
 | Language standard | ASD-STE100 (Simplified Technical English) |
 | Code | `src/` at the commit of this file |
 
@@ -130,7 +130,7 @@ flowchart LR
 | Python bindings | `plitzer-py/` | Implemented | [5.11](#511-python-bindings) |
 | PyTorch dataset | `plitzer-py/python/plitzer/torch.py` | Implemented | [5.12](#512-pytorch-dataset) |
 | Benchmark harness | `plitzer-py/python/plitzer/bench/` | Implemented | [5.13](#513-benchmark-harness) |
-| Baseline harness | `plitzer-py/python/plitzer/bench/baseline.py`, `mosaic.py`, `hf.py` | Implemented | [5.14](#514-baseline-harness) |
+| Baseline harness | `plitzer-py/python/plitzer/bench/baseline.py`, `plitzer_adapter.py`, `mosaic.py`, `hf.py` | Implemented | [5.14](#514-baseline-harness) |
 
 ## 5. Component design
 
@@ -1105,19 +1105,19 @@ def table(results: Sequence[World]) -> str: ...   # Markdown
 
 ### 5.14 Baseline harness
 
-**Function:** `plitzer.bench.baseline` measures how other loaders read the Parquet files that plitzer reads. For each loader, it measures:
+**Function:** `plitzer.bench.baseline` measures how plitzer and other loaders read the same Parquet files. For each loader, it measures:
 
 - the conversion;
 - one shuffled epoch (documents and tokens each second, CPU cores used);
 - a resume at the middle of the epoch.
 
-The resume measurements are the wait for the first batch, whether the rest of the epoch is the same as an uninterrupted run, and how many documents the resume loses. The adapters need the `baseline` extra (torch, `mosaicml-streaming`, `datasets`).
+The resume measurements are the wait for the first batch, whether the rest of the epoch is the same as an uninterrupted run, and how many documents and tokens the resume loses. The Mosaic and HF adapters need the `baseline` extra (torch, `mosaicml-streaming`, `datasets`). The plitzer adapter needs only plitzer.
 
 **Interface (`plitzer/bench/baseline.py`):**
 
 ```python
-# python -m plitzer.bench.baseline DATA --loaders mosaic,hf,hf-stream --batch 64 --workers 4
-class Run(NamedTuple): seed: int; batch: int; workers: int
+# python -m plitzer.bench.baseline DATA --loaders plitzer,mosaic,hf,hf-stream --batch 64 --workers 4
+class Run(NamedTuple): seed: int; batch: int; workers: int; seq_len: int = 2048
 class Opened(Protocol):                       # a loader at the start of an epoch or at a state
     def __iter__(self) -> Iterator[list[Doc]]: ...
     def state(self) -> object: ...            # after the batches given so far
@@ -1125,14 +1125,17 @@ class Loader(Protocol):
     def convert(self, data: Path, work: Path) -> Path: ...
     def open(self, data: Path, prepared: Path, run: Run, state: object) -> Opened: ...
 class Result(NamedTuple): loader; convert_s; convert_bytes; docs_per_s; tokens_per_s
-                          cores: float | None; resume_s; exact: bool; lost: int
+                          cores: float | None; resume_s; exact: bool; lost: int; lost_tokens: int
+                          packed: bool        # .ns_per_token: CPU nanoseconds for each token
 LOADERS: dict[str, tuple[str, str]]           # name -> (module, class) of plitzer.bench
+PACKED: set[str]                              # loaders whose batches are sequences, not documents
 def measure(name: str, data: Path, work: Path, run: Run, resume_at: int) -> Result: ...
 def table(results: Sequence[Result]) -> str: ...
 ```
 
 **Design:**
 
+- `plitzer`: the conversion is the index. It reads the footers into a sidecar in the work folder, with no copy of the data. A `plitzer.Loader` with B = `run.batch`, W = 64, L = `run.seq_len` and a budget of 8 GiB reads the epoch. Each batch is one step: B sequences of L tokens, and the harness counts each sequence as a document. The state is the checkpoint bytes. plitzer packs, so its documents per second is not given (D-89).
 - `mosaic`: `MDSWriter` converts the files to MDS shards with zstd. Each document is one sample, with its tokens as bytes, as llm-foundry writes them (D-75). A shuffled `StreamingDataset` with a `StreamingDataLoader` reads them, with `run.workers` workers. The collate function gives a dict of lists (D-75). The state is `state_dict()`.
 - `hf`: `load_dataset("parquet")` converts the files to an Arrow cache. `shuffle(seed)` gives a random order, and each batch is a slice of the shuffled dataset. The state is the index of the next document, as `accelerate.skip_first_batches` uses for a map-style sampler.
 - `hf-stream`: `load_dataset(..., streaming=True)` reads the files with no conversion, through a shuffle buffer of 10 000 documents. The state is `state_dict()`, which does not hold the buffer.
@@ -1141,9 +1144,12 @@ def table(results: Sequence[Result]) -> str: ...
 - The CPU time is `os.times()` of the process, with the workers that it joined. Cores is CPU time divided by wall time. Cores is unknown when `os.times()` cannot count the workers: on Windows, and when the start method is `forkserver` (the Linux default from Python 3.14), whose workers are not children of the phase process.
 - The timed epoch counts documents and tokens, and saves the state after `resume_at` batches. It makes no digest, so the time is only the loader's work. Its clock starts after `open`: it measures the pace of the loader. The clock of the resume starts before `open`, because a resume waits for the loader to start.
 - The tail phase runs an uninterrupted epoch again, with no clock, and makes a digest of all batches after the first `resume_at`. The resume runs to the end of the epoch, with the same digest. `exact` is true if the two digests are the same. `lost` is the documents of the uninterrupted rest minus the documents of the resumed rest (D-74).
+- Before the conversion of each loader, `measure` reads all source files one time. A conversion reads the files and writes a copy, which is then in the page cache for its epoch. Without this read, a loader with no conversion reads the files from the disk, and its row measures the disk (D-88).
+- `lost_tokens` is the tokens of the uninterrupted rest minus the tokens of the resumed rest. It compares plitzer, which gives sequences, with the loaders that give documents. The CPU nanoseconds for each token are cores divided by tokens each second.
+- The CLI refuses a debug build of plitzer (`plitzer._plitzer.DEBUG`), which runs several times slower than a release build.
 - `measure` refuses an unknown loader and a `resume_at` below 1. The epoch refuses a `resume_at` with no batch after it. The CLI refuses an unknown or repeated loader name before it starts.
 
-**Rationale:** The same files, seed, batch size (in documents), worker count and epoch feed each loader. The input is the FineWeb-Edu-shaped dataset of section 5.13 (D-72). The loaders iterate documents, which is the unit that each loader gives.
+**Rationale:** The same files, seed, batch size, worker count and epoch feed each loader. The batch is 64 documents for the other loaders and 64 sequences of 2048 tokens for plitzer, so compare tokens, not batches. The input is the FineWeb-Edu-shaped dataset of section 5.13 (D-72). The loaders iterate documents, which is the unit that each loader gives.
 
 **Limits:**
 
@@ -1164,25 +1170,30 @@ def table(results: Sequence[Result]) -> str: ...
 | `test_resume_at_must_be_inside_the_epoch` | pytest | A resume after the last batch, or at 0, gives an error. |
 | `test_main_refuses_unknown_or_repeated_loaders` | pytest | The CLI refuses `hf,hf_stream` and `hf,hf` before it starts. |
 | `test_main_prints_a_row_for_each_loader` | pytest | The CLI prints one table row for each loader. |
+| `test_an_epoch_gives_each_token` | pytest | One plitzer epoch gives each token of the source, and less than one step of the next epoch. |
+| `test_resume_is_exact` (`test_compare.py`) | pytest | plitzer resumes at step 10 with the rest of an uninterrupted epoch and loses no token. Its conversion is a sidecar of less than 64 KiB, and its row has no documents per second. |
+| `test_main_runs_plitzer_and_refuses_a_debug_build` | pytest | The CLI prints a plitzer row, and refuses a debug build. |
 
-These tests run in a CI job of their own (`baseline`, on Linux), which installs the loaders. `mosaicml-streaming` pins numpy below 2.2, and the other tests run with the newest numpy. Other jobs skip these tests.
+The tests of `test_compare.py` need only plitzer, and run in each Python job. The other tests run in a CI job of their own (`baseline`, on Linux), which installs the loaders. `mosaicml-streaming` pins numpy below 2.2, and the other tests run with the newest numpy. Other jobs skip these tests.
 
-**Results:** One run on 4 CPU cores, 15 GiB of RAM and a local disk:
-- The data is the 512 row groups of section 6: 512 000 documents, 1104 MiB of Parquet token chunks.
-- The settings are batch 64, 4 workers for Mosaic, seed 0, and a resume at batch 4000 of 8000.
+**Results:** One run on 4 CPU cores, 15 GiB of RAM and a local disk, with a release build of plitzer:
+- The data is the 512 row groups of section 6: 512 000 documents, 526 million tokens, 1104 MiB of Parquet token chunks.
+- The settings are batch 64, 4 workers for Mosaic, seed 0, and a resume at batch 4000. plitzer has L = 2048 and W = 64, so its epoch is 4014 steps.
 - The library versions are `mosaicml-streaming` 0.13.0, `datasets` 5.0.1 and torch 2.15.0 (CPU).
 
-| loader | convert (s) | converted (MiB) | docs/s | Mtokens/s | cores | resume (s) | exact resume | docs lost |
-|---|---|---|---|---|---|---|---|---|
-| mosaic | 22.3 | 1222 | 28 014 | 28.8 | 2.68 | 2.89 | yes | 0 |
-| hf | 4.5 | 2009 | 86 357 | 88.7 | 1.00 | 0.18 | yes | 0 |
-| hf-stream | 0.0 | 0 | 2 949 | 3.0 | 1.10 | 3.06 | no | 10 000 |
+| loader | convert (s) | converted (MiB) | docs/s | Mtokens/s | cores | CPU ns/token | resume (s) | exact resume | tokens lost |
+|---|---|---|---|---|---|---|---|---|---|
+| plitzer | 0.0 | 0.0 | — | 280.8 | 3.95 | 14.1 | 0.36 | yes | 0 |
+| mosaic | 28.4 | 1221.8 | 24 167 | 24.8 | 2.70 | 108.7 | 3.04 | yes | 0 |
+| hf | 5.2 | 2008.7 | 87 018 | 89.4 | 1.00 | 11.2 | 0.28 | yes | 0 |
+| hf-stream | 0.0 | 0.0 | 2 125 | 2.2 | 1.13 | 517.1 | 3.89 | no | 10 373 481 |
 
-- The computer is a shared cloud computer. An earlier run timed the digest inside the epoch, so its `hf` speed was 20 % lower. Its Mosaic and `hf-stream` values were the same within 5 %, but its Mosaic conversion took 53.5 s. Thus the conversion time of Mosaic is 22 to 54 s.
-- Mosaic needs a conversion, and a second copy of the data. It uses 2.7 cores for 28 000 documents each second. Its resume is exact.
-- `hf` makes a second copy of 2 GiB, 1.8 times the Parquet chunks, because the Arrow cache is not compressed. All of the cache fits in the page cache of this computer, so its random access does not wait for the disk. On a dataset larger than RAM, each batch reads from random positions of the disk.
-- `hf-stream` needs no copy, but it gives 2900 documents each second, and its resume loses the 10 000 documents of its buffer. Thus it is neither fast nor resumable without loss.
-- Section 7 keeps the comparison with plitzer as an open question. The next PR adds plitzer to this table.
+- plitzer needs no conversion and no copy: its index of 8 files is a sidecar of a few KiB, and it took less than 0.1 s with the footers in the page cache. It gives 3.1 times the tokens of `hf` and 11 times those of Mosaic. Each sequence is full, and its resume is exact.
+- plitzer uses all 4 cores. Each token costs 14.1 ns of CPU, 26 % more than `hf` (11.2 ns), which copies the data first and then reads a memory map. The binding of plitzer adds approximately 5 ns for each token over its Rust session (section 5.11). This is the next work on speed.
+- The resume of plitzer reads and decodes the current slice of each lane before the first batch: 0.36 s, against 0.28 s for `hf`, whose cache is a memory map. Mosaic and `hf-stream` take approximately 3 s.
+- Mosaic needs a conversion of 22 to 54 s and a second copy of the data. `hf` makes a second copy of 2 GiB, 1.8 times the Parquet chunks, and all of it fits in the page cache of this computer. On a dataset larger than RAM, each of its batches reads from random positions of the disk.
+- `hf-stream` needs no copy, but it gives 2.2 million tokens each second, and its resume loses the 10 000 documents of its buffer.
+- The computer is a shared cloud computer, and runs differ by up to 20 %. An earlier run, before D-88, read the source files of plitzer from the disk: 14.1 million tokens each second on 0.22 cores. Compare rows of one table.
 
 ## 6. Read amplification
 
@@ -1227,7 +1238,6 @@ These tests run in a CI job of their own (`baseline`, on Linux), which installs 
 | How well do documents mix inside one sequence on a sorted dataset? | The value of W. |
 | What are the statistics of the batch of each GPU? | Possible bias between GPUs. |
 | What is the best trade-off between W and memory? | The default W. |
-| How fast is plitzer, with how many cores, against the baseline of section 5.14? | The benchmark table in the README. |
 
 ## 8. Decision log
 
@@ -1312,6 +1322,8 @@ These tests run in a CI job of their own (`baseline`, on Linux), which installs 
 | D-85 | `Loader.bytes_read` reads the shared counter of the reader, with no lock. | The benchmark must count the reads ahead while they arrive. A thread can read it during a step. | The count at the end of the last call (D-70). | #26 |
 | D-86 | Cut the lane slices by slots, the tokens and empty rows that the footer counts, and cut a row at a slice edge. | Each lane takes L tokens a step, so each needs the same share of the tokens. With slices of equal document counts, lanes went apart by 3.9 windows in one epoch and 11.8 in six on FineWeb-Edu lengths, and an epoch took 20 s, not 1.6 s. | Slices by documents (D-10), or slice edges at the nearest document, which need the rows before the slices are known. | #26 |
 | D-87 | The reader refuses a chunk whose rows do not have the slots of the index. | The slices are cut by these slots, so a lane would find too few tokens with no clear error. | Trust the footer. | #26 |
+| D-88 | The baseline reads all source files one time before each loader. | Each conversion leaves its copy in the page cache. Without the read, plitzer, which has no conversion, read the files from the disk: 14.1, not 281, million tokens each second. | Clear the page cache before each epoch: it needs root, and a resumed job also has warm files. | #27 |
+| D-89 | The baseline counts lost tokens, and gives no documents per second for plitzer. | plitzer gives sequences, and the other loaders give documents. Tokens are the unit that all of them give. | A plitzer that gives documents: it would not measure the packer. | #27 |
 | D-22 | The sidecar uses its own binary format and FNV-1a. | No new dependency, and the bytes are fixed by our code. | `serde` with `bincode`, or JSON. | #10 |
 | D-23 | A sidecar that does not exist or is corrupt causes a new build. | The sidecar is only a cache. | An error that the user must correct. | #10 |
 | D-24 | The index keeps the place of each token column chunk, and the reader reads no footer. | A window has row groups from approximately W files. A footer read for each row group costs approximately 1.5 times the data. | Read the footer of each file again, or keep footers in memory (9.4 GB for FineWeb-Edu). | #12 |
@@ -1340,6 +1352,7 @@ These tests run in a CI job of their own (`baseline`, on Linux), which installs 
 | 2026-11-09 | #24 | Add `bytes_read` (`Reader`, `Session`, `Loader`) and `plitzer.bench` (section 5.13). Measure the read amplification on FineWeb-Edu lengths (section 6). Correct the bound to 1 + ⌈n/W⌉(world − 1)/n. |
 | 2026-11-11 | #25 | Add `plitzer.bench.baseline`, with adapters for MosaicML Streaming and HF `datasets` (section 5.14), and measure the baseline. |
 | 2026-11-11 | #26 | Lossless packing: lane slices are cut by slots (tokens and empty rows), so lanes take the same share of the tokens and stay together. Each step fills the sequence from the rest of the current piece and whole pieces, and lanes go on across epochs (`src/pack/lane.rs`, `src/pack/pieces.rs`). The reader checks the slots of each row group. Remove D, C, the pad token and `Batch.lengths`. The loader reads in window order with a budget for the reads ahead (`src/load/sequence.rs`, `prefetch.rs`, `buffer.rs`), and the replay is removed. Checkpoint version 2. `bytes_read` is live. |
+| 2026-11-11 | #27 | Add plitzer to the baseline harness (`plitzer_adapter.py`), with tokens lost, CPU ns/token, a read of the source files before each loader and a refusal of debug builds (`plitzer._plitzer.DEBUG`). Measure the comparison (section 5.14). |
 
 ## 10. Maintenance
 

@@ -56,6 +56,23 @@ S3 credentials come from the usual `AWS_*` variables, or from `storage_options={
 
 The design, its rationale and the decision log are in [docs/design.md](docs/design.md).
 
+## Benchmarks
+
+plitzer against MosaicML Streaming and Hugging Face `datasets`, all reading the same FineWeb-Edu-shaped Parquet files (512 row groups, 526 M tokens) through one harness, `plitzer.bench.baseline`, on 4 CPU cores with the files in the page cache:
+
+| loader | convert (s) | copy (MiB) | Mtokens/s | cores | CPU ns/token | resume (s) | exact resume | tokens lost |
+|---|---|---|---|---|---|---|---|---|
+| **plitzer** | **0.0** | **0** | **280.8** | 3.95 | 14.1 | 0.36 | yes | **0** |
+| mosaic | 28.4 | 1222 | 24.8 | 2.70 | 108.7 | 3.04 | yes | 0 |
+| hf | 5.2 | 2009 | 89.4 | 1.00 | **11.2** | **0.28** | yes | 0 |
+| hf-stream | 0.0 | 0 | 2.2 | 1.13 | 517.1 | 3.89 | no | 10,373,481 |
+
+plitzer reads the Parquet as it is, with no conversion or copy, delivers 3.1× the tokens of `hf` and 11× those of Mosaic, packs every sequence full with no padding, and resumes exactly. `hf` still spends less CPU per token and resumes faster, from the Arrow copy it makes first; both are the next work on speed. Batches are 64 documents for the other loaders and 64 sequences of 2048 tokens for plitzer, so compare tokens. Method and caveats: [design §5.14](docs/design.md#514-baseline-harness).
+
+```sh
+python -m plitzer.bench.baseline DATA --loaders plitzer,mosaic,hf,hf-stream --batch 64 --workers 4
+```
+
 ## TODO
 
 - [x] **Benchmark baseline:** measure MosaicML Streaming and HF `datasets` on a FineWeb-Edu Parquet sample (conversion time, samples/s, CPU cores used, resume time) (`plitzer.bench.baseline`, [design §5.14](docs/design.md#514-baseline-harness))
@@ -77,7 +94,7 @@ The design, its rationale and the decision log are in [docs/design.md](docs/desi
   - [x] `plitzer.torch` `IterableDataset` with `state_dict()` and `load_state_dict()`
 - [x] **End-to-end test:** kill training at a random step, resume on a different GPU count, and check the sample-stream hash matches
 - [x] **Read amplification check:** measure bytes read per GPU on real data. Lane slices simulate at 1.01–1.25×. Add a per-node cache only if it's needed. Measured on FineWeb-Edu lengths: at the bound 1 + (world − 1)/W (1.013× at W = 512 on 8 GPUs), so no cache ([design §6](docs/design.md#6-read-amplification))
-- [ ] **Benchmarks:** publish a comparison table against Mosaic and HF
+- [x] **Benchmarks:** publish a comparison table against Mosaic and HF ([Benchmarks](#benchmarks))
 - [ ] **Release:** build wheels in CI and publish to PyPI
 - [ ] **Stretch:** in-loader tokenization
 
