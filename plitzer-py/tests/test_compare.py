@@ -8,9 +8,9 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-from plitzer.bench import baseline
+from plitzer.bench import baseline, phases
 
-RUN = baseline.Run(seed=3, batch=4, workers=0, seq_len=8)
+RUN = phases.Run(seed=3, batch=4, workers=0, seq_len=8)
 TOKENS = 900
 
 
@@ -31,7 +31,7 @@ def data(tmp_path_factory: pytest.TempPathFactory) -> Path:
 
 
 def test_an_epoch_gives_each_token(data: Path, tmp_path: Path) -> None:
-    load = baseline.loader("plitzer")
+    load = phases.loader("plitzer")
     prepared = load.convert(data, tmp_path)
     got = np.concatenate(
         [np.concatenate(b) for b in load.open(data, prepared, RUN, None)]
@@ -40,12 +40,13 @@ def test_an_epoch_gives_each_token(data: Path, tmp_path: Path) -> None:
     # by less than one step, and only with tokens it already gave.
     extra = len(got) - TOKENS
     assert 0 <= extra < RUN.batch * RUN.seq_len
-    assert set(got.tolist()) == set(range(TOKENS))
+    seen = np.bincount(got, minlength=TOKENS)
+    assert int(np.min(seen)) == 1 and int(np.sum(seen - 1)) == extra
 
 
 def test_resume_is_exact(data: Path, tmp_path: Path) -> None:
     r = baseline.measure("plitzer", data, tmp_path, RUN, resume_at=10)
-    assert r.packed and r.exact and r.lost == 0 and r.lost_tokens == 0
+    assert r.exact and r.lost == 0 and r.lost_tokens == 0
     # The conversion is the index sidecar: a few KiB, not a copy.
     assert 0 < r.convert_bytes < 64 << 10
     assert r.tokens_per_s > 0 and r.resume_s > 0
@@ -69,3 +70,19 @@ def test_main_runs_plitzer_and_refuses_a_debug_build(
     baseline.main(args)
     rows = capsys.readouterr().out.strip().splitlines()
     assert len(rows) == 3 and rows[2].startswith("| plitzer |")
+
+
+def test_each_loader_moves_the_same_tokens_in_a_batch(data: Path) -> None:
+    meta = pq.read_metadata(data / "0.parquet")
+    empty = sum(
+        1 for r in pq.read_table(data / "0.parquet")["tokens"].to_pylist() if not r
+    )
+    shape = baseline.shape(data)
+    # A slot for each token, and one for each empty row.
+    assert shape == baseline.Shape(meta.num_rows, TOKENS + empty)
+    run = phases.Run(seed=0, batch=64, workers=0, seq_len=8)
+    docs, doc_batches = baseline.for_loader("hf", run, shape)
+    assert docs == run and doc_batches == -(-shape.docs // 64)
+    packed, batches = baseline.for_loader("plitzer", run, shape)
+    assert packed.batch == round(64 * shape.tokens / shape.docs / 8)
+    assert batches == -(-shape.tokens // (packed.batch * 8))

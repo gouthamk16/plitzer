@@ -7,92 +7,25 @@ the one an uninterrupted run gives, and how many documents it loses.
     python -m plitzer.bench.baseline DATA --loaders plitzer,mosaic,hf,hf-stream \\
         --batch 64 --workers 4
 
-Each phase runs in a fresh process, so no cache in memory, worker or
-shared-memory segment passes from one phase to the next. The adapters
+``--batch`` is in documents. A packed loader (plitzer) gets the same tokens
+in each batch, in sequences of ``--seq-len``, and each loader resumes at
+half of its own epoch. Each phase runs in a fresh process
+(plitzer.bench.phases). The adapters
 (plitzer.bench.mosaic and plitzer.bench.hf) need the ``baseline`` extra;
 plitzer's (plitzer.bench.plitzer_adapter) needs only plitzer.
 """
 
 import argparse
-import hashlib
-import importlib
-import multiprocessing
 import os
-import sys
 import tempfile
-import time
-from collections.abc import Iterator, Sequence
-from multiprocessing.connection import Connection
+from collections.abc import Sequence
 from pathlib import Path
-from typing import NamedTuple, Protocol
+from typing import NamedTuple
 
-import numpy as np
-import numpy.typing as npt
 import pyarrow.parquet as pq
 
 from plitzer import _plitzer
-
-Doc = npt.NDArray[np.int32]
-# Each name is a module of plitzer.bench and its class. The child imports it
-# after it starts, so that this module needs none of their dependencies.
-LOADERS = {
-    "plitzer": ("plitzer_adapter", "Plitzer"),
-    "mosaic": ("mosaic", "Mosaic"),
-    "hf": ("hf", "HF"),
-    "hf-stream": ("hf", "HFStream"),
-}
-# Loaders that pack documents into sequences: their batches hold sequences,
-# not documents, so documents per second does not apply to them.
-PACKED = {"plitzer"}
-
-
-class Run(NamedTuple):
-    seed: int
-    batch: int  # documents in each batch, or sequences for a packed loader
-    workers: int  # loader worker processes, where the loader has them
-    seq_len: int = 2048  # tokens in each sequence of a packed loader
-
-
-class Opened(Protocol):
-    """A loader at the start of an epoch, or at a saved state."""
-
-    def __iter__(self) -> Iterator[list[Doc]]: ...
-    def state(self) -> object:
-        """A state after the batches given so far, to restore with ``open``."""
-        ...
-
-
-class Loader(Protocol):
-    def convert(self, data: Path, work: Path) -> Path:
-        """The data in the loader's own form, under ``work``, or ``data``."""
-        ...
-
-    def open(self, data: Path, prepared: Path, run: Run, state: object) -> Opened:
-        """An epoch of ``prepared``, from ``state``, or the start if None."""
-        ...
-
-
-class Job(NamedTuple):
-    phase: str  # "convert", "epoch", "tail" or "resume"
-    loader: str
-    data: Path
-    work: Path
-    run: Run
-    resume_at: int  # the batches before the resume, 1 or more
-    prepared: Path | None = None  # from the conversion
-    state: object = None  # the state to resume from
-
-
-class Phase(NamedTuple):
-    seconds: float  # to the end; for a resume, to its first batch
-    cpu: float | None  # CPU seconds of the process and its workers, if known
-    docs: int = 0
-    tokens: int = 0
-    tail: str = ""  # digest of the batches from `resume_at`, or of a resume
-    tail_docs: int = 0
-    tail_tokens: int = 0
-    state: object = None  # after `resume_at` batches
-    prepared: Path | None = None
+from plitzer.bench.phases import LOADERS, PACKED, Job, Run, parquet_files, phase
 
 
 class Result(NamedTuple):
@@ -106,143 +39,11 @@ class Result(NamedTuple):
     exact: bool  # the rest of the epoch is the one of an uninterrupted run
     lost: int  # documents of the rest of the epoch that the resume misses
     lost_tokens: int  # their tokens, which also compare packed loaders
-    packed: bool = False
 
     @property
     def ns_per_token(self) -> float | None:
         """CPU nanoseconds for each token: the cores per token per second."""
         return None if self.cores is None else self.cores / self.tokens_per_s * 1e9
-
-
-def parquet_files(data: Path) -> list[Path]:
-    return sorted(data.rglob("*.parquet"))
-
-
-class Tail:
-    """A digest of a run of batches, in order, and their documents."""
-
-    def __init__(self) -> None:
-        self._hash = hashlib.sha256()
-        self.docs = self.tokens = 0
-
-    def add(self, batch: list[Doc]) -> None:
-        self.docs += len(batch)
-        self.tokens += sum(len(doc) for doc in batch)
-        self._hash.update(len(batch).to_bytes(8, "little"))
-        for doc in batch:
-            self._hash.update(len(doc).to_bytes(8, "little"))
-            self._hash.update(np.ascontiguousarray(doc, np.int32).tobytes())
-
-    def digest(self) -> str:
-        return self._hash.hexdigest()
-
-
-def cpu() -> float:
-    t = os.times()
-    return t.user + t.system + t.children_user + t.children_system
-
-
-def loader(name: str) -> Loader:
-    module, cls = LOADERS[name]
-    made: Loader = getattr(importlib.import_module(f"plitzer.bench.{module}"), cls)()
-    return made
-
-
-def workers_counted() -> bool:
-    """Whether ``os.times()`` counts the CPU time of the workers: only for
-    joined children of this process. Windows gives no child times, and a
-    forkserver (Linux's default from Python 3.14) is the workers' parent."""
-    return (
-        sys.platform != "win32" and multiprocessing.get_start_method() != "forkserver"
-    )
-
-
-def epoch(opened: Opened, resume_at: int) -> Phase:
-    """One timed epoch: counts, and the state after ``resume_at`` batches.
-    It digests nothing, so that only the loader's work is timed."""
-    t0, c0 = time.perf_counter(), cpu()
-    docs = tokens = batches = 0
-    state = None
-    for batch in opened:
-        docs += len(batch)
-        tokens += sum(len(d) for d in batch)
-        batches += 1
-        if batches == resume_at:
-            state = opened.state()
-    if state is None or batches == resume_at:
-        raise ValueError(f"resume_at {resume_at} is not inside {batches} batches")
-    seconds, used = time.perf_counter() - t0, cpu() - c0
-    return Phase(
-        seconds, used if workers_counted() else None, docs, tokens, state=state
-    )
-
-
-def tail(opened: Opened, resume_at: int) -> Phase:
-    """The digest of the batches after the first ``resume_at``, untimed."""
-    digest = Tail()
-    for i, batch in enumerate(opened):
-        if i >= resume_at:
-            digest.add(batch)
-    return Phase(
-        0.0,
-        None,
-        tail=digest.digest(),
-        tail_docs=digest.docs,
-        tail_tokens=digest.tokens,
-    )
-
-
-def resume(opened: Opened, t0: float) -> Phase:
-    """The rest of an epoch from a state, timed to its first batch."""
-    first: float | None = None
-    digest = Tail()
-    for batch in opened:
-        first = first or time.perf_counter() - t0
-        digest.add(batch)
-    seconds = first or time.perf_counter() - t0
-    return Phase(
-        seconds,
-        None,
-        tail=digest.digest(),
-        tail_docs=digest.docs,
-        tail_tokens=digest.tokens,
-    )
-
-
-def child(conn: Connection, job: Job) -> None:
-    load = loader(job.loader)
-    t0, c0 = time.perf_counter(), cpu()
-    if job.phase == "convert":
-        out = load.convert(job.data, job.work)
-        conn.send(Phase(time.perf_counter() - t0, cpu() - c0, prepared=out))
-        return
-    assert job.prepared is not None, "the conversion runs first"
-    # The epoch's clock starts after `open`, the resume's before it: a
-    # resume waits for the loader to start, and an epoch measures its pace.
-    opened = load.open(job.data, job.prepared, job.run, job.state)
-    if job.phase == "epoch":
-        conn.send(epoch(opened, job.resume_at))
-    elif job.phase == "tail":
-        conn.send(tail(opened, job.resume_at))
-    else:
-        conn.send(resume(opened, t0))
-
-
-def phase(job: Job) -> Phase:
-    """``job`` in a new process."""
-    ctx = multiprocessing.get_context("spawn")
-    receive, send = ctx.Pipe(duplex=False)
-    process = ctx.Process(target=child, args=(send, job))
-    process.start()
-    send.close()
-    try:
-        got = receive.recv()
-    except EOFError:
-        got = None
-    process.join()
-    if not isinstance(got, Phase) or process.exitcode != 0:
-        raise RuntimeError(f"{job.loader} {job.phase} failed (exit {process.exitcode})")
-    return got
 
 
 def warm(data: Path) -> None:
@@ -260,10 +61,48 @@ def dir_bytes(path: Path) -> int:
     return sum(p.stat().st_size for p in path.rglob("*") if p.is_file())
 
 
-def measure(name: str, data: Path, work: Path, run: Run, resume_at: int) -> Result:
-    """The phases of loader ``name`` over ``data``, using ``work``."""
+class Shape(NamedTuple):
+    docs: int
+    tokens: int  # leaf values of the token column: tokens, and empty rows
+
+
+def shape(data: Path, column: str = "tokens") -> Shape:
+    """The documents and tokens of ``data``, from the footers."""
+    docs = tokens = 0
+    for path in parquet_files(data):
+        meta = pq.read_metadata(path)
+        leaves = [
+            i
+            for i in range(meta.num_columns)
+            if meta.schema.column(i).path.split(".")[0] == column
+        ]
+        docs += meta.num_rows
+        for g in range(meta.num_row_groups):
+            tokens += sum(meta.row_group(g).column(i).num_values for i in leaves)
+    return Shape(docs, tokens)
+
+
+def for_loader(name: str, run: Run, data: Shape) -> tuple[Run, int]:
+    """The run of loader ``name``, and the batches of its epoch. A packed
+    loader gets the tokens of ``run.batch`` documents in each batch, in
+    sequences of ``run.seq_len``, so that each loader moves the same tokens
+    for each batch."""
+    if name not in PACKED:
+        return run, -(-data.docs // run.batch)
+    per_doc = data.tokens / max(1, data.docs)
+    lanes = max(1, round(run.batch * per_doc / run.seq_len))
+    return run._replace(batch=lanes), -(-data.tokens // (lanes * run.seq_len))
+
+
+def measure(
+    name: str, data: Path, work: Path, run: Run, resume_at: int | None = None
+) -> Result:
+    """The phases of loader ``name`` over ``data``, using ``work``. The
+    resume is after ``resume_at`` batches; by default, half of its epoch."""
     if name not in LOADERS:
         raise ValueError(f"no loader {name!r}; the loaders are {', '.join(LOADERS)}")
+    run, batches = for_loader(name, run, shape(data))
+    resume_at = max(1, batches // 2) if resume_at is None else resume_at
     if resume_at < 1:
         raise ValueError("resume_at is a count of batches, 1 or more")
     warm(data)
@@ -285,7 +124,6 @@ def measure(name: str, data: Path, work: Path, run: Run, resume_at: int) -> Resu
         exact=back.tail == want.tail,
         lost=want.tail_docs - back.tail_docs,
         lost_tokens=want.tail_tokens - back.tail_tokens,
-        packed=name in PACKED,
     )
 
 
@@ -298,7 +136,7 @@ def table(results: Sequence[Result]) -> str:
     for r in results:
         cores = "—" if r.cores is None else f"{r.cores:.2f}"
         ns = "—" if r.ns_per_token is None else f"{r.ns_per_token:.1f}"
-        docs = "—" if r.packed else f"{r.docs_per_s:,.0f}"
+        docs = "—" if r.loader in PACKED else f"{r.docs_per_s:,.0f}"
         rows.append(
             f"| {r.loader} | {r.convert_s:.1f} | {r.convert_bytes / 2**20:.1f} "
             f"| {docs} | {r.tokens_per_s / 1e6:.1f} | {cores} | {ns} "
@@ -323,14 +161,12 @@ def main(argv: Sequence[str] | None = None) -> None:
     if "plitzer" in a.loaders and plitzer_debug():
         p.error("plitzer is a debug build; build it with maturin develop --release")
     run = Run(a.seed, a.batch, a.workers, a.seq_len)
-    half = max(1, count_docs(a.data) // a.batch // 2)
-    resume_at = half if a.resume_at is None else a.resume_at
     results = []
     with tempfile.TemporaryDirectory(dir=a.work) as tmp:
         for name in a.loaders:
             work = Path(tmp, name)
             work.mkdir()
-            results.append(measure(name, a.data, work, run, resume_at))
+            results.append(measure(name, a.data, work, run, a.resume_at))
     print(table(results))
 
 
@@ -348,10 +184,6 @@ def plitzer_debug() -> bool:
     """Whether the plitzer extension is a debug build, whose speed is not
     plitzer's: it runs several times slower than a release build."""
     return _plitzer.DEBUG
-
-
-def count_docs(data: Path) -> int:
-    return sum(pq.read_metadata(p).num_rows for p in parquet_files(data))
 
 
 if __name__ == "__main__":

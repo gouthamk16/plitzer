@@ -11,7 +11,7 @@ from pathlib import Path
 import numpy as np
 
 import plitzer
-from plitzer.bench.baseline import Doc, Run
+from plitzer.bench.phases import Doc, Run
 
 WINDOW = 64  # row groups in each window
 BUDGET = 8 << 30  # bytes of row groups that the loader may read ahead

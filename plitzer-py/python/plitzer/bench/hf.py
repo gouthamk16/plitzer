@@ -18,7 +18,7 @@ from pathlib import Path
 import datasets
 import numpy as np
 
-from plitzer.bench.baseline import Doc, Run, parquet_files
+from plitzer.bench.phases import Doc, Run, parquet_files
 
 BUFFER = 10_000  # documents in the shuffle buffer of HFStream
 
