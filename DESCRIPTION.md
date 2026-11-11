@@ -62,10 +62,10 @@ plitzer, MosaicML Streaming and Hugging Face `datasets` reading the same FineWeb
 
 | loader | conversion | extra copy | Mtokens/s | CPU ns/token | resume (s) | exact resume | tokens lost |
 |---|---|---|---|---|---|---|---|
-| plitzer | none | none | 298.5 | 13.2 | 0.34 | yes | 0 |
-| MosaicML Streaming | 27.5 s | 1.2 GiB | 24.1 | 110.5 | 2.79 | yes | 0 |
-| HF `datasets` | 4.8 s | 2.0 GiB | 85.2 | 11.6 | 0.16 | yes | 0 |
-| HF `datasets`, streaming | none | none | 2.4 | 467.0 | 3.54 | no | 10.4 M |
+| plitzer | none | none | 391.5 | 10.0 | 0.24 | yes | 0 |
+| MosaicML Streaming | 26.5 s | 1.2 GiB | 23.9 | 102.8 | 3.32 | yes | 0 |
+| HF `datasets` | 4.2 s | 2.0 GiB | 91.9 | 10.8 | 0.27 | yes | 0 |
+| HF `datasets`, streaming | none | none | 2.8 | 388.2 | 3.18 | no | 10.4 M |
 
 The method and the full table are in the [repository README](https://github.com/gouthamk16/plitzer#benchmarks).
 

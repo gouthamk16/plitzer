@@ -1195,16 +1195,16 @@ The tests of `test_compare.py` need only plitzer, and run in each Python job. Th
 
 | loader | convert (s) | converted (MiB) | docs/s | Mtokens/s | cores | CPU ns/token | resume (s) | exact resume | tokens lost |
 |---|---|---|---|---|---|---|---|---|---|
-| plitzer | 0.0 | 0.0 | — | 298.5 | 3.95 | 13.2 | 0.34 | yes | 0 |
-| mosaic | 27.5 | 1221.8 | 23,475 | 24.1 | 2.66 | 110.5 | 2.79 | yes | 0 |
-| hf | 4.8 | 2008.7 | 82,952 | 85.2 | 0.99 | 11.6 | 0.16 | yes | 0 |
-| hf-stream | 0.0 | 0.0 | 2,329 | 2.4 | 1.12 | 467.0 | 3.54 | no | 10,373,481 |
+| plitzer | 0.0 | 0.0 | — | 391.5 | 3.91 | 10.0 | 0.24 | yes | 0 |
+| mosaic | 26.5 | 1221.8 | 23,216 | 23.9 | 2.45 | 102.8 | 3.32 | yes | 0 |
+| hf | 4.2 | 2008.7 | 89,477 | 91.9 | 0.99 | 10.8 | 0.27 | yes | 0 |
+| hf-stream | 0.0 | 0.0 | 2,760 | 2.8 | 1.10 | 388.2 | 3.18 | no | 10,373,481 |
 
-- plitzer needs no conversion and no copy: its index of 8 files is a sidecar of a few KiB, and it took less than 0.1 s with the footers in the page cache. It gives 3.5 times the tokens of `hf` and 12 times those of Mosaic. Each sequence is full, and its resume is exact.
-- plitzer uses all 4 cores. Each token costs 13.2 ns of CPU, 14 % more than `hf` (11.6 ns), which copies the data first and then reads a memory map. The binding of plitzer adds approximately 5 ns for each token over its Rust session (section 5.11). This is the next work on speed.
-- The resume of plitzer reads and decodes the current slice of each lane before the first batch: 0.34 s, against 0.16 s for `hf`, whose cache is a memory map. Mosaic and `hf-stream` take approximately 3 s.
-- Mosaic needs a conversion of 22 to 54 s (27.5 s here) and a second copy of the data. `hf` makes a second copy of 2 GiB, 1.8 times the Parquet chunks, and all of it fits in the page cache of this computer. On a dataset larger than RAM, each of its batches reads from random positions of the disk.
-- `hf-stream` needs no copy, but it gives 2.4 million tokens each second, and its resume loses the 10 000 documents of its buffer.
+- plitzer needs no conversion and no copy: its index of 8 files is a sidecar of a few KiB, and it took less than 0.1 s with the footers in the page cache. It gives 4.3 times the tokens of `hf` and 16 times those of Mosaic. Each sequence is full, and its resume is exact.
+- plitzer uses all 4 cores. Each token costs 10.0 ns of CPU, against 10.8 ns for `hf`, which copies the data first and then reads a memory map. The decode with the column reader (D-94) took plitzer from 13.2 to 10.0 ns. Of the 10.0 ns, the decode is approximately 4 ns, and the reads of the next epoch's first windows, which this short epoch of 8 windows also counts, are approximately 1.5 ns.
+- The resume of plitzer reads and decodes the current slice of each lane before the first batch: 0.24 s, against 0.27 s for `hf`, whose cache is a memory map. Across runs, `hf` took 0.16 to 0.28 s and plitzer 0.22 to 0.34 s, so the two are near. Mosaic and `hf-stream` take approximately 3 s.
+- Mosaic needs a conversion of 22 to 54 s (26.5 s here) and a second copy of the data. `hf` makes a second copy of 2 GiB, 1.8 times the Parquet chunks, and all of it fits in the page cache of this computer. On a dataset larger than RAM, each of its batches reads from random positions of the disk.
+- `hf-stream` needs no copy, but it gives 2.8 million tokens each second, and its resume loses the 10 000 documents of its buffer.
 - The computer is a shared cloud computer, and runs differ by up to 20 %. An earlier run, before D-88, read the source files of plitzer from the disk: 14.1 million tokens each second on 0.22 cores. A run with B = 64 for plitzer, twice the tokens in each batch, gave 280.8 million tokens each second and 14.1 ns for each token. Compare rows of one table.
 
 ### 5.15 Packaging and release
@@ -1387,7 +1387,7 @@ git tag v0.1.0 && git push --tags   # a release: the tag must be the Cargo versi
 | D-85 | `Loader.bytes_read` reads the shared counter of the reader, with no lock. | The benchmark must count the reads ahead while they arrive. A thread can read it during a step. | The count at the end of the last call (D-70). | #26 |
 | D-86 | Cut the lane slices by slots, the tokens and empty rows that the footer counts, and cut a row at a slice edge. | Each lane takes L tokens a step, so each needs the same share of the tokens. With slices of equal document counts, lanes went apart by 3.9 windows in one epoch and 11.8 in six on FineWeb-Edu lengths, and an epoch took 20 s, not 1.6 s. | Slices by documents (D-10), or slice edges at the nearest document, which need the rows before the slices are known. | #26 |
 | D-87 | The reader refuses a chunk whose rows do not have the slots of the index. | The slices are cut by these slots, so a lane would find too few tokens with no clear error. | Trust the footer. | #26 |
-| D-88 | The baseline reads all source files one time before each loader. | Each conversion leaves its copy in the page cache. Without the read, plitzer, which has no conversion, read the files from the disk: 14.1, not 299, million tokens each second. | Clear the page cache before each epoch: it needs root, and a resumed job also has warm files. | #27 |
+| D-88 | The baseline reads all source files one time before each loader. | Each conversion leaves its copy in the page cache. Without the read, plitzer, which has no conversion, read the files from the disk: 14.1, not 299, million tokens each second (before D-94). | Clear the page cache before each epoch: it needs root, and a resumed job also has warm files. | #27 |
 | D-89 | The baseline counts lost tokens, and gives no documents per second for plitzer. | plitzer gives sequences, and the other loaders give documents. Tokens are the unit that all of them give. | A plitzer that gives documents: it would not measure the packer. | #27 |
 | D-90 | `pyproject.toml` is at the root of the repository, and points maturin to `plitzer-py/Cargo.toml`. | The README and the licence files are at the root, and PEP 639 refuses a licence path with `..`. `pip install` of the repository needs a `pyproject.toml` at its root. | Copies of the README and the licences in `plitzer-py/`. | #28 |
 | D-91 | Publish from a `v*` tag with PyPI trusted publishing, after each wheel passes its tests on its own system. | No token is in the repository. A wheel that does not import fails before PyPI gets it. | A PyPI token as a secret, and a publish with no test of the wheels. | #28 |
