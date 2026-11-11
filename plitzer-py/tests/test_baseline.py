@@ -34,7 +34,8 @@ def source(data: Path) -> list[str]:
     return sorted(doc_key(np.array(d, np.int32)) for d in column)
 
 
-@pytest.mark.parametrize("name", list(baseline.LOADERS))
+# plitzer packs documents into sequences: test_compare.py checks its tokens.
+@pytest.mark.parametrize("name", sorted(set(baseline.LOADERS) - baseline.PACKED))
 def test_an_epoch_gives_each_document_once(
     name: str, data: Path, tmp_path: Path
 ) -> None:

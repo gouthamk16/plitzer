@@ -32,4 +32,12 @@ mod _plitzer {
     use super::loader::Loader;
     #[pymodule_export]
     use super::merge;
+
+    use pyo3::prelude::*;
+
+    /// `DEBUG`: whether this is a debug build, which benchmarks refuse.
+    #[pymodule_init]
+    fn init(m: &Bound<'_, PyModule>) -> PyResult<()> {
+        m.add("DEBUG", cfg!(debug_assertions))
+    }
 }

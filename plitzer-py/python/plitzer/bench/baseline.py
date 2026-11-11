@@ -4,12 +4,13 @@ reads. For each loader it measures the conversion, one shuffled epoch
 mid-epoch: the wait for the first batch, whether the rest of the epoch is
 the one an uninterrupted run gives, and how many documents it loses.
 
-    python -m plitzer.bench.baseline DATA --loaders mosaic,hf,hf-stream \\
+    python -m plitzer.bench.baseline DATA --loaders plitzer,mosaic,hf,hf-stream \\
         --batch 64 --workers 4
 
 Each phase runs in a fresh process, so no cache in memory, worker or
 shared-memory segment passes from one phase to the next. The adapters
-(plitzer.bench.mosaic and plitzer.bench.hf) need the ``baseline`` extra.
+(plitzer.bench.mosaic and plitzer.bench.hf) need the ``baseline`` extra;
+plitzer's (plitzer.bench.plitzer_adapter) needs only plitzer.
 """
 
 import argparse
@@ -29,20 +30,27 @@ import numpy as np
 import numpy.typing as npt
 import pyarrow.parquet as pq
 
+from plitzer import _plitzer
+
 Doc = npt.NDArray[np.int32]
 # Each name is a module of plitzer.bench and its class. The child imports it
 # after it starts, so that this module needs none of their dependencies.
 LOADERS = {
+    "plitzer": ("plitzer_adapter", "Plitzer"),
     "mosaic": ("mosaic", "Mosaic"),
     "hf": ("hf", "HF"),
     "hf-stream": ("hf", "HFStream"),
 }
+# Loaders that pack documents into sequences: their batches hold sequences,
+# not documents, so documents per second does not apply to them.
+PACKED = {"plitzer"}
 
 
 class Run(NamedTuple):
     seed: int
-    batch: int  # documents in each batch
+    batch: int  # documents in each batch, or sequences for a packed loader
     workers: int  # loader worker processes, where the loader has them
+    seq_len: int = 2048  # tokens in each sequence of a packed loader
 
 
 class Opened(Protocol):
@@ -82,6 +90,7 @@ class Phase(NamedTuple):
     tokens: int = 0
     tail: str = ""  # digest of the batches from `resume_at`, or of a resume
     tail_docs: int = 0
+    tail_tokens: int = 0
     state: object = None  # after `resume_at` batches
     prepared: Path | None = None
 
@@ -96,6 +105,13 @@ class Result(NamedTuple):
     resume_s: float  # to the first batch
     exact: bool  # the rest of the epoch is the one of an uninterrupted run
     lost: int  # documents of the rest of the epoch that the resume misses
+    lost_tokens: int  # their tokens, which also compare packed loaders
+    packed: bool = False
+
+    @property
+    def ns_per_token(self) -> float | None:
+        """CPU nanoseconds for each token: the cores per token per second."""
+        return None if self.cores is None else self.cores / self.tokens_per_s * 1e9
 
 
 def parquet_files(data: Path) -> list[Path]:
@@ -107,10 +123,11 @@ class Tail:
 
     def __init__(self) -> None:
         self._hash = hashlib.sha256()
-        self.docs = 0
+        self.docs = self.tokens = 0
 
     def add(self, batch: list[Doc]) -> None:
         self.docs += len(batch)
+        self.tokens += sum(len(doc) for doc in batch)
         self._hash.update(len(batch).to_bytes(8, "little"))
         for doc in batch:
             self._hash.update(len(doc).to_bytes(8, "little"))
@@ -166,7 +183,13 @@ def tail(opened: Opened, resume_at: int) -> Phase:
     for i, batch in enumerate(opened):
         if i >= resume_at:
             digest.add(batch)
-    return Phase(0.0, None, tail=digest.digest(), tail_docs=digest.docs)
+    return Phase(
+        0.0,
+        None,
+        tail=digest.digest(),
+        tail_docs=digest.docs,
+        tail_tokens=digest.tokens,
+    )
 
 
 def resume(opened: Opened, t0: float) -> Phase:
@@ -177,7 +200,13 @@ def resume(opened: Opened, t0: float) -> Phase:
         first = first or time.perf_counter() - t0
         digest.add(batch)
     seconds = first or time.perf_counter() - t0
-    return Phase(seconds, None, tail=digest.digest(), tail_docs=digest.docs)
+    return Phase(
+        seconds,
+        None,
+        tail=digest.digest(),
+        tail_docs=digest.docs,
+        tail_tokens=digest.tokens,
+    )
 
 
 def child(conn: Connection, job: Job) -> None:
@@ -243,21 +272,25 @@ def measure(name: str, data: Path, work: Path, run: Run, resume_at: int) -> Resu
         resume_s=back.seconds,
         exact=back.tail == want.tail,
         lost=want.tail_docs - back.tail_docs,
+        lost_tokens=want.tail_tokens - back.tail_tokens,
+        packed=name in PACKED,
     )
 
 
 def table(results: Sequence[Result]) -> str:
     rows = [
         "| loader | convert (s) | converted (MiB) | docs/s | Mtokens/s | cores "
-        "| resume (s) | exact resume | docs lost |",
-        "|---|---|---|---|---|---|---|---|---|",
+        "| CPU ns/token | resume (s) | exact resume | tokens lost |",
+        "|---|---|---|---|---|---|---|---|---|---|",
     ]
     for r in results:
         cores = "—" if r.cores is None else f"{r.cores:.2f}"
+        ns = "—" if r.ns_per_token is None else f"{r.ns_per_token:.1f}"
+        docs = "—" if r.packed else f"{r.docs_per_s:,.0f}"
         rows.append(
-            f"| {r.loader} | {r.convert_s:.1f} | {r.convert_bytes / 2**20:.0f} "
-            f"| {r.docs_per_s:,.0f} | {r.tokens_per_s / 1e6:.1f} | {cores} "
-            f"| {r.resume_s:.2f} | {'yes' if r.exact else 'no'} | {r.lost:,} |"
+            f"| {r.loader} | {r.convert_s:.1f} | {r.convert_bytes / 2**20:.1f} "
+            f"| {docs} | {r.tokens_per_s / 1e6:.1f} | {cores} | {ns} "
+            f"| {r.resume_s:.2f} | {'yes' if r.exact else 'no'} | {r.lost_tokens:,} |"
         )
     return "\n".join(rows)
 
@@ -269,12 +302,15 @@ def main(argv: Sequence[str] | None = None) -> None:
     p.add_argument("--batch", type=int, default=64)
     p.add_argument("--workers", type=int, default=os.cpu_count() or 1)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--seq-len", type=int, default=2048, help="for packed loaders")
     p.add_argument("--resume-at", type=int, help="batches before; default half")
     p.add_argument(
         "--work", type=Path, help="for converted data; default a temp folder"
     )
     a = p.parse_args(argv)
-    run = Run(a.seed, a.batch, a.workers)
+    if "plitzer" in a.loaders and plitzer_debug():
+        p.error("plitzer is a debug build; build it with maturin develop --release")
+    run = Run(a.seed, a.batch, a.workers, a.seq_len)
     half = max(1, count_docs(a.data) // a.batch // 2)
     resume_at = half if a.resume_at is None else a.resume_at
     results = []
@@ -294,6 +330,12 @@ def loader_names(value: str) -> list[str]:
             f"names from {', '.join(LOADERS)}, each once; not {value!r}"
         )
     return names
+
+
+def plitzer_debug() -> bool:
+    """Whether the plitzer extension is a debug build, whose speed is not
+    plitzer's: it runs several times slower than a release build."""
+    return _plitzer.DEBUG
 
 
 def count_docs(data: Path) -> int:
