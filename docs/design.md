@@ -5,7 +5,7 @@
 | Field | Value |
 |---|---|
 | Status | Active. It changes with each feature PR. The code is alpha, version 0.1.0. |
-| Last change | 2026-11-11, PR #28 |
+| Last change | 2026-11-11, PR #29 |
 | Language standard | ASD-STE100 (Simplified Technical English) |
 | Code | `src/` at the commit of this file |
 
@@ -1221,7 +1221,9 @@ git tag v0.1.0 && git push --tags   # a release: the tag must be the Cargo versi
 
 **Design:**
 
-- `pyproject.toml` is at the root of the repository. `[tool.maturin]` gives the manifest `plitzer-py/Cargo.toml` and the Python source `plitzer-py/python`. Thus the README and both licence files are in the package, and `pip install` of the repository works (D-90).
+- `pyproject.toml` is at the root of the repository. `[tool.maturin]` gives the manifest `plitzer-py/Cargo.toml` and the Python source `plitzer-py/python`. Thus the description and both licence files are in the package, and `pip install` of the repository works (D-90).
+- The PyPI page is `DESCRIPTION.md`, not the README: it holds what a user of the package needs, and no TODO list or contributor notes. Its Python examples are the examples of the README, and `test_docs.py` makes sure that they stay the same (D-92).
+- `main` has a ruleset, `.github/rulesets/main.json`: a change comes only through a pull request, with the CI checks green on a branch that is up to date with `main`, and with all review threads resolved. The merge is a merge commit. A force-push or a deletion of `main` is refused. The owner imports the file in the repository settings, because no workflow can set a ruleset (D-93).
 - The extension uses the abi3 interface of CPython 3.11. Thus one wheel for each platform covers each CPython from 3.11.
 - `.github/workflows/release.yml` builds five artifacts with `maturin-action`:
   - a wheel for Linux x86_64 (manylinux 2.28);
@@ -1252,7 +1254,8 @@ git tag v0.1.0 && git push --tags   # a release: the tag must be the Cargo versi
 | `version` job | CI | The versions agree, the changelog has an entry, and a tag is that version. |
 | `wheels` job | CI | Each of the 4 wheels builds, installs into a new virtualenv, and passes `test_loader.py` and `test_export.py` on its own system. |
 | `sdist` job | CI | The sdist builds, and a wheel built from it imports and gives `plitzer.__version__`. |
-| `twine check` | Manual | The wheel and the sdist have valid metadata. The README renders, and both licence files are in the wheel. |
+| `twine check` | Manual | The wheel and the sdist have valid metadata. The description renders, and both licence files are in the wheel. |
+| `test_description_examples_are_the_readme_examples` | pytest | The Python examples of `DESCRIPTION.md` are the same as those of the README. |
 
 ## 6. Read amplification
 
@@ -1385,6 +1388,8 @@ git tag v0.1.0 && git push --tags   # a release: the tag must be the Cargo versi
 | D-89 | The baseline counts lost tokens, and gives no documents per second for plitzer. | plitzer gives sequences, and the other loaders give documents. Tokens are the unit that all of them give. | A plitzer that gives documents: it would not measure the packer. | #27 |
 | D-90 | `pyproject.toml` is at the root of the repository, and points maturin to `plitzer-py/Cargo.toml`. | The README and the licence files are at the root, and PEP 639 refuses a licence path with `..`. `pip install` of the repository needs a `pyproject.toml` at its root. | Copies of the README and the licences in `plitzer-py/`. | #28 |
 | D-91 | Publish from a `v*` tag with PyPI trusted publishing, after each wheel passes its tests on its own system. | No token is in the repository. A wheel that does not import fails before PyPI gets it. | A PyPI token as a secret, and a publish with no test of the wheels. | #28 |
+| D-92 | The PyPI page is `DESCRIPTION.md`, with the same examples as the README, which a test checks. | The README is the front page of the repository: it has the TODO list, the contribution guidelines and the development steps, which a user of the package does not need. | The README on PyPI, or a description made from the README by a script. | #29 |
+| D-93 | Protect `main` with a ruleset file in `.github/rulesets/`, which the owner imports. | Pull requests only, green and up-to-date CI, resolved threads, merge commits and no force-push are the rules of CLAUDE.md. A file keeps them in review and in the history. No approval is required: the project has one maintainer, who could not merge their own PRs. | Settings made by hand with no record, or a GitHub App that applies settings from a file. | #29 |
 | D-22 | The sidecar uses its own binary format and FNV-1a. | No new dependency, and the bytes are fixed by our code. | `serde` with `bincode`, or JSON. | #10 |
 | D-23 | A sidecar that does not exist or is corrupt causes a new build. | The sidecar is only a cache. | An error that the user must correct. | #10 |
 | D-24 | The index keeps the place of each token column chunk, and the reader reads no footer. | A window has row groups from approximately W files. A footer read for each row group costs approximately 1.5 times the data. | Read the footer of each file again, or keep footers in memory (9.4 GB for FineWeb-Edu). | #12 |
@@ -1415,6 +1420,7 @@ git tag v0.1.0 && git push --tags   # a release: the tag must be the Cargo versi
 | 2026-11-11 | #26 | Lossless packing: lane slices are cut by slots (tokens and empty rows), so lanes take the same share of the tokens and stay together. Each step fills the sequence from the rest of the current piece and whole pieces, and lanes go on across epochs (`src/pack/lane.rs`, `src/pack/pieces.rs`). The reader checks the slots of each row group. Remove D, C, the pad token and `Batch.lengths`. The loader reads in window order with a budget for the reads ahead (`src/load/sequence.rs`, `prefetch.rs`, `buffer.rs`), and the replay is removed. Checkpoint version 2. `bytes_read` is live. |
 | 2026-11-11 | #27 | Add plitzer to the baseline harness (`plitzer_adapter.py`), with tokens lost, CPU ns/token, a read of the source files before each loader and a refusal of debug builds (`plitzer._plitzer.DEBUG`). Measure the comparison (section 5.14). |
 | 2026-11-11 | #28 | Add the release workflow (section 5.15): a check of the versions and the changelog, wheels for 4 platforms and an sdist, a test of each wheel on its own system, and PyPI trusted publishing on a `v*` tag. Move `pyproject.toml` to the root, with the README, the licences and the package metadata. Add `plitzer.__version__` and `CHANGELOG.md`. |
+| 2026-11-11 | #29 | Publish 0.1.0 to PyPI: the `v0.1.0` tag ran the release workflow, which published 4 wheels and the sdist. Add `DESCRIPTION.md`, the PyPI page from the next release, and `test_docs.py`. Add the ruleset of `main` and the contribution guidelines in the README. |
 
 ## 10. Maintenance
 

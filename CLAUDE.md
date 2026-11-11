@@ -33,7 +33,7 @@ python -m plitzer.bench.amplification OUT --lanes 512 --window 16 64 256 512 --w
 python -m plitzer.bench.baseline OUT --loaders plitzer,mosaic,hf,hf-stream --batch 64 --workers 4  # release build only
 ```
 
-`pyproject.toml` is at the repository root and points maturin at `plitzer-py/Cargo.toml`, so `maturin develop`, `maturin sdist` and `pip install .` work from the root. A release is a `v*` tag matching the Cargo version: `.github/workflows/release.yml` builds abi3 wheels (Linux x86_64 and aarch64, macOS universal2, Windows x64) and an sdist, tests each wheel on its own OS, and publishes to PyPI with trusted publishing. Add the version's entry to `CHANGELOG.md` first.
+`pyproject.toml` is at the repository root and points maturin at `plitzer-py/Cargo.toml`, so `maturin develop`, `maturin sdist` and `pip install .` work from the root. A release is a `v*` tag matching the Cargo version: `.github/workflows/release.yml` builds abi3 wheels (Linux x86_64 and aarch64, macOS universal2, Windows x64) and an sdist, tests each wheel on its own OS, and publishes to PyPI with trusted publishing. Add the version's entry to `CHANGELOG.md` first. The PyPI page is `DESCRIPTION.md`, not the README; its Python examples must equal the README's (`test_docs.py`), so change both. `main` is protected by `.github/rulesets/main.json` (imported in the repository settings): keep its required checks in step with the job names in `ci.yml`.
 
 `cargo test` at the root tests only the core crate; the bindings are tested through pytest. Lint with `cargo clippy --workspace --all-targets --all-features` and `cargo fmt --all`.
 

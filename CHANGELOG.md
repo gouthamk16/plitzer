@@ -2,6 +2,10 @@
 
 All notable changes to plitzer. The project follows [Semantic Versioning](https://semver.org/); until 1.0, a minor version can change the API or the checkpoint format. A checkpoint from another format version is refused with `CheckpointError`, never misread.
 
+## Unreleased
+
+- The PyPI page is a short description of the package (`DESCRIPTION.md`), not the repository README.
+
 ## 0.1.0
 
 The first release.
