@@ -47,7 +47,7 @@ jobs:
           - { os: ubuntu-latest, target: x86_64, manylinux: "2_28" }
           - { os: ubuntu-24.04-arm, target: aarch64, manylinux: "2_28" }
           # One wheel for arm64 and x86_64 Macs, tested on arm64.
-          - { os: macos-14, target: universal2-apple-darwin }
+          - { os: macos-latest, target: universal2-apple-darwin }
           - { os: windows-latest, target: x64 }
     runs-on: ${{ matrix.os }}
     steps:
