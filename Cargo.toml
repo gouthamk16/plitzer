@@ -11,13 +11,12 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/gouthamk16/plitzer"
 
 [dependencies]
-arrow-array = { version = "60.0.0", default-features = false }
 arrow-buffer = { version = "60.0.0", default-features = false }
-arrow-schema = { version = "60.0.0", default-features = false }
 bytes = "1.11.1"
 futures = "0.3.32"
 object_store = { version = "0.14.2", default-features = false, features = ["fs"] }
-# Default features: arrow for the column decoder, and every codec real files use.
+# Default features: every codec real files use. The token decode uses the column
+# reader, not the arrow feature; the tests write files with its ArrowWriter.
 parquet = "60.0.0"
 rand_chacha = "0.10.0"
 tempfile = "3.27.0"
@@ -29,5 +28,7 @@ url = "2.5"
 s3 = ["object_store/aws"]
 
 [dev-dependencies]
+arrow-array = { version = "60.0.0", default-features = false }
+arrow-schema = { version = "60.0.0", default-features = false }
 proptest = "1.11.0"
 tokio = { version = "1.52.1", features = ["rt", "rt-multi-thread", "macros", "time"] }

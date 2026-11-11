@@ -5,7 +5,7 @@
 | Field | Value |
 |---|---|
 | Status | Active. It changes with each feature PR. The code is alpha, version 0.1.0. |
-| Last change | 2026-11-11, PR #29 |
+| Last change | 2026-11-11, PR #30 |
 | Language standard | ASD-STE100 (Simplified Technical English) |
 | Code | `src/` at the commit of this file |
 
@@ -543,30 +543,33 @@ pub enum Error { Schema(..), Fetch { path, source }, Decode { path, row_group, s
 1. Get the chunk record of the row group from the index: `start`, `len`, `codec` and `rows`.
 2. Fetch the bytes `start..start + len`. Cut a chunk larger than 16 MiB into pieces of 16 MiB or less.
 3. Fetch the pieces at the same time.
-4. Make a `ParquetMetaData` with one row group and one column from the record and the schema in the index.
-5. Decode the chunk with `ParquetPushDecoder` into one list array.
-6. Make `RowGroupTokens` from the list offsets and the values.
+4. Make the metadata of the column chunk from the record and the schema in the index, with the chunk at offset 0 of the fetched bytes.
+5. Decode the chunk with the column reader of `parquet` (`ColumnReaderImpl`). The values, the definition levels and the repetition levels go into buffers that have the size of the slots of the record.
+6. Make the row offsets from the levels. A repetition level of 0 starts a row. A definition level at its maximum is a token.
+7. Make `RowGroupTokens` from the offsets and the values.
 
 The page reader of `parquet` uses only the codec and the byte range of the chunk from the metadata. It reads all other data from the page headers in the chunk. Thus the metadata that step 4 makes is sufficient.
 
 After step 3, `read` adds the length of the fetched chunk to an atomic counter. `bytes_read` gives the counter. A chunk that the reader fetches but cannot decode counts, because storage sent its bytes. A failed fetch does not count.
 
-`RowGroupTokens` keeps `Int32` and `UInt32` values with no copy. It copies other integer types into `u32`. A null row is empty.
+`RowGroupTokens` keeps the values of an INT32 column (`int32`, `uint32` and the smaller integer types) with no copy. It copies INT64 values into `u32`. A null row and an empty list are empty rows.
 
 **Rationale:**
 
 - A window has row groups from approximately W different files. A new read of a 3.1 MiB footer for each 2 MB row group costs approximately 1.5 times the data. The index records each chunk, so the reader reads no footer (D-24).
-- `ParquetPushDecoder` does no I/O of its own. The reader controls each request and knows its size before the fetch, which the prefetch budget needs (D-25).
+- The decoder does no I/O of its own. The reader controls each request and knows its size before the fetch, which the prefetch budget needs (D-25).
+- The column reader makes no Arrow list: no validity bitmap, no record batch and no buffer that grows. The index gives the slots, so each buffer has its full size before the decode. On the data of section 6, this took the decode from 8.4–8.9 to 3.7 ns for each token, and the loader from 13.2 to 9.6–10.1 ns (D-94).
 - The input of v1 is a column of token lists. Tokenization in the loader is a later item (D-26).
 - `object_store` does not cut a large range, and AWS advises requests of 8 to 16 MB at the same time. Each piece is a separate `get_ranges` call, so that `object_store` does not merge the pieces again (D-27).
 - A negative token, a null token or a token larger than `u32::MAX` gives `Error::BadToken`. A null token would otherwise become token 0.
 - A chunk that decodes to a different number of rows than its footer gives `Error::Decode`.
-- A chunk whose rows do not have the slots of its footer gives `Error::Slots`. The order cuts the slices by these slots, so a lane would otherwise find too few tokens.
+- The order cuts the slices by the slots of the index, so the reader makes sure of two counts: the levels of the chunk are its slots, and its rows have those slots (a token, or one slot for a row with none). A level that is neither, such as a null struct around the integer, gives `Error::Slots`. A lane would otherwise find too few tokens.
+- The buffers have the size of the slots of the footer before the decode. A reservation that fails gives `Error::Decode`, not an abort.
 
 **Limits:**
 
 - The reader reads one row group at a time. The loader reads many row groups at the same time (section 5.7).
-- A list column has 32-bit offsets after the decode, also for a `large_list` column. One row group never has 2³¹ tokens.
+- The levels take 4 bytes for each slot while a chunk decodes, and the reader frees them after the decode. An INT64 chunk also holds its values as 8 bytes for each slot until the copy into `u32`. The budget counts only the result, 4 bytes for each slot, so with 16 reads in flight the memory can be above the budget by these buffers.
 - A column of more than one list level, or a column that is not a list of plain integers, gives an index error.
 
 **Verification:**
@@ -583,6 +586,8 @@ After step 3, `read` adds the length of the fetched chunk to an atomic counter. 
 | `bad_tokens_are_errors` | Unit | A negative token and a null token each give `Error::BadToken`. |
 | `row_count_must_match_the_footer` | Unit | An index with 5 rows for a chunk of 3 rows gives `Error::Decode`. |
 | `slots_must_match_the_index` | Unit | `RowGroupTokens::slots` is the value count of the index, and an index with one more gives `Error::Slots`. |
+| `a_null_struct_around_a_token_is_an_error` | Unit | A `list<struct<int32>>` with a null struct passes the index, and its read gives `Error::Slots`. Without the check of the slots of the rows, the read loses a token. |
+| `reads_what_was_written` | Property | Random `list<int32>` and `list<uint32>` columns, with null and empty rows, a dictionary or not, and data pages of 1 to 63 rows, read back as written. A wrong row start or a null token read as a token fails it. |
 | `fetch_splits_large_ranges`, `pieces_cover_range` | Unit | The pieces cover the range with no gap and no overlap, and each piece is 16 MiB or less. |
 | `index_and_read_over_s3` | Integration | The index, the sidecar and the reader work against versitygw in the `s3` CI job. |
 
@@ -1192,16 +1197,16 @@ The tests of `test_compare.py` need only plitzer, and run in each Python job. Th
 
 | loader | convert (s) | converted (MiB) | docs/s | Mtokens/s | cores | CPU ns/token | resume (s) | exact resume | tokens lost |
 |---|---|---|---|---|---|---|---|---|---|
-| plitzer | 0.0 | 0.0 | — | 298.5 | 3.95 | 13.2 | 0.34 | yes | 0 |
-| mosaic | 27.5 | 1221.8 | 23,475 | 24.1 | 2.66 | 110.5 | 2.79 | yes | 0 |
-| hf | 4.8 | 2008.7 | 82,952 | 85.2 | 0.99 | 11.6 | 0.16 | yes | 0 |
-| hf-stream | 0.0 | 0.0 | 2,329 | 2.4 | 1.12 | 467.0 | 3.54 | no | 10,373,481 |
+| plitzer | 0.0 | 0.0 | — | 391.5 | 3.91 | 10.0 | 0.24 | yes | 0 |
+| mosaic | 26.5 | 1221.8 | 23,216 | 23.9 | 2.45 | 102.8 | 3.32 | yes | 0 |
+| hf | 4.2 | 2008.7 | 89,477 | 91.9 | 0.99 | 10.8 | 0.27 | yes | 0 |
+| hf-stream | 0.0 | 0.0 | 2,760 | 2.8 | 1.10 | 388.2 | 3.18 | no | 10,373,481 |
 
-- plitzer needs no conversion and no copy: its index of 8 files is a sidecar of a few KiB, and it took less than 0.1 s with the footers in the page cache. It gives 3.5 times the tokens of `hf` and 12 times those of Mosaic. Each sequence is full, and its resume is exact.
-- plitzer uses all 4 cores. Each token costs 13.2 ns of CPU, 14 % more than `hf` (11.6 ns), which copies the data first and then reads a memory map. The binding of plitzer adds approximately 5 ns for each token over its Rust session (section 5.11). This is the next work on speed.
-- The resume of plitzer reads and decodes the current slice of each lane before the first batch: 0.34 s, against 0.16 s for `hf`, whose cache is a memory map. Mosaic and `hf-stream` take approximately 3 s.
-- Mosaic needs a conversion of 22 to 54 s (27.5 s here) and a second copy of the data. `hf` makes a second copy of 2 GiB, 1.8 times the Parquet chunks, and all of it fits in the page cache of this computer. On a dataset larger than RAM, each of its batches reads from random positions of the disk.
-- `hf-stream` needs no copy, but it gives 2.4 million tokens each second, and its resume loses the 10 000 documents of its buffer.
+- plitzer needs no conversion and no copy: its index of 8 files is a sidecar of a few KiB, and it took less than 0.1 s with the footers in the page cache. It gives 4.3 times the tokens of `hf` and 16 times those of Mosaic. Each sequence is full, and its resume is exact.
+- plitzer uses all 4 cores. Each token costs 10.0 ns of CPU, against 10.8 ns for `hf`, which copies the data first and then reads a memory map. The decode with the column reader (D-94) took plitzer from 13.2 to 10.0 ns. Of the 10.0 ns, the decode is approximately 4 ns, and the reads of the next epoch's first windows, which this short epoch of 8 windows also counts, are approximately 1.5 ns.
+- The resume of plitzer reads and decodes the current slice of each lane before the first batch: 0.24 s, against 0.27 s for `hf`, whose cache is a memory map. Across runs, `hf` took 0.16 to 0.28 s and plitzer 0.22 to 0.34 s, so the two are near. Mosaic and `hf-stream` take approximately 3 s.
+- Mosaic needs a conversion of 22 to 54 s (26.5 s here) and a second copy of the data. `hf` makes a second copy of 2 GiB, 1.8 times the Parquet chunks, and all of it fits in the page cache of this computer. On a dataset larger than RAM, each of its batches reads from random positions of the disk.
+- `hf-stream` needs no copy, but it gives 2.8 million tokens each second, and its resume loses the 10 000 documents of its buffer.
 - The computer is a shared cloud computer, and runs differ by up to 20 %. An earlier run, before D-88, read the source files of plitzer from the disk: 14.1 million tokens each second on 0.22 cores. A run with B = 64 for plitzer, twice the tokens in each batch, gave 280.8 million tokens each second and 14.1 ns for each token. Compare rows of one table.
 
 ### 5.15 Packaging and release
@@ -1384,16 +1389,17 @@ git tag v0.1.0 && git push --tags   # a release: the tag must be the Cargo versi
 | D-85 | `Loader.bytes_read` reads the shared counter of the reader, with no lock. | The benchmark must count the reads ahead while they arrive. A thread can read it during a step. | The count at the end of the last call (D-70). | #26 |
 | D-86 | Cut the lane slices by slots, the tokens and empty rows that the footer counts, and cut a row at a slice edge. | Each lane takes L tokens a step, so each needs the same share of the tokens. With slices of equal document counts, lanes went apart by 3.9 windows in one epoch and 11.8 in six on FineWeb-Edu lengths, and an epoch took 20 s, not 1.6 s. | Slices by documents (D-10), or slice edges at the nearest document, which need the rows before the slices are known. | #26 |
 | D-87 | The reader refuses a chunk whose rows do not have the slots of the index. | The slices are cut by these slots, so a lane would find too few tokens with no clear error. | Trust the footer. | #26 |
-| D-88 | The baseline reads all source files one time before each loader. | Each conversion leaves its copy in the page cache. Without the read, plitzer, which has no conversion, read the files from the disk: 14.1, not 299, million tokens each second. | Clear the page cache before each epoch: it needs root, and a resumed job also has warm files. | #27 |
+| D-88 | The baseline reads all source files one time before each loader. | Each conversion leaves its copy in the page cache. Without the read, plitzer, which has no conversion, read the files from the disk: 14.1, not 299, million tokens each second (before D-94). | Clear the page cache before each epoch: it needs root, and a resumed job also has warm files. | #27 |
 | D-89 | The baseline counts lost tokens, and gives no documents per second for plitzer. | plitzer gives sequences, and the other loaders give documents. Tokens are the unit that all of them give. | A plitzer that gives documents: it would not measure the packer. | #27 |
 | D-90 | `pyproject.toml` is at the root of the repository, and points maturin to `plitzer-py/Cargo.toml`. | The README and the licence files are at the root, and PEP 639 refuses a licence path with `..`. `pip install` of the repository needs a `pyproject.toml` at its root. | Copies of the README and the licences in `plitzer-py/`. | #28 |
 | D-91 | Publish from a `v*` tag with PyPI trusted publishing, after each wheel passes its tests on its own system. | No token is in the repository. A wheel that does not import fails before PyPI gets it. | A PyPI token as a secret, and a publish with no test of the wheels. | #28 |
 | D-92 | The PyPI page is `DESCRIPTION.md`, with the same examples as the README, which a test checks. | The README is the front page of the repository: it has the TODO list, the contribution guidelines and the development steps, which a user of the package does not need. | The README on PyPI, or a description made from the README by a script. | #29 |
 | D-93 | Protect `main` with a ruleset file in `.github/rulesets/`, which the owner imports. | Pull requests only, green and up-to-date CI, resolved threads, merge commits and no force-push are the rules of CLAUDE.md. A file keeps them in review and in the history. No approval is required: the project has one maintainer, who could not merge their own PRs. | Settings made by hand with no record, or a GitHub App that applies settings from a file. | #29 |
+| D-94 | Decode the token chunk with the column reader of `parquet`, into buffers of the size of its slots, and make the offsets from the levels. | The Arrow list reader builds validity bitmaps, a record batch and buffers that grow. It took 8.4–8.9 ns for each token; the column reader takes 3.7. | `ParquetPushDecoder` to an Arrow list (D-25), or a decoder of our own for the pages. | #30 |
 | D-22 | The sidecar uses its own binary format and FNV-1a. | No new dependency, and the bytes are fixed by our code. | `serde` with `bincode`, or JSON. | #10 |
 | D-23 | A sidecar that does not exist or is corrupt causes a new build. | The sidecar is only a cache. | An error that the user must correct. | #10 |
 | D-24 | The index keeps the place of each token column chunk, and the reader reads no footer. | A window has row groups from approximately W files. A footer read for each row group costs approximately 1.5 times the data. | Read the footer of each file again, or keep footers in memory (9.4 GB for FineWeb-Edu). | #12 |
-| D-25 | Decode with `ParquetPushDecoder` and metadata that the reader makes. | No I/O in the decoder, so the reader knows each request and its size. | `ParquetRecordBatchStreamBuilder` with an `AsyncFileReader`: it needs the footer metadata. | #12 |
+| D-25 | Decode with `ParquetPushDecoder` and metadata that the reader makes. | No I/O in the decoder, so the reader knows each request and its size. D-94 replaces the push decoder with the column reader. | `ParquetRecordBatchStreamBuilder` with an `AsyncFileReader`: it needs the footer metadata. | #12 |
 | D-26 | The input of v1 is a column of token lists. | The simplest correct input. The reader takes `Int32` and `UInt32` with no copy. | Text with tokenization in the loader: a large dependency and more CPU load. It is a later item. | #12 |
 | D-27 | Fetch a chunk in separate pieces of 16 MiB or less. | `object_store` does not cut a large range, and its default timeout is 30 s. AWS advises 8 to 16 MB requests at the same time. | One request for each chunk. | #12 |
 | D-28 | Test S3 against versitygw in a Linux CI job. | MinIO stopped its images in October 2025. versitygw is Apache-2.0, active, and checks request signatures. | MinIO, LocalStack (needs a token since 2026), moto (no signature check). | #12 |
@@ -1421,6 +1427,7 @@ git tag v0.1.0 && git push --tags   # a release: the tag must be the Cargo versi
 | 2026-11-11 | #27 | Add plitzer to the baseline harness (`plitzer_adapter.py`), with tokens lost, CPU ns/token, a read of the source files before each loader and a refusal of debug builds (`plitzer._plitzer.DEBUG`). Measure the comparison (section 5.14). |
 | 2026-11-11 | #28 | Add the release workflow (section 5.15): a check of the versions and the changelog, wheels for 4 platforms and an sdist, a test of each wheel on its own system, and PyPI trusted publishing on a `v*` tag. Move `pyproject.toml` to the root, with the README, the licences and the package metadata. Add `plitzer.__version__` and `CHANGELOG.md`. |
 | 2026-11-11 | #29 | Publish 0.1.0 to PyPI: the `v0.1.0` tag ran the release workflow, which published 4 wheels and the sdist. Add `DESCRIPTION.md`, the PyPI page from the next release, and `test_docs.py`. Add the ruleset of `main` and the contribution guidelines in the README. |
+| 2026-11-11 | #30 | Decode the token chunks with the column reader of `parquet` (`src/read/column.rs`), not the Arrow list reader: approximately 30 % less CPU for each token (D-94). Add `reads_what_was_written`. |
 
 ## 10. Maintenance
 

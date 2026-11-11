@@ -4,6 +4,7 @@ All notable changes to plitzer. The project follows [Semantic Versioning](https:
 
 ## Unreleased
 
+- About 30 % less CPU per token and about 35 % more tokens per second: the token column decodes with parquet's column reader into buffers sized from the index, not through an Arrow list.
 - The PyPI page is a short description of the package (`DESCRIPTION.md`), not the repository README.
 
 ## 0.1.0

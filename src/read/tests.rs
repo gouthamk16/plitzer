@@ -14,6 +14,7 @@ use tempfile::TempDir;
 use super::*;
 
 mod bad;
+mod pages;
 use crate::index::Error as IndexError;
 
 /// The tokens of row `r`: `r % 7` tokens, unique across rows. Every fifth
