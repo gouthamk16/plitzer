@@ -5,7 +5,7 @@
 | Field | Value |
 |---|---|
 | Status | Active. It changes with each feature PR. The code is alpha, version 0.1.0. |
-| Last change | 2026-11-11, PR #28 |
+| Last change | 2026-11-11, PR #29 |
 | Language standard | ASD-STE100 (Simplified Technical English) |
 | Code | `src/` at the commit of this file |
 
@@ -1415,6 +1415,7 @@ git tag v0.1.0 && git push --tags   # a release: the tag must be the Cargo versi
 | 2026-11-11 | #26 | Lossless packing: lane slices are cut by slots (tokens and empty rows), so lanes take the same share of the tokens and stay together. Each step fills the sequence from the rest of the current piece and whole pieces, and lanes go on across epochs (`src/pack/lane.rs`, `src/pack/pieces.rs`). The reader checks the slots of each row group. Remove D, C, the pad token and `Batch.lengths`. The loader reads in window order with a budget for the reads ahead (`src/load/sequence.rs`, `prefetch.rs`, `buffer.rs`), and the replay is removed. Checkpoint version 2. `bytes_read` is live. |
 | 2026-11-11 | #27 | Add plitzer to the baseline harness (`plitzer_adapter.py`), with tokens lost, CPU ns/token, a read of the source files before each loader and a refusal of debug builds (`plitzer._plitzer.DEBUG`). Measure the comparison (section 5.14). |
 | 2026-11-11 | #28 | Add the release workflow (section 5.15): a check of the versions and the changelog, wheels for 4 platforms and an sdist, a test of each wheel on its own system, and PyPI trusted publishing on a `v*` tag. Move `pyproject.toml` to the root, with the README, the licences and the package metadata. Add `plitzer.__version__` and `CHANGELOG.md`. |
+| 2026-11-11 | #29 | Publish 0.1.0 to PyPI: the `v0.1.0` tag ran the release workflow, which published 4 wheels and the sdist. |
 
 ## 10. Maintenance
 
