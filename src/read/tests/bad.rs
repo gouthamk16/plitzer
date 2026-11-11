@@ -161,11 +161,18 @@ async fn a_null_struct_around_a_token_is_an_error() {
     }
     b.append(true);
     let d = data();
-    write(&d.path("x.parquet"), Arc::new(b.finish()), props(Compression::SNAPPY, false));
+    write(
+        &d.path("x.parquet"),
+        Arc::new(b.finish()),
+        props(Compression::SNAPPY, false),
+    );
     let Ok(index) = d.index().await else {
         return; // the index refuses the column: no read can lose a token
     };
     let reader = Reader::new(d.store.clone(), d.prefix.clone(), &index).unwrap();
     let got = reader.read(&index, 0).await;
-    assert!(matches!(got, Err(Error::Slots { .. } | Error::BadToken { .. })), "{got:?}");
+    assert!(
+        matches!(got, Err(Error::Slots { .. } | Error::BadToken { .. })),
+        "{got:?}"
+    );
 }
