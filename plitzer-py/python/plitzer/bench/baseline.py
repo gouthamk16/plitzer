@@ -245,6 +245,17 @@ def phase(job: Job) -> Phase:
     return got
 
 
+def warm(data: Path) -> None:
+    """Reads the source files once, so that each loader starts with them in
+    the page cache. A conversion reads them and writes a copy that is still
+    in memory for its epoch; with no conversion, a loader would otherwise
+    read them from the disk, and its row would measure the disk."""
+    for path in parquet_files(data):
+        with path.open("rb") as f:
+            while f.read(16 << 20):
+                pass
+
+
 def dir_bytes(path: Path) -> int:
     return sum(p.stat().st_size for p in path.rglob("*") if p.is_file())
 
@@ -255,6 +266,7 @@ def measure(name: str, data: Path, work: Path, run: Run, resume_at: int) -> Resu
         raise ValueError(f"no loader {name!r}; the loaders are {', '.join(LOADERS)}")
     if resume_at < 1:
         raise ValueError("resume_at is a count of batches, 1 or more")
+    warm(data)
     convert = phase(Job("convert", name, data, work, run, resume_at))
     job = Job("epoch", name, data, work, run, resume_at, convert.prepared)
     size = 0 if convert.prepared == data else dir_bytes(work)
