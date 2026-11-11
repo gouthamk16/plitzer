@@ -120,7 +120,7 @@ flowchart LR
 | Shuffle | `src/shuffle.rs` | Implemented | [5.1](#51-shuffle) |
 | Seed key | `src/seed.rs` | Implemented | [5.2](#52-seed-key) |
 | Order | `src/order.rs` | Implemented | [5.3](#53-order) |
-| Pack | `src/pack.rs`, `src/pack/stream.rs` | Implemented | [5.4](#54-pack) |
+| Pack | `src/pack.rs`, `src/pack/lane.rs`, `src/pack/pieces.rs` | Implemented | [5.4](#54-pack) |
 | Index | `src/index.rs` | Implemented | [5.5](#55-index) |
 | Read | `src/read.rs` | Implemented | [5.6](#56-read) |
 | Loader | `src/load.rs`, `src/load/sequence.rs`, `src/load/prefetch.rs`, `src/load/buffer.rs` | Implemented | [5.7](#57-loader) |
