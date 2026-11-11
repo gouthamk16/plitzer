@@ -8,22 +8,17 @@ fn config() -> Config {
         seed: 7,
         lanes: 4,
         window: 3,
-        packing: Packing {
-            seq_len: 8,
-            docs: 2,
-            cap: 10,
-            pad: u32::MAX,
-        },
+        seq_len: 8,
     }
 }
 
-fn part(first_lane: u32, steps: &[u64]) -> Checkpoint {
-    let lanes = steps
-        .iter()
-        .enumerate()
-        .map(|(i, &step)| LaneState {
-            step,
-            doc: 3 * step + i as u64,
+/// `n` lanes from `first_lane` at step `step`, alternately in epochs 2 and
+/// 3: lanes stand a few documents apart at an epoch's end.
+fn part(first_lane: u32, step: u64, n: usize) -> Checkpoint {
+    let lanes = (0..n)
+        .map(|i| Position {
+            epoch: 2 + i as u64 % 2,
+            doc: 3 * i as u64 + 1,
             offset: i as u32,
         })
         .collect();
@@ -31,6 +26,7 @@ fn part(first_lane: u32, steps: &[u64]) -> Checkpoint {
         config: config(),
         fingerprint: 0xfeed,
         epoch: 2,
+        step,
         first_lane,
         lanes,
     }
@@ -40,16 +36,16 @@ fn part(first_lane: u32, steps: &[u64]) -> Checkpoint {
 // were built independently with Python's `struct` module.
 #[test]
 fn golden_bytes() {
-    let bytes = part(1, &[5, 5]).to_bytes();
+    let bytes = part(1, 5, 2).to_bytes();
     let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-    assert_eq!(bytes.len(), 126);
-    assert_eq!(&hex[..24], "504c545a434b505401000000");
-    assert_eq!(fnv1a(&bytes), 0xe604_36cc_0508_3891);
+    assert_eq!(bytes.len(), 122);
+    assert_eq!(&hex[..24], "504c545a434b505402000000");
+    assert_eq!(fnv1a(&bytes), 0xd973_93d1_c21c_24f1);
 }
 
 #[test]
 fn damaged_bytes_are_refused() {
-    let bytes = part(0, &[1, 1, 1, 1]).to_bytes();
+    let bytes = part(0, 1, 4).to_bytes();
     let mut flipped = bytes.clone();
     flipped[40] ^= 1;
     assert_eq!(Checkpoint::from_bytes(&flipped), Err(Error::Checksum));
@@ -84,64 +80,55 @@ fn damaged_bytes_are_refused() {
 
 #[test]
 fn merge_tiles_the_lanes() {
-    let parts = vec![part(2, &[4, 4]), part(0, &[4, 4])];
+    let parts = vec![part(2, 4, 2), part(0, 4, 2)];
     let merged = Checkpoint::merge(parts).unwrap();
     assert!(merged.is_global());
-    assert_eq!(merged.lanes[..2], part(0, &[4, 4]).lanes[..]);
-    assert_eq!(merged.lanes[2..], part(2, &[4, 4]).lanes[..]);
-    assert_eq!(merged.states(1..3).unwrap(), merged.lanes[1..3]);
+    assert_eq!(merged.lanes[..2], part(0, 4, 2).lanes[..]);
+    assert_eq!(merged.lanes[2..], part(2, 4, 2).lanes[..]);
+    assert_eq!(merged.positions(1..3).unwrap(), merged.lanes[1..3]);
 }
 
 #[test]
 fn merge_refuses_bad_parts() {
     let refused = |parts: Vec<Checkpoint>| matches!(Checkpoint::merge(parts), Err(Error::Parts(_)));
     assert!(refused(vec![]));
-    let mut huge = part(0, &[4, 4]);
+    let mut huge = part(0, 4, 2);
     huge.config.lanes = u32::MAX;
     assert!(refused(vec![huge]), "B from the bytes is not reserved");
-    assert!(refused(vec![part(0, &[4, 4])]), "lanes 2..4 missing");
-    assert!(refused(vec![part(0, &[4, 4]), part(3, &[4, 4])]), "gap");
-    assert!(
-        refused(vec![part(0, &[4, 4]), part(1, &[4, 4, 4])]),
-        "overlap"
-    );
-    assert!(
-        refused(vec![part(0, &[4, 4]), part(2, &[5, 5])]),
-        "steps differ"
-    );
-    let mut other = part(2, &[4, 4]);
+    assert!(refused(vec![part(0, 4, 2)]), "lanes 2..4 missing");
+    assert!(refused(vec![part(0, 4, 2), part(3, 4, 2)]), "gap");
+    assert!(refused(vec![part(0, 4, 2), part(1, 4, 3)]), "overlap");
+    assert!(refused(vec![part(0, 4, 2), part(2, 5, 2)]), "steps differ");
+    let mut other = part(2, 4, 2);
     other.config.seed = 8;
-    assert!(refused(vec![part(0, &[4, 4]), other]), "configs differ");
-    let mut other = part(2, &[4, 4]);
+    assert!(refused(vec![part(0, 4, 2), other]), "configs differ");
+    let mut other = part(2, 4, 2);
     other.epoch = 3;
-    assert!(refused(vec![part(0, &[4, 4]), other]), "epochs differ");
+    assert!(refused(vec![part(0, 4, 2), other]), "epochs differ");
 }
 
 #[test]
-fn states_of_a_part() {
-    let p = part(2, &[4, 4]);
+fn positions_of_a_part() {
+    let p = part(2, 4, 2);
     assert!(!p.is_global());
-    assert_eq!(p.states(2..4).unwrap(), p.lanes);
-    assert!(matches!(p.states(0..2), Err(Error::Parts(_))));
-    assert!(matches!(p.states(3..5), Err(Error::Parts(_))));
+    assert_eq!(p.positions(2..4).unwrap(), p.lanes);
+    assert!(matches!(p.positions(0..2), Err(Error::Parts(_))));
+    assert!(matches!(p.positions(3..5), Err(Error::Parts(_))));
     #[allow(clippy::reversed_empty_ranges)]
     let reversed = 10..2;
-    assert!(matches!(p.states(reversed), Err(Error::Parts(_))));
-    let mixed = part(0, &[4, 5]);
-    assert!(matches!(mixed.states(0..2), Err(Error::Parts(_))));
-    assert_eq!(mixed.states(1..2).unwrap(), mixed.lanes[1..]);
+    assert!(matches!(p.positions(reversed), Err(Error::Parts(_))));
 }
 
 #[test]
 fn check_names_the_field() {
-    let c = part(0, &[1, 1, 1, 1]);
+    let c = part(0, 1, 4);
     assert_eq!(c.check(&config(), 0xfeed), Ok(()));
     let field = |config: Config, fingerprint: u64| match c.check(&config, fingerprint) {
         Err(Error::Mismatch { field, .. }) => field,
         other => panic!("{other:?}"),
     };
     let mut other = config();
-    other.packing.seq_len = 16;
+    other.seq_len = 16;
     assert_eq!(field(other, 0xfeed), "seq_len");
     let mut other = config();
     other.window = 4;
@@ -154,28 +141,23 @@ fn check_names_the_field() {
 
 fn checkpoints() -> impl Strategy<Value = Checkpoint> {
     let lane = (any::<u64>(), any::<u64>(), any::<u32>())
-        .prop_map(|(step, doc, offset)| LaneState { step, doc, offset });
-    let packing = any::<[u32; 4]>().prop_map(|[seq_len, docs, cap, pad]| Packing {
-        seq_len,
-        docs,
-        cap,
-        pad,
-    });
-    let config = (".{0,12}", any::<u64>(), any::<[u32; 2]>(), packing).prop_map(
-        |(column, seed, [lanes, window], packing)| Config {
+        .prop_map(|(epoch, doc, offset)| Position { epoch, doc, offset });
+    let config = (".{0,12}", any::<u64>(), any::<[u32; 3]>()).prop_map(
+        |(column, seed, [lanes, window, seq_len])| Config {
             column,
             seed,
             lanes,
             window,
-            packing,
+            seq_len,
         },
     );
     let lanes = proptest::collection::vec(lane, 0..8);
-    (config, any::<[u64; 2]>(), any::<u32>(), lanes).prop_map(
-        |(config, [fingerprint, epoch], first_lane, lanes)| Checkpoint {
+    (config, any::<[u64; 3]>(), any::<u32>(), lanes).prop_map(
+        |(config, [fingerprint, epoch, step], first_lane, lanes)| Checkpoint {
             config,
             fingerprint,
             epoch,
+            step,
             first_lane,
             lanes,
         },

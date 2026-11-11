@@ -2,19 +2,21 @@
 //!
 //! ```text
 //! magic "PLTZCKPT" | version u32 | column (len u32, UTF-8) | seed u64 | lanes u32 |
-//! window u32 | seq_len u32 | docs u32 | cap u32 | pad u32 | fingerprint u64 |
-//! epoch u64 | first_lane u32 | count u32 | each lane: step u64 | doc u64 | offset u32 |
+//! window u32 | seq_len u32 | fingerprint u64 | epoch u64 | step u64 | first_lane u32 |
+//! count u32 | each lane: epoch u64 | doc u64 | offset u32 |
 //! checksum u64 (FNV-1a of all bytes before it)
+//!
+//! Version 1 held the fixed-D packer's settings and states; it is refused.
 //! ```
 
 use std::fmt;
 use std::ops::Range;
 
 use crate::codec::{Reader, fnv1a, len, put_str};
-use crate::pack::{LaneState, Packing};
+use crate::pack::Position;
 
 const MAGIC: &[u8; 8] = b"PLTZCKPT";
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 
 /// The settings that fix the order and the sequences. A resume with any
 /// other value would give other batches, so a checkpoint refuses it.
@@ -26,20 +28,24 @@ pub struct Config {
     pub lanes: u32,
     /// W: row groups per window.
     pub window: u32,
-    pub packing: Packing,
+    /// L: tokens per sequence.
+    pub seq_len: u32,
 }
 
-/// The state of lanes `first_lane..first_lane + lanes.len()` before a step
-/// of epoch `epoch`. One rank's part holds its own lanes; a global
-/// checkpoint holds all B lanes and resumes on any number of GPUs.
+/// Lanes `first_lane..first_lane + lanes.len()` before step `step` of epoch
+/// `epoch`, each at its own position: a lane's stream runs across epochs,
+/// so a lane can stand a few documents into the next epoch, or before the
+/// end of the last. One rank's part holds its own lanes; a global checkpoint
+/// holds all B lanes and resumes on any number of GPUs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Checkpoint {
     pub config: Config,
     /// `Index::fingerprint` of the dataset.
     pub fingerprint: u64,
     pub epoch: u64,
+    pub step: u64,
     pub first_lane: u32,
-    pub lanes: Vec<LaneState>,
+    pub lanes: Vec<Position>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -91,18 +97,18 @@ impl Checkpoint {
         let c = &self.config;
         put_str(&mut out, &c.column);
         out.extend(c.seed.to_le_bytes());
-        let p = c.packing;
-        for v in [c.lanes, c.window, p.seq_len, p.docs, p.cap, p.pad] {
+        for v in [c.lanes, c.window, c.seq_len] {
             out.extend(v.to_le_bytes());
         }
-        out.extend(self.fingerprint.to_le_bytes());
-        out.extend(self.epoch.to_le_bytes());
+        for v in [self.fingerprint, self.epoch, self.step] {
+            out.extend(v.to_le_bytes());
+        }
         out.extend(self.first_lane.to_le_bytes());
         out.extend(len(self.lanes.len()).to_le_bytes());
-        for s in &self.lanes {
-            out.extend(s.step.to_le_bytes());
-            out.extend(s.doc.to_le_bytes());
-            out.extend(s.offset.to_le_bytes());
+        for p in &self.lanes {
+            out.extend(p.epoch.to_le_bytes());
+            out.extend(p.doc.to_le_bytes());
+            out.extend(p.offset.to_le_bytes());
         }
         out.extend(fnv1a(&out).to_le_bytes());
         out
@@ -134,11 +140,9 @@ impl Checkpoint {
 
     /// True if `other` comes from the same run, epoch and step.
     fn same_position(&self, other: &Checkpoint) -> bool {
-        let step = self.lanes.first().map(|s| s.step);
         other.config == self.config
             && other.fingerprint == self.fingerprint
-            && other.epoch == self.epoch
-            && other.lanes.iter().all(|s| Some(s.step) == step)
+            && (other.epoch, other.step) == (self.epoch, self.step)
     }
 
     /// True if this checkpoint holds all B lanes.
@@ -151,7 +155,8 @@ impl Checkpoint {
         let Some(first) = parts.first() else {
             return Err(Error::Parts("no checkpoint parts to merge".into()));
         };
-        let (config, fingerprint, epoch) = (first.config.clone(), first.fingerprint, first.epoch);
+        let (config, fingerprint) = (first.config.clone(), first.fingerprint);
+        let (epoch, step) = (first.epoch, first.step);
         if !parts.iter().all(|p| first.same_position(p)) {
             return Err(Error::Parts(
                 "the parts come from different runs or steps".into(),
@@ -171,6 +176,7 @@ impl Checkpoint {
             config,
             fingerprint,
             epoch,
+            step,
             first_lane: 0,
             lanes,
         };
@@ -180,9 +186,8 @@ impl Checkpoint {
         }
     }
 
-    /// The states of lanes `lanes`, which the checkpoint must hold. They
-    /// must be at one step, since a loader steps all its lanes together.
-    pub fn states(&self, lanes: Range<u32>) -> Result<Vec<LaneState>, Error> {
+    /// The positions of lanes `lanes`, which the checkpoint must hold.
+    pub fn positions(&self, lanes: Range<u32>) -> Result<Vec<Position>, Error> {
         let held = u64::from(self.first_lane)..u64::from(self.first_lane) + self.lanes.len() as u64;
         let (start, end) = (u64::from(lanes.start), u64::from(lanes.end));
         if start > end || start < held.start || end > held.end {
@@ -190,27 +195,19 @@ impl Checkpoint {
             return Err(Error::Parts(why));
         }
         let from = (u64::from(lanes.start) - held.start) as usize;
-        let states = &self.lanes[from..from + lanes.len()];
-        if states.iter().any(|s| s.step != states[0].step) {
-            return Err(Error::Parts("the lanes are at different steps".into()));
-        }
-        Ok(states.to_vec())
+        Ok(self.lanes[from..from + lanes.len()].to_vec())
     }
 
     /// Refuses a checkpoint from another setting or dataset, and names the
     /// first field that differs.
     pub fn check(&self, config: &Config, fingerprint: u64) -> Result<(), Error> {
         let (a, b) = (&self.config, config);
-        let (pa, pb) = (a.packing, b.packing);
-        let fields: [(&'static str, String, String); 9] = [
+        let fields: [(&'static str, String, String); 6] = [
             ("column", a.column.clone(), b.column.clone()),
             ("seed", a.seed.to_string(), b.seed.to_string()),
             ("lanes", a.lanes.to_string(), b.lanes.to_string()),
             ("window", a.window.to_string(), b.window.to_string()),
-            ("seq_len", pa.seq_len.to_string(), pb.seq_len.to_string()),
-            ("docs", pa.docs.to_string(), pb.docs.to_string()),
-            ("cap", pa.cap.to_string(), pb.cap.to_string()),
-            ("pad", pa.pad.to_string(), pb.pad.to_string()),
+            ("seq_len", a.seq_len.to_string(), b.seq_len.to_string()),
             (
                 "fingerprint",
                 self.fingerprint.to_string(),
@@ -228,33 +225,28 @@ impl Checkpoint {
 fn fields(r: &mut Reader) -> Option<Checkpoint> {
     let column = r.str()?;
     let seed = r.u64()?;
-    let [lanes, window, seq_len, docs, cap, pad] = [(); 6].map(|_| r.u32());
-    let packing = Packing {
-        seq_len: seq_len?,
-        docs: docs?,
-        cap: cap?,
-        pad: pad?,
-    };
+    let [lanes, window, seq_len] = [(); 3].map(|_| r.u32());
     let config = Config {
         column,
         seed,
         lanes: lanes?,
         window: window?,
-        packing,
+        seq_len: seq_len?,
     };
-    let (fingerprint, epoch, first_lane) = (r.u64()?, r.u64()?, r.u32()?);
+    let (fingerprint, epoch, step, first_lane) = (r.u64()?, r.u64()?, r.u64()?, r.u32()?);
     // The count comes from the bytes, so nothing is preallocated from it.
-    let mut states = Vec::new();
+    let mut lanes = Vec::new();
     for _ in 0..r.u32()? {
-        let (step, doc, offset) = (r.u64()?, r.u64()?, r.u32()?);
-        states.push(LaneState { step, doc, offset });
+        let (epoch, doc, offset) = (r.u64()?, r.u64()?, r.u32()?);
+        lanes.push(Position { epoch, doc, offset });
     }
     Some(Checkpoint {
         config,
         fingerprint,
         epoch,
+        step,
         first_lane,
-        lanes: states,
+        lanes,
     })
 }
 

@@ -10,64 +10,43 @@ fn corrupt(d: &Data, row_group: u32) {
     std::fs::write(&path, bytes).unwrap();
 }
 
-// A read that fails mid-epoch returns its error once. The lanes have not
-// moved, so `states()` is a valid resume point, and later calls report
-// `Stopped` instead of reading a row group that never arrived.
+// A read that fails returns its error once. The lanes have not moved, so
+// `positions()` is a valid resume point, and later calls report `Stopped`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn failed_read_stops_the_loader() {
     let d = data(17).await;
-    let fresh = vec![LaneState::default(); LANES as usize];
-    let needs = plan(&d.epoch, &d.index, 0..LANES, &fresh);
-    let bad = needs
-        .iter()
-        .find(|n| n.first >= 2)
-        .expect("a row group needed later");
-    corrupt(&d, bad.row_group);
-
-    let mut loader = Loader::new(
-        d.epoch.clone(),
-        d.reader.clone(),
-        d.index.clone(),
-        0..LANES,
-        &fresh,
-        PLENTY,
-    )
-    .await
-    .unwrap();
-    let mut out = vec![0; (LANES * PACKING.seq_len) as usize];
-    let mut before = loader.states();
+    // A row group of epoch 0's second window: read after the first steps.
+    let later = d.orders.epoch(0).windows()[1].groups()[0];
+    corrupt(&d, later);
+    let fresh = vec![Position::default(); LANES as usize];
+    let (o, r, i) = (d.orders.clone(), d.reader.clone(), d.index.clone());
+    let mut loader = Loader::new(o, r, i, 0..LANES, &fresh, PLENTY).unwrap();
+    let mut out = vec![0; (LANES * SEQ_LEN) as usize];
+    let mut before = loader.positions();
     let err = loop {
         match loader.next(&mut out).await {
-            Ok(Some(_)) => before = loader.states(),
-            Ok(None) => panic!("the corrupt row group was never read"),
+            Ok(()) => before = loader.positions(),
             Err(e) => break e,
         }
     };
     assert!(matches!(err, Error::Read(_)), "{err:?}");
-    assert_eq!(loader.states(), before);
+    assert_eq!(loader.positions(), before);
+    assert!(before.iter().all(|p| p.epoch == 0), "failed in epoch 0");
     assert!(matches!(loader.next(&mut out).await, Err(Error::Stopped)));
 }
 
-// `new` reads the first step's row groups, also with no leftover to replay,
-// so a resume into data that cannot be read fails at once, not at `next`.
+// A position past its document is found at the first step, with the tokens.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn new_reads_the_first_step() {
+async fn a_bad_position_is_an_error() {
     let d = data(17).await;
-    let fresh = vec![LaneState::default(); LANES as usize];
-    let needs = plan(&d.epoch, &d.index, 0..LANES, &fresh);
-    let first = needs
-        .iter()
-        .find(|n| n.first == 0)
-        .expect("a row group at step 0");
-    corrupt(&d, first.row_group);
-    let got = Loader::new(
-        d.epoch.clone(),
-        d.reader.clone(),
-        d.index.clone(),
-        0..LANES,
-        &fresh,
-        PLENTY,
-    )
-    .await;
-    assert!(matches!(got, Err(Error::Read(_))), "{:?}", got.err());
+    let mut at = vec![Position::default(); LANES as usize];
+    at[1].offset = 100_000;
+    let (o, r, i) = (d.orders.clone(), d.reader.clone(), d.index.clone());
+    let mut loader = Loader::new(o, r, i, 0..LANES, &at, PLENTY).unwrap();
+    let mut out = vec![0; (LANES * SEQ_LEN) as usize];
+    let got = loader.next(&mut out).await;
+    assert!(
+        matches!(&got, Err(Error::State(why)) if why.contains("lane 1")),
+        "{got:?}"
+    );
 }

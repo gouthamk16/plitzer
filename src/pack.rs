@@ -1,92 +1,112 @@
-use std::sync::Arc;
+//! Lanes: each lane packs its stream of documents into sequences of exactly
+//! L tokens, with nothing dropped and no padding. A lane's stream is its
+//! slice of each window of epoch 0, then of epoch 1, and so on, so a lane
+//! that ends an epoch goes on into the next.
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, Weak};
 
 use crate::order::{Doc, Order, Window};
 
+mod stream;
+#[cfg(test)]
+mod tests;
+
+pub use stream::Stream;
+
 /// A lane state error, named by its lane: the session and the loader both
 /// give it, and Python users see it in `CheckpointError`.
-pub(crate) fn at_lane(lane: u32, epoch: u64, why: &str) -> String {
-    format!("lane {lane} of epoch {epoch}: {why}")
+pub(crate) fn at_lane(lane: u32, why: &str) -> String {
+    format!("lane {lane}: {why}")
 }
 
-mod leftover;
-mod replay;
-
-use leftover::Leftover;
-pub use replay::Replay;
-
-/// Where a lane gets each document's tokens. The packer adds no separators,
-/// so a source that wants EOS between documents includes it in the tokens.
+/// Where a lane gets each document's tokens: `None` when they are not in
+/// memory. The packer adds no separators, so a source that wants EOS between
+/// documents includes it in the tokens.
 pub trait Tokens {
-    fn tokens(&self, doc: Doc) -> &[u32];
+    fn tokens(&self, doc: Doc) -> Option<&[u32]>;
 }
 
-/// How lanes pack documents into sequences.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Packing {
-    /// L: tokens per sequence.
-    pub seq_len: u32,
-    /// D: documents a lane takes each step.
-    pub docs: u32,
-    /// C: the most leftover tokens a lane carries into the next step.
-    pub cap: u32,
-    /// The token that fills the end of a short sequence.
-    pub pad: u32,
-}
-
-/// A lane's checkpoint before step `step`: its leftover starts at token
-/// `offset` of the lane's `doc`-th document of the epoch and runs to the
-/// cursor, so nothing else is needed to resume. The default starts the epoch.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct LaneState {
-    pub step: u64,
+/// Where a lane stands: before token `offset` of the `doc`-th document of its
+/// stream in epoch `epoch`. The default is the start of epoch 0.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Position {
+    pub epoch: u64,
     pub doc: u64,
     pub offset: u32,
 }
 
-/// One epoch of packing. It owns a copy of the order's inputs, and lanes
-/// share it through an `Arc`, so the windows are computed once and a loader
-/// can own an epoch together with its lanes.
-pub struct Epoch {
-    seed: u64,
-    number: u64,
-    lanes: u32,
-    window: u32,
-    rows: Vec<u32>,
-    packing: Packing,
-    windows: Vec<Window>,
-    steps: u64,
+/// The inputs of the order of every epoch, and each epoch's windows, made
+/// once and shared by the lanes that are in it.
+pub struct Orders {
+    pub seed: u64,
+    /// B: the lanes of the global batch.
+    pub lanes: u32,
+    /// W: row groups per window.
+    pub window: u32,
+    /// L: tokens per sequence.
+    pub seq_len: u32,
+    rows: Arc<[u32]>,
+    epochs: Mutex<HashMap<u64, Weak<Epoch>>>,
 }
 
-impl Epoch {
-    pub fn new(order: Order<'_>, packing: Packing) -> Self {
+impl Orders {
+    pub fn new(seed: u64, lanes: u32, window: u32, seq_len: u32, rows: &[u32]) -> Arc<Self> {
         assert!(
-            packing.seq_len > 0 && packing.docs > 0,
-            "seq_len and docs must be positive"
+            lanes > 0 && window > 0 && seq_len > 0,
+            "B, W and L must be positive"
         );
-        let windows = order.windows();
-        let mut epoch = Epoch {
-            seed: order.seed,
-            number: order.epoch,
-            lanes: order.lanes,
-            window: order.window,
-            rows: order.rows.to_vec(),
-            packing,
-            windows,
-            steps: 0,
-        };
-        let longest = (0..epoch.lanes).map(|l| epoch.lane_docs(l)).max();
-        // After the longest lane takes its last documents, its leftover holds
-        // at most C tokens, so ceil(C/L) more steps empty every lane.
-        epoch.steps = match longest {
-            None | Some(0) => 0,
-            Some(n) => {
-                n.div_ceil(packing.docs.into()) + u64::from(packing.cap.div_ceil(packing.seq_len))
-            }
-        };
+        Arc::new(Orders {
+            seed,
+            lanes,
+            window,
+            seq_len,
+            rows: rows.into(),
+            epochs: Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// Epoch `number`, made when no lane holds it.
+    pub fn epoch(&self, number: u64) -> Arc<Epoch> {
+        let mut epochs = self.epochs.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(epoch) = epochs.get(&number).and_then(Weak::upgrade) {
+            return epoch;
+        }
+        let epoch = Arc::new(Epoch::new(self, number));
+        epochs.retain(|_, e| e.strong_count() > 0);
+        epochs.insert(number, Arc::downgrade(&epoch));
         epoch
     }
 
-    /// The order of this epoch, as a view of the copied inputs.
+    pub fn rows(&self) -> &[u32] {
+        &self.rows
+    }
+}
+
+/// One epoch's windows, and the order that made them.
+pub struct Epoch {
+    pub number: u64,
+    seed: u64,
+    lanes: u32,
+    window: u32,
+    rows: Arc<[u32]>,
+    windows: Vec<Window>,
+}
+
+impl Epoch {
+    fn new(orders: &Orders, number: u64) -> Self {
+        let mut epoch = Epoch {
+            number,
+            seed: orders.seed,
+            lanes: orders.lanes,
+            window: orders.window,
+            rows: orders.rows.clone(),
+            windows: Vec::new(),
+        };
+        epoch.windows = epoch.order().windows();
+        epoch
+    }
+
     pub fn order(&self) -> Order<'_> {
         Order {
             seed: self.seed,
@@ -101,197 +121,133 @@ impl Epoch {
         &self.windows
     }
 
-    pub fn packing(&self) -> Packing {
-        self.packing
-    }
-
-    /// Steps in the epoch. Every lane supplies one sequence per step.
-    pub fn steps(&self) -> u64 {
-        self.steps
-    }
-
-    /// Lane `lane`, resumed from `state`. A state that no run makes, such as one from a
-    /// checkpoint made by hand, is an error that names what is wrong.
-    pub fn lane(
-        self: &Arc<Self>,
-        lane: u32,
-        state: LaneState,
-        tokens: &impl Tokens,
-    ) -> Result<Lane, String> {
-        let mut replay = self.replay(lane, state)?;
-        replay.take(tokens, u64::MAX)?;
-        replay.finish()
-    }
-
-    /// The documents lane `lane` takes in the whole epoch.
+    /// The documents of lane `lane` in the whole epoch.
     pub fn lane_docs(&self, lane: u32) -> u64 {
-        self.windows
-            .iter()
-            .map(|w| self.order().lane_len(w, lane))
-            .sum()
-    }
-
-    /// Whether `state` can stand in lane `lane` of this epoch: no later than
-    /// its last step, with its leftover not past the documents it has taken.
-    /// Gives the lane's cursor at that step. An offset past its document is
-    /// found only with the tokens, by `lane`.
-    pub fn check(&self, lane: u32, state: LaneState) -> Result<u64, String> {
-        if lane >= self.lanes {
-            return Err(format!("lane {lane} out of range for {} lanes", self.lanes));
-        }
-        if state.step > self.steps {
-            return Err(format!(
-                "state {state:?} is past the epoch's {} steps",
-                self.steps
-            ));
-        }
-        let cursor = self.cursor(lane, state.step);
-        if state.doc > cursor {
-            return Err(format!("state {state:?} is past the cursor {cursor}"));
-        }
-        // The flush steps empty every leftover, so a lane ends at
-        // `(cursor, 0)`; a leftover there would never be emitted.
-        if state.step == self.steps && (state.doc, state.offset) != (cursor, 0) {
-            return Err(format!(
-                "state {state:?} has a leftover after the last step"
-            ));
-        }
-        Ok(cursor)
-    }
-
-    /// The documents lane `lane` has taken before step `step`.
-    fn cursor(&self, lane: u32, step: u64) -> u64 {
-        assert!(
-            lane < self.lanes,
-            "lane {lane} out of range for {} lanes",
-            self.lanes
-        );
-        step.saturating_mul(self.packing.docs.into())
-            .min(self.lane_docs(lane))
+        let order = self.order();
+        self.windows.iter().map(|w| order.lane_len(w, lane)).sum()
     }
 }
 
-/// One lane's packer for one epoch.
+/// What the next sequence of a lane needs.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Need {
+    /// Every document it takes tokens from is in memory.
+    Ready,
+    /// The first document it needs that is not in memory, and the
+    /// `(epoch, window)` it is in.
+    Missing { slice: (u64, usize), doc: Doc },
+    /// A position that no run makes, such as from a hand-made checkpoint.
+    Bad(String),
+    /// A lane that finds no token in two whole epochs: it would never fill
+    /// a sequence.
+    Empty(String),
+}
+
+const NO_TOKENS: &str = "finds no token in two whole epochs: the dataset has too few documents \
+     or tokens for this many lanes";
+
+/// One lane's packer.
 pub struct Lane {
-    epoch: Arc<Epoch>,
     lane: u32,
-    step: u64,
     stream: Stream,
-    leftover: Leftover,
+    offset: u32,
 }
 
 impl Lane {
-    /// Writes the next sequence into `out`, pads its end, and returns the
-    /// number of real tokens.
-    pub fn fill(&mut self, tokens: &impl Tokens, out: &mut [u32]) -> u32 {
-        let p = self.epoch.packing;
-        assert_eq!(
-            out.len(),
-            p.seq_len as usize,
-            "out must hold seq_len tokens"
-        );
-        assert!(self.step < self.epoch.steps, "the epoch has ended");
-        self.take(tokens, p.docs.into());
-        let real = self.leftover.tokens.len().min(out.len());
-        for (o, &t) in out.iter_mut().zip(&self.leftover.tokens) {
-            *o = t;
-        }
-        out[real..].fill(p.pad);
-        self.leftover.advance(real);
-        // Drop the oldest tokens, not the newest, so the leftover stays one
-        // run that ends at the cursor and `LaneState` can describe it.
-        let over = self.leftover.tokens.len().saturating_sub(p.cap as usize);
-        self.leftover.advance(over);
-        self.step += 1;
-        real as u32
-    }
-
-    pub fn state(&self) -> LaneState {
-        LaneState {
-            step: self.step,
-            doc: self.leftover.doc,
-            offset: self.leftover.offset,
-        }
-    }
-
-    /// Skips the replayed leftover's first `state.offset` tokens and checks
-    /// that the lane now stands exactly at `state`.
-    fn start_at(&mut self, state: LaneState) -> Result<(), String> {
-        let first = self.leftover.lens.front().copied().unwrap_or(0);
-        if state.offset != 0 && state.offset >= first {
-            return Err(format!("state {state:?} offset is past its document"));
-        }
-        self.leftover.advance(state.offset as usize);
-        if self.state() != state {
+    /// Lane `lane` at `at`. A position past the lane's documents of its
+    /// epoch is an error; one at their end stands at the next epoch.
+    pub fn new(orders: &Arc<Orders>, lane: u32, at: Position) -> Result<Lane, String> {
+        if lane >= orders.lanes {
             return Err(format!(
-                "state {state:?} does not start on a document with tokens left"
+                "lane {lane} out of range for {} lanes",
+                orders.lanes
             ));
         }
-        if self.leftover.tokens.len() > self.epoch.packing.cap as usize {
-            return Err(format!("state {state:?} leaves more than the cap"));
+        let named = |why: String| at_lane(lane, &why);
+        let stream = Stream::seek(orders, lane, at.epoch, at.doc).map_err(named)?;
+        if at.offset > 0 && stream.position().epoch != at.epoch {
+            return Err(named(format!("{at:?} is past the lane's documents")));
         }
-        Ok(())
+        Ok(Lane {
+            lane,
+            stream,
+            offset: at.offset,
+        })
     }
 
-    /// Adds the next `n` documents, or as many as are left, to the leftover.
-    fn take(&mut self, tokens: &impl Tokens, n: u64) {
-        for _ in 0..n {
-            let Some(doc) = self.stream.next(&self.epoch, self.lane) else {
-                break;
+    pub fn lane(&self) -> u32 {
+        self.lane
+    }
+
+    pub fn position(&self) -> Position {
+        Position {
+            offset: self.offset,
+            ..self.stream.position()
+        }
+    }
+
+    /// The window the lane stands in: `(epoch, window)`.
+    pub fn slice(&self) -> (u64, usize) {
+        self.stream.slice()
+    }
+
+    /// What the next sequence needs, without moving the lane.
+    pub fn need(&self, tokens: &impl Tokens) -> Need {
+        let mut stream = self.stream.clone();
+        let (mut offset, mut need) = (self.offset as usize, self.stream.seq_len());
+        // Epochs entered with no token since: at 3, two whole epochs gave
+        // none, and the lane would look for ever.
+        let (mut epoch, mut dry) = (stream.position().epoch, 0);
+        loop {
+            let Some(doc) = stream.current() else {
+                return Need::Empty(at_lane(self.lane, NO_TOKENS));
             };
-            self.leftover.push(tokens.tokens(doc));
-        }
-    }
-}
-
-/// A lane's documents for the epoch, one window's slice at a time.
-struct Stream {
-    window: usize,
-    docs: Vec<Doc>,
-    next: usize,
-}
-
-impl Stream {
-    /// The stream positioned at the lane's `pos`-th document.
-    fn seek(epoch: &Epoch, lane: u32, mut pos: u64) -> Self {
-        let mut window = 0;
-        while let Some(w) = epoch.windows.get(window) {
-            let len = epoch.order().lane_len(w, lane);
-            if pos < len {
-                let docs = epoch.order().lane(w, lane);
-                return Stream {
-                    window,
-                    docs,
-                    next: pos as usize,
-                };
+            if stream.position().epoch != epoch {
+                (epoch, dry) = (stream.position().epoch, dry + 1);
+                if dry == 3 {
+                    return Need::Empty(at_lane(self.lane, NO_TOKENS));
+                }
             }
-            pos -= len;
-            window += 1;
-        }
-        Stream {
-            window,
-            docs: Vec::new(),
-            next: 0,
+            let Some(t) = tokens.tokens(doc) else {
+                let slice = stream.slice();
+                return Need::Missing { slice, doc };
+            };
+            if offset > t.len() {
+                let why = format!("{:?} is past its document", self.position());
+                return Need::Bad(at_lane(self.lane, &why));
+            }
+            let rest = t.len() - offset;
+            if rest >= need {
+                return Need::Ready;
+            }
+            if rest > 0 {
+                dry = 0;
+            }
+            (need, offset) = (need - rest, 0);
+            stream.advance();
         }
     }
 
-    fn next(&mut self, epoch: &Epoch, lane: u32) -> Option<Doc> {
-        let doc = *self.rest(epoch, lane).first()?;
-        self.next += 1;
-        Some(doc)
-    }
-
-    /// The documents left in the current window, after moving past windows
-    /// with none left. Empty at the end of the epoch.
-    fn rest(&mut self, epoch: &Epoch, lane: u32) -> &[Doc] {
-        while self.next == self.docs.len() && self.window + 1 < epoch.windows.len() {
-            self.window += 1;
-            self.docs = epoch.order().lane(&epoch.windows[self.window], lane);
-            self.next = 0;
+    /// Writes the next sequence into `out`, of exactly L tokens. Every
+    /// document it takes must be in `tokens`: call `need` first.
+    pub fn fill(&mut self, tokens: &impl Tokens, out: &mut [u32]) {
+        assert_eq!(out.len(), self.stream.seq_len(), "out must hold L tokens");
+        let mut filled = 0;
+        while filled < out.len() {
+            let doc = self.stream.current().expect("`need` found the documents");
+            let t = tokens
+                .tokens(doc)
+                .expect("`need` found the tokens in memory");
+            let rest = &t[self.offset as usize..];
+            let n = rest.len().min(out.len() - filled);
+            out[filled..filled + n].copy_from_slice(&rest[..n]);
+            filled += n;
+            if n == rest.len() {
+                self.stream.advance();
+                self.offset = 0;
+            } else {
+                self.offset += n as u32;
+            }
         }
-        &self.docs[self.next..]
     }
 }
-
-#[cfg(test)]
-mod tests;

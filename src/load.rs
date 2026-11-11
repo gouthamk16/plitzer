@@ -1,28 +1,30 @@
-use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::ops::Range;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
-use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::watch;
 use tokio::task::{JoinError, JoinHandle};
 
 use crate::index::Index;
 use crate::order::Doc;
-use crate::pack::{Epoch, Lane, LaneState, Tokens};
-use crate::read::{self, Reader, RowGroupTokens};
+use crate::pack::{Lane, Need, Orders, Position};
+use crate::read::{self, Reader};
 
-mod plan;
-mod replay;
+mod buffer;
+mod prefetch;
+mod sequence;
+#[cfg(test)]
+mod tests;
 
-use plan::{Need, needs};
+use buffer::Buffer;
+use prefetch::{Arrival, Prefetch, Signals};
+use sequence::{Key, Sequence, window_kib};
 
 #[derive(Debug)]
 pub enum Error {
-    /// The budget is below the most the GPU's lanes need at once, at one
-    /// step or to replay one part of a leftover, so the loader would wait
-    /// for itself.
+    /// The budget is below one window of the GPU's lanes, which a run holds
+    /// at once.
     Budget {
         needed: u64,
         budget: u64,
@@ -30,11 +32,13 @@ pub enum Error {
     Read(read::Error),
     /// A read task panicked.
     Join(JoinError),
-    /// An earlier read failed. `states()` still holds the state before the
-    /// failed step, so build a new loader from it.
+    /// An earlier read failed. `positions()` still holds the position before
+    /// the failed step, so build a new loader from it.
     Stopped,
-    /// A lane state that no run makes, such as from a checkpoint made by hand.
+    /// A lane position that no run makes, such as from a hand-made checkpoint.
     State(String),
+    /// A lane that never finds a token, so it can never fill a sequence.
+    Empty(String),
 }
 
 impl fmt::Display for Error {
@@ -42,12 +46,12 @@ impl fmt::Display for Error {
         match self {
             Error::Budget { needed, budget } => write!(
                 f,
-                "the prefetch budget is {budget} bytes, but the lanes need {needed} at once"
+                "the prefetch budget is {budget} bytes, but one window of the lanes needs {needed}"
             ),
             Error::Read(e) => write!(f, "{e}"),
             Error::Join(e) => write!(f, "a read task failed: {e}"),
-            Error::Stopped => write!(f, "an earlier read failed; resume from states()"),
-            Error::State(why) => write!(f, "{why}"),
+            Error::Stopped => write!(f, "an earlier read failed; resume from positions()"),
+            Error::State(why) | Error::Empty(why) => write!(f, "{why}"),
         }
     }
 }
@@ -55,16 +59,16 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Error::Budget { .. } | Error::Stopped | Error::State(_) => None,
             Error::Read(e) => Some(e),
             Error::Join(e) => Some(e),
+            _ => None,
         }
     }
 }
 
 /// A task that is stopped when its handle is dropped, so a dropped loader
 /// leaves no reads running.
-struct Abort<T>(JoinHandle<T>);
+pub(crate) struct Abort<T>(pub(crate) JoinHandle<T>);
 
 impl<T> Drop for Abort<T> {
     fn drop(&mut self) {
@@ -72,212 +76,170 @@ impl<T> Drop for Abort<T> {
     }
 }
 
-type Read = Result<(RowGroupTokens, OwnedSemaphorePermit), read::Error>;
-
-/// Reads in flight at once. The budget alone would allow thousands of
-/// concurrent requests at start; the index caps footer reads the same way.
-const CONCURRENT_READS: usize = 16;
-
-/// The decoded row groups in memory. Each holds its budget permits until it
-/// is evicted.
-#[derive(Default)]
-struct Buffer(HashMap<u32, (RowGroupTokens, OwnedSemaphorePermit)>);
-
-impl Tokens for Buffer {
-    fn tokens(&self, doc: Doc) -> &[u32] {
-        let (tokens, _) = &self.0[&doc.row_group];
-        tokens.row(doc.row as usize)
-    }
-}
-
-/// The lanes of one GPU, fed by a prefetch of their row groups that stays
-/// within a byte budget.
+/// The lanes of one GPU, fed by a prefetch of their row groups. Each step
+/// gives one sequence of exactly L tokens for each lane, for as long as the
+/// caller asks: a lane's stream goes on into the next epoch.
 pub struct Loader {
-    epoch: Arc<Epoch>,
+    orders: Arc<Orders>,
     lanes: Vec<Lane>,
-    needs: Vec<Need>,
-    /// The next entry of `needs` to take from `arrivals`.
-    next: usize,
-    /// The row groups to evict after each step.
-    evict: BTreeMap<u64, Vec<u32>>,
     buffer: Buffer,
-    arrivals: UnboundedReceiver<(u32, Abort<Read>)>,
+    arrivals: UnboundedReceiver<Arrival>,
     /// The read taken from `arrivals` and not yet finished. It lives here,
     /// not in `receive`, so a dropped `next` future loses no read.
-    pending: Option<(u32, Abort<Read>)>,
-    /// Decoded bytes of every finished read not yet evicted, also those
-    /// still waiting in `arrivals`.
-    held: Arc<AtomicUsize>,
-    /// Set when a read failed: the lanes may be mid-step, so `next` stops.
+    pending: Option<Arrival>,
+    demand: watch::Sender<Key>,
+    slowest: watch::Sender<(u64, usize)>,
+    /// Set when a read failed: `next` stops, and the lanes keep the
+    /// position before the failed step.
     stopped: bool,
     _driver: Abort<()>,
 }
 
 impl Loader {
-    /// The loader for lanes `lanes`, each resumed from its state in
-    /// `states`. `budget` caps the bytes of decoded tokens in memory. It
-    /// replays the lanes' leftovers before it returns; the later reads run
-    /// as tokio tasks, and on a multi-thread runtime they continue in the
-    /// background while the caller trains.
-    pub async fn new(
-        epoch: Arc<Epoch>,
+    /// The loader for lanes `lanes`, each at its position in `at`. `budget`
+    /// caps the decoded bytes that the prefetch reads ahead; a read that a
+    /// step waits for is made past it. The reads run as tokio tasks, and on
+    /// a multi-thread runtime they go on while the caller trains.
+    pub fn new(
+        orders: Arc<Orders>,
         reader: Arc<Reader>,
         index: Arc<Index>,
         lanes: Range<u32>,
-        states: &[LaneState],
+        at: &[Position],
         budget: u64,
     ) -> Result<Self, Error> {
-        let (step, needs) = needs(&epoch, &index, lanes.clone(), states, budget)?;
-        let (r, i) = (reader.clone(), index.clone());
-        let lanes = replay::lanes(&epoch, r, i, lanes, states, budget).await?;
-        let held = Arc::new(AtomicUsize::new(0));
-        let (arrivals, driver) = prefetch(&needs, reader, index, budget / 1024, held.clone());
-        let mut loader = Loader {
-            epoch,
-            lanes,
-            evict: evictions(&needs),
-            needs,
-            next: 0,
+        assert_eq!(at.len(), lanes.len(), "one position for each lane");
+        let made: Result<Vec<Lane>, String> = (lanes.clone().zip(at))
+            .map(|(l, &p)| Lane::new(&orders, l, p))
+            .collect();
+        let made = made.map_err(Error::State)?;
+        let starts: Vec<(u64, usize)> = made.iter().map(Lane::slice).collect();
+        let start = starts.iter().min().copied().unwrap_or((0, 0));
+        let needed = window_kib(&orders, &index, lanes.clone(), start.0);
+        if needed > budget / 1024 {
+            let needed = needed * 1024;
+            return Err(Error::Budget { needed, budget });
+        }
+        let (demand, wanted) = watch::channel((0, 0, 0));
+        let (slowest, behind) = watch::channel(start);
+        let prefetch = Prefetch {
+            reader,
+            index,
+            budget_kib: budget / 1024,
+            starts,
+            windows: orders.epoch(start.0).windows().len() as u64,
+        };
+        let seq = Sequence::new(&orders, lanes, start);
+        let signals = Signals {
+            demand: wanted,
+            slowest: behind,
+        };
+        let (arrivals, driver) = prefetch.start(seq, signals);
+        Ok(Loader {
+            orders,
+            lanes: made,
             buffer: Buffer::default(),
             arrivals,
             pending: None,
-            held,
+            demand,
+            slowest,
             stopped: false,
             _driver: driver,
-        };
-        // The first step's row groups are read now, so a resume succeeds
-        // only if the run can go on from there.
-        loader.receive(step).await?;
-        Ok(loader)
+        })
     }
 
     /// The next step: one sequence of L tokens for each lane, in lane order,
-    /// written into `out`. Returns the real-token count of each sequence, or
-    /// `None` after the last step of the epoch.
-    pub async fn next(&mut self, out: &mut [u32]) -> Result<Option<Vec<u32>>, Error> {
-        if self.ended() {
-            return Ok(None);
-        }
-        let step = self.lanes[0].state().step;
+    /// written into `out`. Cancel safe: the lanes move only once every row
+    /// group the step needs is in memory, after the last await.
+    pub async fn next(&mut self, out: &mut [u32]) -> Result<(), Error> {
         if self.stopped {
             return Err(Error::Stopped);
         }
-        if let Err(e) = self.receive(step).await {
-            self.stopped = true;
-            return Err(e);
-        }
-        let seq_len = self.epoch.packing().seq_len as usize;
+        let seq_len = self.orders.seq_len as usize;
         assert_eq!(
             out.len(),
             self.lanes.len() * seq_len,
             "out must hold one sequence per lane"
         );
-        let buffer = &self.buffer;
-        let real = (self.lanes.iter_mut().zip(out.chunks_mut(seq_len)))
-            .map(|(lane, seq)| lane.fill(buffer, seq))
-            .collect();
-        for g in self.evict.remove(&step).unwrap_or_default() {
-            if let Some((tokens, _)) = self.buffer.0.remove(&g) {
-                self.held.fetch_sub(tokens.bytes(), Ordering::Relaxed);
+        while let Some(key) = self.missing()? {
+            if let Err(e) = self.receive(key).await {
+                self.stopped = true;
+                return Err(e);
             }
         }
-        Ok(Some(real))
-    }
-
-    /// True after the last step of the epoch.
-    pub fn ended(&self) -> bool {
-        (self.lanes.first()).is_none_or(|l| l.state().step == self.epoch.steps())
-    }
-
-    /// The state of each lane, for a checkpoint. Prefetched row groups are
-    /// not part of it: a resume reads them again.
-    pub fn states(&self) -> Vec<LaneState> {
-        self.lanes.iter().map(Lane::state).collect()
-    }
-
-    /// The decoded bytes in memory now: the row groups in use and those
-    /// prefetched ahead of use. The budget caps this.
-    pub fn resident_bytes(&self) -> usize {
-        self.held.load(Ordering::Relaxed)
-    }
-
-    /// Waits until every row group needed at or before `step` is in memory.
-    /// Cancel safe: `recv` is, and the read in progress stays in `pending`.
-    async fn receive(&mut self, step: u64) -> Result<(), Error> {
-        while self.needs.get(self.next).is_some_and(|n| n.first <= step) {
-            let want = self.needs[self.next].row_group;
-            if self.pending.is_none() {
-                let arrival = self.arrivals.recv().await;
-                self.pending = Some(arrival.expect("the driver sends every need"));
-            }
-            let (row_group, task) = self.pending.as_mut().expect("set above");
-            debug_assert_eq!(*row_group, want, "arrivals come in plan order");
-            let read = (&mut task.0).await;
-            let (row_group, _) = self.pending.take().expect("set above");
-            let (tokens, permit) = read.map_err(Error::Join)?.map_err(Error::Read)?;
-            self.buffer.0.insert(row_group, (tokens, permit));
-            self.next += 1;
+        let before: Vec<(u64, usize)> = self.lanes.iter().map(Lane::slice).collect();
+        for (lane, seq) in self.lanes.iter_mut().zip(out.chunks_mut(seq_len)) {
+            lane.fill(&self.buffer, seq);
         }
+        // Only after every lane's fill: `missing` found each row group in
+        // memory for the whole step.
+        for (i, before) in before.into_iter().enumerate() {
+            self.buffer.release(&self.orders, &self.lanes[i], i, before);
+        }
+        let slowest = self
+            .lanes
+            .iter()
+            .map(Lane::slice)
+            .min()
+            .expect("a GPU has lanes");
+        self.slowest
+            .send_if_modified(|s| (*s != slowest).then(|| *s = slowest).is_some());
         Ok(())
     }
-}
 
-/// `kib` as semaphore permits, which tokio counts in `u32`. Only a row group
-/// or chunk past 4 TiB saturates, and then takes all `u32::MAX` permits.
-fn permits(kib: u64) -> u32 {
-    u32::try_from(kib).unwrap_or(u32::MAX)
-}
-
-/// The row groups to evict after each step: those whose last step it is.
-fn evictions(needs: &[Need]) -> BTreeMap<u64, Vec<u32>> {
-    let mut evict: BTreeMap<u64, Vec<u32>> = BTreeMap::new();
-    for n in needs {
-        evict.entry(n.last).or_default().push(n.row_group);
+    /// Each lane's position, for a checkpoint. Prefetched row groups are not
+    /// part of it: a resume reads them again.
+    pub fn positions(&self) -> Vec<Position> {
+        self.lanes.iter().map(Lane::position).collect()
     }
-    evict
-}
 
-/// Starts the prefetch. One driver takes the budget permits of each row
-/// group in plan order, then a read slot, then starts its read. Permits are taken one row
-/// group at a time: tokio's semaphore is first in, first out, so a later
-/// row group cannot take permits that an earlier one waits for.
-fn prefetch(
-    needs: &[Need],
-    reader: Arc<Reader>,
-    index: Arc<Index>,
-    budget_kib: u64,
-    held: Arc<AtomicUsize>,
-) -> (UnboundedReceiver<(u32, Abort<Read>)>, Abort<()>) {
-    let (tx, rx) = unbounded_channel();
-    let semaphore = Arc::new(Semaphore::new(budget_kib as usize));
-    let slots = Arc::new(Semaphore::new(CONCURRENT_READS));
-    let needs: Vec<(u32, u32)> = needs
-        .iter()
-        .map(|n| (n.row_group, permits(n.kib)))
-        .collect();
-    let driver = tokio::spawn(async move {
-        for (row_group, kib) in needs {
-            let Ok(permit) = semaphore.clone().acquire_many_owned(kib).await else {
-                return;
-            };
-            let Ok(slot) = slots.clone().acquire_owned().await else {
-                return;
-            };
-            let (reader, index, held) = (reader.clone(), index.clone(), held.clone());
-            let read = tokio::spawn(async move {
-                let tokens = reader.read(&index, row_group).await;
-                drop(slot);
-                let tokens = tokens?;
-                held.fetch_add(tokens.bytes(), Ordering::Relaxed);
-                Ok((tokens, permit))
-            });
-            if tx.send((row_group, Abort(read))).is_err() {
-                return;
+    /// The decoded bytes in memory now, of the row groups that lanes take
+    /// from or will take from soon.
+    pub fn resident_bytes(&self) -> usize {
+        self.buffer.bytes()
+    }
+
+    /// The key of the first row group that the next step needs and that is
+    /// not in memory, or `None` when the step can run.
+    fn missing(&self) -> Result<Option<Key>, Error> {
+        for lane in &self.lanes {
+            match lane.need(&self.buffer) {
+                Need::Ready => {}
+                Need::Missing { slice, doc } => return Ok(Some(self.key(slice, doc))),
+                Need::Bad(why) => return Err(Error::State(why)),
+                Need::Empty(why) => return Err(Error::Empty(why)),
             }
         }
-    });
-    (rx, Abort(driver))
-}
+        Ok(None)
+    }
 
-#[cfg(test)]
-mod tests;
+    fn key(&self, (epoch, window): (u64, usize), doc: Doc) -> Key {
+        let e = self.orders.epoch(epoch);
+        let groups = e.windows()[window].groups();
+        let i = groups
+            .binary_search(&doc.row_group)
+            .expect("a lane's document is in its window");
+        (epoch, window, i)
+    }
+
+    /// Takes arrivals in order until the one at `key` is in memory. Cancel
+    /// safe: `recv` is, and the read in progress stays in `pending`.
+    async fn receive(&mut self, key: Key) -> Result<(), Error> {
+        self.demand
+            .send_if_modified(|d| (*d < key).then(|| *d = key).is_some());
+        loop {
+            if self.pending.is_none() {
+                let arrival = self.arrivals.recv().await;
+                self.pending = Some(arrival.expect("the driver sends reads for ever"));
+            }
+            let arrival = self.pending.as_mut().expect("set above");
+            let read = (&mut arrival.read.0).await;
+            let arrival = self.pending.take().expect("set above");
+            let (tokens, permit) = read.map_err(Error::Join)?.map_err(Error::Read)?;
+            (self.buffer).hold(&self.orders, &self.lanes, &arrival, tokens, permit);
+            if arrival.key >= key {
+                return Ok(());
+            }
+        }
+    }
+}
