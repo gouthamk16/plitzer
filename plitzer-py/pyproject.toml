@@ -20,6 +20,8 @@ classifiers = [
 torch = ["torch>=2.5"]
 # plitzer.bench: the benchmark harnesses.
 bench = ["numpy>=2.1", "pyarrow>=18"]
+# plitzer.bench.baseline: the loaders that plitzer is measured against.
+baseline = ["numpy>=2.1", "pyarrow>=18", "torch>=2.5", "mosaicml-streaming>=0.13", "datasets>=3"]
 
 [project.urls]
 Repository = "https://github.com/gouthamk16/plitzer"
@@ -47,6 +49,7 @@ python_version = "3.11"
 mypy_path = ["python", "tests"]
 
 [[tool.mypy.overrides]]
-# pyarrow ships no type information.
-module = ["pyarrow", "pyarrow.*"]
+# pyarrow and datasets ship no type information. streaming does, but CI
+# leaves it out of the lint job: it pins numpy<2.2, whose stubs differ.
+module = ["pyarrow", "pyarrow.*", "datasets", "datasets.*", "streaming", "streaming.*"]
 ignore_missing_imports = true

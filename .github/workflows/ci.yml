@@ -62,6 +62,22 @@ jobs:
       - run: uv run --no-project maturin develop -m plitzer-py/Cargo.toml
       - run: uv run --no-project python -m pytest plitzer-py/tests
 
+  baseline:
+    # The loaders of plitzer.bench.baseline, in their own environment:
+    # mosaicml-streaming pins numpy<2.2, which the other tests must not get.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: astral-sh/setup-uv@v6
+      - run: uv venv -p 3.11
+      # The CPU builds first, so the loaders do not pull in CUDA torch.
+      - run: uv pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+      - run: uv pip install maturin pytest pyarrow mosaicml-streaming datasets
+      - run: uv run --no-project maturin develop -m plitzer-py/Cargo.toml
+      - run: uv run --no-project python -m pytest plitzer-py/tests/test_baseline.py
+
   s3:
     # Service containers run only on Linux runners, so S3 is tested here
     # alone. versitygw serves each folder under /data as a bucket. It comes
